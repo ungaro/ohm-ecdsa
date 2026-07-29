@@ -86,7 +86,7 @@ impl Acceptor {
         }
     }
 
-    fn process(&mut self, msg: Received) {
+    fn process(&mut self, msg: Received<DkgMessage>) {
         match msg {
             Received::Original(se) => match se.envelope.to {
                 None => {
@@ -208,9 +208,9 @@ fn slot_and_payload(se: &SignedEnvelope<DkgMessage>) -> (SlotKey, Vec<u8>) {
 /// (keeping listeners and reader threads alive), the shared mailbox, and
 /// the echo-broadcast acceptor.
 pub struct MeshTransport {
-    nodes: Vec<Node>,
+    nodes: Vec<Node<DkgMessage>>,
     ids: Vec<PartyId>,
-    inbox: Mutex<Receiver<Received>>,
+    inbox: Mutex<Receiver<Received<DkgMessage>>>,
     state: Mutex<Acceptor>,
     timeout: Duration,
 }
@@ -269,7 +269,7 @@ impl MeshTransport {
             .collect()
     }
 
-    fn node(&self, id: PartyId) -> &Node {
+    fn node(&self, id: PartyId) -> &Node<DkgMessage> {
         self.nodes
             .iter()
             .find(|n| n.id() == id)

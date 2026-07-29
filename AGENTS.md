@@ -11,9 +11,9 @@ It is a **reference implementation of an unreviewed protocol draft** —
 unaudited research code, not for securing real assets (see `SPEC.md` §13).
 
 The repo is a **two-crate workspace**: the core library at the repo root
-(`ohm-ecdsa`, dependency-pure, no networking) and the M1 transport
+(`ohm-ecdsa`, dependency-pure, no networking) and the transport
 companion in `node/` (`ohm-ecdsa-node`, which owns all networking — see
-`node/README.md`).
+`node/README.md`; M1 orchestrator driver + M2 per-party node drivers).
 
 Protocol properties:
 
@@ -37,7 +37,7 @@ keep those citations accurate when changing code.
   all curve / ECDSA arithmetic, `sha2`, `thiserror`, `rand` (0.8),
   `zeroize`. No serde, no async, no networking **in the core crate** — the
   "no networking" rule is core-only; the `node/` companion crate owns all
-  networking (M1: `std::net` blocking threads, no external runtime; its
+  networking (`std::net` blocking threads, no external runtime; its
   only extra dependencies are the path dependency on the core plus `k256`
   and `rand` for keys/RNGs). `Cargo.lock` is committed — keep it
   reproducible.
@@ -62,14 +62,29 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
   `tests/examples.rs` (each narrative example is run via `cargo run
   --example` and checked for its guarantee lines). All 76 pass at the
   time of writing.
-- `cargo test -p ohm-ecdsa-node` — 3 integration tests in
+- `cargo test -p ohm-ecdsa-node` — 13 integration tests: 3 M1 tests in
   `node/tests/mesh_keygen.rs` (3 nodes on localhost ephemeral ports:
   keygen over `MeshTransport` reconstructs the joint key, a cheating
   dealer is blamed with a verifying `BlameToken`, forged/unknown-sender/
-  malformed frames are dropped while the honest keygen completes).
-- `cargo run -p ohm-ecdsa-node [-- PORT_BASE]` — M1 demo: 3-node
-  committee on localhost real TCP, keygen through `drive_dkg_signed`,
-  prints the joint public key; exits 0 (`PORT_BASE` 0 = ephemeral ports).
+  malformed frames are dropped while the honest keygen completes),
+  6 M2 thread-level tests in `node/tests/party_mesh.rs` (per-node keygen
+  2-of-3 and 3-of-5, cheating dealer and false accuser each named by
+  every node via the wire §6.1 rounds, per-node signing with valid low-s
+  signature, wrong sign share blamed while the signature still delivers),
+  and 4 M2 process-level tests in `node/tests/process_demo.rs` (real
+  child processes via `spawn-demo`: honest keygen+sign, sign cheater
+  named by the other two processes with the signature still delivered,
+  DKG cheater and false accuser named by all three).
+- `cargo run -p ohm-ecdsa-node -- spawn-demo [--cheat-node K --cheat C]
+  [--delay-ms D]` — M2 demo: 3 child processes, each holding only its own
+  seed; keygen (§6.1 complaints on the wire) + one online signature;
+  prints per-process logs, the joint key, the signature, and blame
+  (`C` ∈ `bad-deal:V`, `false-accuse:D`, `bad-sign-share`).
+  `cargo run -p ohm-ecdsa-node -- m1-demo [-- PORT_BASE]` is the original
+  M1 orchestrator demo.
+- `cargo run --release -p ohm-ecdsa-node --example mesh_perf` — M2
+  latency benchmark over the real mesh: keygen and online-sign wall time
+  for 2-of-3 and 3-of-5, localhost and with per-link artificial delay.
 - `cargo run --release --example perf` — `examples/perf.rs` wall-clock
   micro-benchmarks for the SPEC §13.5 rows (std `Instant` only, no extra
   dependencies).
@@ -94,7 +109,7 @@ pipeline in the repo.
 Two crates: the core library at the repo root (one module per protocol
 building block, grouped into three layers mirroring the spec (`src/`,
 ~5400 lines total): `primitives/` (SPEC §4 building blocks), `protocol/`
-(§6–§9, §13.4), `runtime/` (transport/orchestration/policy)) and the M1
+(§6–§9, §13.4), `runtime/` (transport/orchestration/policy)) and the
 transport companion in `node/`. `lib.rs` declares the three layer
 modules and re-exports each building-block module FLAT
 (`pub use primitives::{dleq, open, shamir, vss};` etc.), so the public
@@ -119,7 +134,7 @@ re-exports too:
 | `runtime/policy.rs` | 10.3 | `restart_committee`: expel-and-restart committee computation — removes blamed ids, refuses (never lowers `t`) when the remainder would drop below `2t−1` (below the bound, use §13.4 re-sharing — `protocol/refresh.rs`) |
 | `runtime/transport.rs` | 4.7, 10.2, 13.1, 13.2 | The explicit transport seam: `Envelope<M>` (exactly the per-message fields a production transport signs — sid/phase/round/from/to/payload), object-safe sync `Transport<M>` trait modeling the LOGICAL rounds (§2.2), `DkgMessage` payload enum, `SimTransport` reference in-process impl (delivers identical accepted sets — echo-broadcast consistency), `drive_dkg` transport-driven DKG driver. §10.2/§13.1 signing: `Encode`/`Decode` (THE canonical wire format: length-prefixed, no serde — implemented for `DkgMessage`, the DKG bcast/p2p structs, `FeldmanCommitment`, the scalar/point/`Signature` primitives, and `Envelope`/`SignedEnvelope` themselves; other message types implement it as needed), `SignedEnvelope<M>` (sender ECDSA signature over the canonical encoding, domain-separated under `tags::TRANSPORT_SIGN`), `SigningTransport` (wraps any `Transport<SignedEnvelope<M>>` — signs on send, verifies accepted sets against the party key registry, a forged/tampered envelope is `Error::Abort` blaming the claimed sender), `BlameToken` (§A.4 evidence: abort + offending signed share envelope + dealer commitment; `verify(party_keys)` is the auditor's offline check), `drive_dkg_signed` (returns `SignedDriveError { error, token }` — `drive_dkg` stays the unsigned entry point for `sim::run_keygen*`); triples/presign orchestration still drives DKG instances internally (incremental pattern in the `transport` module docs) |
 | `runtime/sim.rs` | 4.7, 10.3, 13.2, 7.4.3 | Single-threaded reference orchestrator: `run_keygen` / `run_keygen_with_tamper` (message delivery routes through `transport::SimTransport` + `transport::drive_dkg`), `run_presign` / `run_presign_robust` / `run_presign_batch` / `run_presign_packed` (§7.4.3), `run_sign` / `run_sign_stored` / `run_sign_robust` / `run_sign_packed` (§7.4.3 — slot-point interpolation, quorum `t + B − 1`), §10.3 expel-and-restart wrappers `run_keygen_with_restart` / `run_presign_with_restart` / `run_triples_with_restart` (poisoned sid/id per retry; blame in original ids; keygen/triples retries renumber, presign retries keep original ids; the presign/triples wrappers drive the §10.4 ROBUST variants per attempt, so continuable faults complete in-attempt without poisoning — only dealing-phase aborts cascade to restart), §13.4 wrappers `run_refresh` / `run_reshare` (caller must clear presignature stores on epoch change), `make_rngs` (deterministic `StdRng` seeds — tests only) |
-| `node/` (crate `ohm-ecdsa-node`) | 4.7, 10.2, 13.1, 13.2 | M1 transport companion (localhost scale, `std::net` blocking threads, NO async runtime — tokio/rustls are M2): `src/wire.rs` (length-prefixed framing of the core's canonical `Encode`/`Decode` format; `WireMessage` = original signed envelope or echoer-signed §4.7 echo; `verify` against the party key registry), `src/mesh.rs` (`Node`: listener + full-mesh connections + reader threads; first-echo-per-slot rule; unknown sender/bad signature/misrouted p2p dropped + logged), `src/transport.rs` (`MeshTransport` implementing the core `Transport<SignedEnvelope<DkgMessage>>`: echo-broadcast acceptor — accept on `⌈(n+1)/2⌉` echoes from parties OTHER than the sender, dedup by `(sid, phase, round, from)`; blocking round collection with a generous timeout that returns the partial set and lets the DKG fail closed), `src/main.rs` (demo: 3-node keygen through `drive_dkg_signed`). M1 is the reference-orchestration pattern (one process holds all transport keys, as the core drives `SimTransport`); TLS, persistence, per-party process separation are M2 |
+| `node/` (crate `ohm-ecdsa-node`) | 4.7, 10.2, 13.1, 13.2 | Transport companion (localhost scale, `std::net` blocking threads, NO async runtime — tokio/rustls are M3): `src/wire.rs` (length-prefixed framing of the core's canonical `Encode`/`Decode` format; `WireMessage<M>` = original signed envelope or echoer-signed §4.7 echo, generic over the payload; `verify` against the party key registry), `src/mesh.rs` (`Node<M>`: listener + full-mesh connections + reader threads; first-echo-per-slot rule; unknown sender/bad signature/misrouted p2p dropped + logged; self-echo loopback for the M2 per-node acceptor; config-driven send delay for benchmarks), `src/transport.rs` (`MeshTransport` — M1 — implementing the core `Transport<SignedEnvelope<DkgMessage>>`: echo-broadcast acceptor — accept on `⌈(n+1)/2⌉` echoes from parties OTHER than the sender, dedup by `(sid, phase, round, from)`; blocking round collection with a generous timeout that returns the partial set and lets the DKG fail closed), `src/party.rs` (M2: `PartyNode` — holds ONLY its own transport key/id and runs only its own logic; per-node keygen §6 with the §6.1 complaint subprotocol on the wire — signed `Complaints`/`Defenses` broadcast rounds adjudicated identically at every node — and per-node §9/§10.4 signing: broadcast `sign_share`, point-equality verification, robust combine, low-s; `NodePayload` wire enum; `Cheat` fault injection), `src/seed.rs` (the M2 presignature shortcut: an orchestrated ceremony writing per-party SECRET seed files + a PUBLIC committee file; per-node presign is M3), `src/main.rs` (`node`/`setup`/`spawn-demo` process separation + `m1-demo`), `examples/mesh_perf.rs` (latency benchmark). M1 is the reference-orchestration pattern (one process holds all transport keys); M2 enforces key separation by construction. TLS, persistence, per-node presign are M3 |
 
 Architecture: per-party protocol logic is message-oriented (broadcast/P2P
 structs keyed by sender); the `runtime/transport.rs` seam (`Envelope` /
@@ -198,7 +213,15 @@ signatures, SPEC §13.1) without changing the per-party logic.
   (`node/tests/mesh_keygen.rs`) runs the same keygen over real TCP:
   joint-key reconstruction through `MeshTransport`, a cheating dealer
   blamed with a verifying `BlameToken`, and forged/unknown-sender/
-  malformed frames dropped while the honest keygen completes. Committee maintenance (§13.4): refresh
+  malformed frames dropped while the honest keygen completes. M2 per-party
+  drivers (`node/tests/party_mesh.rs`, thread-level with strict per-node
+  key separation; `node/tests/process_demo.rs`, real child processes via
+  `spawn-demo`): per-node keygen reconstructs the joint key (2-of-3 and
+  3-of-5), a cheating dealer is named by EVERY node through the wire §6.1
+  complaint/defense rounds, a false accuser is named by every node,
+  per-node signing yields a valid low-`s` signature, and a wrong signature
+  share is blamed by every node while the signature is still delivered.
+  Committee maintenance (§13.4): refresh
   preserves `X` while replacing every share and enables post-refresh
   presign+sign, outstanding presignatures are invalidated on refresh
   (`PresigStore::clear` — stale-id signing fails with `Error::PresigStore`),

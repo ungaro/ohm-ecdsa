@@ -1,5 +1,5 @@
 //! The full-mesh TCP layer (SPEC §13.1): `std::net` with blocking
-//! threads, no external runtime (M1; tokio is M2).
+//! threads, no external runtime (M1; tokio is M3).
 //!
 //! Topology: every node listens, and opens one outgoing connection to
 //! every peer. A pair of nodes therefore has two connections between
@@ -14,9 +14,21 @@
 //! applies the §4.7 first-echo rule for broadcasts, and feeds the shared
 //! mailbox. Unknown senders, bad signatures, and misrouted P2P are
 //! dropped and logged — they never reach the mailbox.
+//!
+//! Two M2 additions, both config-driven and off by default:
+//!
+//! * self-echo loopback ([`Node::set_self_echo_loopback`]): the node's own
+//!   echo is also delivered to its own mailbox. M1's orchestrator acceptor
+//!   saw every node's mailbox, so every honest echo was counted globally;
+//!   a per-node acceptor (M2, [`crate::party`]) sees only its own mailbox
+//!   and must count its own echo explicitly to reach the same
+//!   `⌈(n+1)/2⌉`-of-others acceptance rule.
+//! * artificial send delay ([`Node::set_send_delay`]): every outgoing
+//!   frame is written after a fixed sleep (on a helper thread), simulating
+//!   a per-link network latency for the `mesh_perf` benchmark.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -25,9 +37,10 @@ use std::time::Duration;
 
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use k256::SecretKey;
+use ohm_ecdsa::transport::{Decode, Encode};
 use ohm_ecdsa::{PartyId, Phase};
 
-use crate::wire::{read_frame, write_frame, Received, WireMessage};
+use crate::wire::{frame_bytes, read_frame, write_frame, Received, WireMessage};
 
 /// A broadcast slot `(sid, phase, round, from)`: at most one echo per
 /// node per slot (the §4.7 first-echo rule — an equivocating sender
@@ -35,7 +48,7 @@ use crate::wire::{read_frame, write_frame, Received, WireMessage};
 type SlotKey = (Vec<u8>, Phase, u8, PartyId);
 
 /// Shared per-node state: the outgoing half of the mesh plus the keys.
-pub(crate) struct NodeShared {
+pub(crate) struct NodeShared<M> {
     id: PartyId,
     key: SigningKey,
     registry: BTreeMap<PartyId, VerifyingKey>,
@@ -44,20 +57,25 @@ pub(crate) struct NodeShared {
     /// Broadcast slots this node already echoed.
     echoed: Mutex<BTreeSet<SlotKey>>,
     /// The mailbox every verified message is delivered to.
-    inbox: Sender<Received>,
+    inbox: Sender<Received<M>>,
+    /// Deliver this node's own echoes to its own mailbox (M2 per-node
+    /// acceptor; see the module docs).
+    self_echo_loopback: Mutex<bool>,
+    /// Artificial per-link send delay (benchmarks; 0 = off).
+    send_delay: Mutex<Duration>,
 }
 
 /// One node of the full mesh: a listener plus one outgoing connection to
 /// every peer. Dropping the node closes its outgoing connections (peer
 /// readers then see EOF); listener/reader threads are daemon-style and
-/// exit with the process (M1 simplification — clean shutdown is M2).
-pub struct Node {
+/// exit with the process (M1 simplification — clean shutdown is M3).
+pub struct Node<M> {
     id: PartyId,
     local: SocketAddr,
-    pub(crate) shared: Arc<NodeShared>,
+    pub(crate) shared: Arc<NodeShared<M>>,
 }
 
-impl Node {
+impl<M: Clone + Encode + Decode + Send + 'static> Node<M> {
     /// Bind the listener and start the accept loop. Peer connections are
     /// established by [`Node::connect`] once every node of the committee
     /// is bound.
@@ -66,7 +84,7 @@ impl Node {
         bind: SocketAddr,
         key: &SecretKey,
         registry: BTreeMap<PartyId, VerifyingKey>,
-        inbox: Sender<Received>,
+        inbox: Sender<Received<M>>,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(bind)?;
         let local = listener.local_addr()?;
@@ -77,6 +95,8 @@ impl Node {
             out: Mutex::new(BTreeMap::new()),
             echoed: Mutex::new(BTreeSet::new()),
             inbox,
+            self_echo_loopback: Mutex::new(false),
+            send_delay: Mutex::new(Duration::ZERO),
         });
         let accept_shared = Arc::clone(&shared);
         thread::spawn(move || accept_loop(listener, accept_shared));
@@ -92,6 +112,19 @@ impl Node {
     /// ephemeral port the OS picked).
     pub fn local_addr(&self) -> SocketAddr {
         self.local
+    }
+
+    /// Deliver this node's own echoes to its own mailbox (M2 per-node
+    /// acceptor mode; see the module docs). Off by default — M1's
+    /// orchestrator acceptor counts echoes globally and must NOT see
+    /// duplicates.
+    pub fn set_self_echo_loopback(&self, on: bool) {
+        *self.shared.self_echo_loopback.lock().expect("mesh mutex") = on;
+    }
+
+    /// Artificial per-link send delay (benchmarks; simulated WAN).
+    pub fn set_send_delay(&self, delay: Duration) {
+        *self.shared.send_delay.lock().expect("mesh mutex") = delay;
     }
 
     /// Open the outgoing connection to every peer in `addrs` (skipping
@@ -115,17 +148,21 @@ impl Node {
 
     /// Send one wire message to one peer. A dead peer is logged, not
     /// fatal: the round's timeout policy surfaces it (§13.1).
-    pub(crate) fn send_to(&self, to: PartyId, msg: &WireMessage) {
+    pub(crate) fn send_to(&self, to: PartyId, msg: &WireMessage<M>) {
         send_to(&self.shared, to, msg);
     }
 
     /// Send one wire message to every peer.
-    pub(crate) fn send_all(&self, msg: &WireMessage) {
+    pub(crate) fn send_all(&self, msg: &WireMessage<M>) {
         send_all(&self.shared, msg);
     }
 }
 
-fn send_to(shared: &NodeShared, to: PartyId, msg: &WireMessage) {
+fn send_to<M: Clone + Encode + Send + 'static>(
+    shared: &NodeShared<M>,
+    to: PartyId,
+    msg: &WireMessage<M>,
+) {
     let conn = {
         shared
             .out
@@ -134,19 +171,40 @@ fn send_to(shared: &NodeShared, to: PartyId, msg: &WireMessage) {
             .get(&to)
             .cloned()
     };
-    match conn {
-        Some(c) => {
-            if let Ok(mut s) = c.lock() {
-                if let Err(e) = write_frame(&mut *s, msg) {
-                    eprintln!("[node {}] send to {to} failed: {e}", shared.id);
-                }
+    let Some(c) = conn else {
+        eprintln!("[node {}] no connection to {to}", shared.id);
+        return;
+    };
+    let delay = *shared.send_delay.lock().expect("mesh mutex");
+    if delay.is_zero() {
+        if let Ok(mut s) = c.lock() {
+            if let Err(e) = write_frame(&mut *s, msg) {
+                eprintln!("[node {}] send to {to} failed: {e}", shared.id);
             }
         }
-        None => eprintln!("[node {}] no connection to {to}", shared.id),
+        return;
     }
+    // Delayed send (simulated link latency): encode once, write after the
+    // sleep on a helper thread so the sender is not blocked.
+    let frame = match frame_bytes(msg) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[node {}] encode for {to} failed: {e}", shared.id);
+            return;
+        }
+    };
+    let id = shared.id;
+    thread::spawn(move || {
+        thread::sleep(delay);
+        if let Ok(mut s) = c.lock() {
+            if let Err(e) = s.write_all(&frame) {
+                eprintln!("[node {id}] send to {to} failed: {e}");
+            }
+        }
+    });
 }
 
-fn send_all(shared: &NodeShared, msg: &WireMessage) {
+fn send_all<M: Clone + Encode + Send + 'static>(shared: &NodeShared<M>, msg: &WireMessage<M>) {
     let peers: Vec<PartyId> = shared
         .out
         .lock()
@@ -176,7 +234,10 @@ fn connect_retry(addr: SocketAddr) -> io::Result<TcpStream> {
     Err(last_err.expect("at least one connect attempt"))
 }
 
-fn accept_loop(listener: TcpListener, shared: Arc<NodeShared>) {
+fn accept_loop<M: Clone + Encode + Decode + Send + 'static>(
+    listener: TcpListener,
+    shared: Arc<NodeShared<M>>,
+) {
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -188,7 +249,10 @@ fn accept_loop(listener: TcpListener, shared: Arc<NodeShared>) {
     }
 }
 
-fn reader_loop(mut stream: TcpStream, shared: Arc<NodeShared>) {
+fn reader_loop<M: Clone + Encode + Decode + Send + 'static>(
+    mut stream: TcpStream,
+    shared: Arc<NodeShared<M>>,
+) {
     loop {
         match read_frame(&mut stream) {
             Ok(Some(msg)) => handle(msg, &shared),
@@ -203,7 +267,7 @@ fn reader_loop(mut stream: TcpStream, shared: Arc<NodeShared>) {
 
 /// The receive path: verify, apply the first-echo rule, deliver to the
 /// mailbox. Signature/consistency checks are never optional.
-fn handle(msg: WireMessage, shared: &NodeShared) {
+fn handle<M: Clone + Encode + Send + 'static>(msg: WireMessage<M>, shared: &NodeShared<M>) {
     if !msg.verify(&shared.registry) {
         eprintln!(
             "[node {}] dropped message: unknown sender or bad signature",
@@ -235,6 +299,15 @@ fn handle(msg: WireMessage, shared: &NodeShared) {
                 if first {
                     let echo = WireMessage::echo(shared.id, se.clone(), &shared.key);
                     send_all(shared, &echo);
+                    // M2 per-node acceptor mode: count this node's own
+                    // echo in its own mailbox (M1's orchestrator acceptor
+                    // saw it through the peers' mailboxes).
+                    if *shared.self_echo_loopback.lock().expect("mesh mutex") {
+                        let _ = shared.inbox.send(Received::Echo {
+                            echoer: shared.id,
+                            original: se.clone(),
+                        });
+                    }
                 }
             }
             let _ = shared.inbox.send(Received::Original(se));

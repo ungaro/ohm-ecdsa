@@ -11,13 +11,18 @@
 //!   ECHOING party so echoes are attributable: a relayed echo cannot be
 //!   planted under an honest party's name, and the acceptance count is
 //!   per distinct echoer.
+//!
+//! The payload type `M` is generic: M1 drives the core's
+//! [`DkgMessage`] through `drive_dkg_signed`; M2's per-node drivers
+//! ([`crate::party`]) use the node crate's own payload enum. The framing,
+//! echo, and signature rules are payload-agnostic.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
 use k256::ecdsa::signature::{Signer, Verifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
-use ohm_ecdsa::transport::{Decode, DkgMessage, Encode, SignedEnvelope};
+use ohm_ecdsa::transport::{Decode, Encode, SignedEnvelope};
 use ohm_ecdsa::PartyId;
 
 /// Domain separation for echo signatures (the core's tags are
@@ -25,29 +30,29 @@ use ohm_ecdsa::PartyId;
 const ECHO_TAG: &[u8] = b"OHM-ECDSA-NODE/v0.1/echo";
 
 /// Largest accepted frame: a garbage length prefix must not trigger an
-/// unbounded allocation. DKG frames are a few hundred bytes.
+/// unbounded allocation. Protocol frames are a few hundred bytes.
 const MAX_FRAME: u32 = 4 * 1024 * 1024;
 
 /// One message on the wire.
 #[derive(Clone, Debug)]
-pub enum WireMessage {
+pub enum WireMessage<M> {
     /// A protocol envelope as sent by its origin (broadcast or P2P),
     /// signed by the sender under the core's transport-signing tag.
-    Original(SignedEnvelope<DkgMessage>),
+    Original(SignedEnvelope<M>),
     /// A §4.7 echo of a broadcast, signed by the echoing party.
     Echo {
         /// The party emitting this echo.
         echoer: PartyId,
         /// The broadcast being echoed (itself signed by its sender).
-        original: SignedEnvelope<DkgMessage>,
+        original: SignedEnvelope<M>,
         /// The echoer's signature over `ECHO_TAG ‖ echoer ‖ original`.
         signature: Signature,
     },
 }
 
-impl WireMessage {
+impl<M: Encode> WireMessage<M> {
     /// Build a signed echo of a broadcast.
-    pub fn echo(echoer: PartyId, original: SignedEnvelope<DkgMessage>, key: &SigningKey) -> Self {
+    pub fn echo(echoer: PartyId, original: SignedEnvelope<M>, key: &SigningKey) -> Self {
         let signature: Signature = key.sign(&echo_bytes(echoer, &original));
         Self::Echo {
             echoer,
@@ -83,8 +88,8 @@ impl WireMessage {
     }
 }
 
-fn valid_original(
-    se: &SignedEnvelope<DkgMessage>,
+fn valid_original<M: Encode>(
+    se: &SignedEnvelope<M>,
     registry: &BTreeMap<PartyId, VerifyingKey>,
 ) -> bool {
     registry
@@ -92,7 +97,7 @@ fn valid_original(
         .is_some_and(|key| se.verify_signature(key))
 }
 
-fn echo_bytes(echoer: PartyId, original: &SignedEnvelope<DkgMessage>) -> Vec<u8> {
+fn echo_bytes<M: Encode>(echoer: PartyId, original: &SignedEnvelope<M>) -> Vec<u8> {
     let mut out = ECHO_TAG.to_vec();
     out.extend_from_slice(&(echoer as u64).to_be_bytes());
     original.encode(&mut out);
@@ -102,19 +107,19 @@ fn echo_bytes(echoer: PartyId, original: &SignedEnvelope<DkgMessage>) -> Vec<u8>
 /// A wire message that survived signature verification: the reader
 /// threads' output, the echo-broadcast acceptor's input.
 #[derive(Clone, Debug)]
-pub enum Received {
+pub enum Received<M> {
     /// A verified original envelope (broadcast or P2P).
-    Original(SignedEnvelope<DkgMessage>),
+    Original(SignedEnvelope<M>),
     /// A verified echo of a broadcast.
     Echo {
         /// The verified echoing party.
         echoer: PartyId,
         /// The verified broadcast being echoed.
-        original: SignedEnvelope<DkgMessage>,
+        original: SignedEnvelope<M>,
     },
 }
 
-impl Encode for WireMessage {
+impl<M: Encode> Encode for WireMessage<M> {
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Self::Original(se) => {
@@ -135,7 +140,7 @@ impl Encode for WireMessage {
     }
 }
 
-impl Decode for WireMessage {
+impl<M: Decode> Decode for WireMessage<M> {
     fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
         let tag = *bytes.first()?;
         let mut used = 1;
@@ -166,25 +171,32 @@ impl Decode for WireMessage {
     }
 }
 
-fn take_u64(b: &[u8]) -> Option<(u64, usize)> {
+pub(crate) fn take_u64(b: &[u8]) -> Option<(u64, usize)> {
     let a: [u8; 8] = b.get(..8)?.try_into().ok()?;
     Some((u64::from_be_bytes(a), 8))
 }
 
-/// Write one length-prefixed frame (`u32` BE length ‖ canonical bytes).
-pub fn write_frame(w: &mut impl Write, msg: &WireMessage) -> io::Result<()> {
+/// The canonical bytes of one framed message (`u32` BE length ‖ payload).
+pub fn frame_bytes<M: Encode>(msg: &WireMessage<M>) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     msg.encode(&mut buf);
     let len = u32::try_from(buf.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame too large"))?;
-    w.write_all(&len.to_be_bytes())?;
-    w.write_all(&buf)
+    let mut out = Vec::with_capacity(4 + buf.len());
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&buf);
+    Ok(out)
+}
+
+/// Write one length-prefixed frame (`u32` BE length ‖ canonical bytes).
+pub fn write_frame<M: Encode>(w: &mut impl Write, msg: &WireMessage<M>) -> io::Result<()> {
+    w.write_all(&frame_bytes(msg)?)
 }
 
 /// Read one frame. `Ok(None)` on a clean connection close between frames;
 /// `Err` on truncation, oversize, or malformed content (the caller drops
 /// the connection).
-pub fn read_frame(r: &mut impl Read) -> io::Result<Option<WireMessage>> {
+pub fn read_frame<M: Decode>(r: &mut impl Read) -> io::Result<Option<WireMessage<M>>> {
     let mut hdr = [0u8; 4];
     if !read_exact_or_eof(r, &mut hdr)? {
         return Ok(None);

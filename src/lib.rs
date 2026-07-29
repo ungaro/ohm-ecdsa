@@ -146,7 +146,12 @@ pub(crate) mod tags {
 }
 
 /// Hash a Feldman commitment vector into a transcript digest.
-pub(crate) fn hash_commitment(
+///
+/// Public so per-party drivers outside this crate (the node crate's M2
+/// per-node keygen driver) can re-verify the §6 commit-reveal binding on
+/// their own accepted message sets — the same check
+/// [`dkg::DkgInstance::finalize`] performs internally.
+pub fn hash_commitment(
     sid: &[u8],
     tag: &[u8],
     party: PartyId,

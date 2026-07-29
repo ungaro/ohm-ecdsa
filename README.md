@@ -173,10 +173,13 @@ let sig = sim::run_sign(&params, &presigs[..2], b"hello threshold", None).unwrap
 | `blame_token` | §10.2/§A.4: signed envelopes, offline-verifiable blame tokens, forgery rejection | `cargo run --example blame_token` |
 | `epoch_refresh` | §13.4 refresh + re-share to a new committee, X unchanged | `cargo run --example epoch_refresh` |
 
-The companion crate ships a networked demo (M1): a 3-node committee on
-localhost real TCP with echo broadcast and signed envelopes, keygen
-through `drive_dkg_signed` — `cargo run -p ohm-ecdsa-node` (see
-`node/README.md`).
+The companion crate ships networked demos over localhost real TCP with
+echo broadcast and signed envelopes (see `node/README.md`): the M2
+per-party demo — three OS processes each holding only its own key,
+keygen with §6.1 complaints on the wire plus online signing,
+`cargo run -p ohm-ecdsa-node -- spawn-demo` — and the original M1
+orchestrator demo (`-- m1-demo`). A mesh latency benchmark lives at
+`cargo run --release -p ohm-ecdsa-node --example mesh_perf`.
 
 ## Choosing parameters (T, n, B)
 
@@ -304,12 +307,17 @@ sets, issuers, auditors.
   wire format (no serde) shared by the signing layer and the node crate
 * M1 transport companion crate `ohm-ecdsa-node` (`node/`): full-mesh real
   TCP, §4.7 echo broadcast, §10.2 signed envelopes verified on receipt,
-  keygen through `drive_dkg_signed` (`cargo run -p ohm-ecdsa-node`)
+  keygen through `drive_dkg_signed`
+* M2 per-party node drivers (`node/src/party.rs`): each party holds only
+  its own key and runs as its own OS process; per-node keygen with the
+  §6.1 complaint subprotocol on the wire (consistent blame at every
+  node), per-node §9/§10.4 online signing (wrong shares blamed, signature
+  still delivered); presignatures seeded from a prior orchestrated run
+  (per-node presign is M3); `spawn-demo` + `mesh_perf` latency benchmark
 
-**Not yet** (roadmap): production-hardened transport over the seam (M2:
-TLS/mTLS, persistence of accepted-message sets, per-party process
-separation — the `transport` module is the contract; the node crate is
-the M1 reference over it), key rotation
+**Not yet** (roadmap): production-hardened transport (M3: TLS/mTLS,
+persistence of accepted-message sets, per-node presign over the mesh —
+the `transport` module is the contract), key rotation
 (§13.4 — re-DKG with a new `X`), audit.
 
 ## Documentation map
@@ -326,7 +334,7 @@ the M1 reference over it), key rotation
 ## Layout
 
 Two crates in one workspace: the core library `ohm-ecdsa` (repo root —
-dependency-pure, no networking) and the M1 transport companion
+dependency-pure, no networking) and the transport companion
 `ohm-ecdsa-node` (`node/` — owns all networking; see `node/README.md`).
 
 Sources are layered under `src/` — `primitives/` (SPEC §4 building
@@ -350,7 +358,7 @@ crate root (`ohm_ecdsa::shamir`, `ohm_ecdsa::sim`, …).
 | `runtime/transport` | 4.7, 10.2, 13.1, 13.2 | transport seam: `Envelope` message contract, sync `Transport` trait, `SimTransport` reference impl, `drive_dkg` transport-driven keygen driver, signed envelopes (`SignedEnvelope`/`SigningTransport`), offline-verifiable `BlameToken`, `drive_dkg_signed` |
 | `runtime/transport` | 4.7, 10.2, 13.1, 13.2 | transport seam: `Envelope` message contract, sync `Transport` trait, `SimTransport` reference impl, `drive_dkg` transport-driven keygen driver, canonical `Encode`/`Decode` wire format, signed envelopes (`SignedEnvelope`/`SigningTransport`), offline-verifiable `BlameToken`, `drive_dkg_signed` |
 | `runtime/sim` | 4.7, 10.3, 13.2 | reference orchestrator (keygen routes through the `transport` seam), §10.3 restart wrappers |
-| `node/` (crate `ohm-ecdsa-node`) | 4.7, 10.2, 13.1, 13.2 | M1 transport companion: full-mesh real TCP, signed envelopes verified on receipt, echo broadcast, `MeshTransport`, keygen demo + integration tests |
+| `node/` (crate `ohm-ecdsa-node`) | 4.7, 10.2, 13.1, 13.2 | transport companion: full-mesh real TCP, signed envelopes verified on receipt, echo broadcast; M1 `MeshTransport` orchestrator driver; M2 `PartyNode` per-party drivers (keygen with §6.1 wire complaints, §9/§10.4 signing, process separation, `mesh_perf` benchmark) |
 
 Contributions: keep `cargo fmt && cargo clippy --workspace --all-targets &&
 cargo test --workspace` green; follow `AGENTS.md`.
