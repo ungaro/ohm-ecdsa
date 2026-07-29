@@ -57,9 +57,25 @@ sequenceDiagram
 ```
 
 If either party broadcasts a wrong share, point-equality against the
-public Feldman commitments fails and names the cheater — no proof
-systems, no trusted hardware. Full diagrams per phase:
-[`SPEC.md`](./SPEC.md) §5, §6, §8, §9.
+public Feldman commitments fails **and names the cheater** — no proof
+systems, no trusted hardware:
+
+```mermaid
+sequenceDiagram
+    participant A as Alice (honest)
+    participant M as Mallory (faulty)
+    participant B as Bob (honest)
+    Note over A,B: Sign round, presig #7
+    M->>A: s̃_M  (a wrong share!)
+    M->>B: s̃_M
+    Note over A: s̃_M·G ≠ EvalCom(A[s], M) ✗
+    Note over B: same check fails ✗
+    Note over A,B: Mallory is NAMED — the public commitment<br/>is the evidence. Robust mode: exclude her,<br/>signature still delivered (§10.4)
+```
+
+More walkthrough diagrams (keygen ceremony, offline factories, cheater
+blame, lost-phone recovery): [`docs/diagrams.md`](./docs/diagrams.md).
+Normative per-phase diagrams: [`SPEC.md`](./SPEC.md) §5, §6, §8, §9.
 
 ## Quick start
 
@@ -220,6 +236,7 @@ contract, not an implementation), serde wire format, key rotation
 
 ## Documentation map
 
+* Visual walkthrough (Alice/Bob sequence diagrams) → `docs/diagrams.md`
 * Protocol design, notation, diagrams → [`SPEC.md`](./SPEC.md) §1–§10
 * Security claims, proof obligations, and the game-based proof skeleton → SPEC §11 (esp. §11.4)
 * Patent design-around analysis → SPEC §12
