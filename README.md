@@ -12,6 +12,53 @@ triples + commit-reveal DKG. The full protocol is specified in
 [`SPEC.md`](./SPEC.md), including the patent design-around analysis
 (US 11,757,657 / Sepior and KU23 / Dfns; §12).
 
+**Contents:** [Motivation](#motivation-the-patent-situation) ·
+[How it works](#how-it-works) · [Quick start](#quick-start) ·
+[Usage](#usage) · [Examples](#examples) ·
+[Choosing parameters](#choosing-parameters-t-n-b) ·
+[How it compares](#how-it-compares) ·
+[Why this is useful](#why-this-is-useful) · [Status](#status) ·
+[Documentation map](#documentation-map) · [Layout](#layout) ·
+[Security notes](#security-notes) · [Patent notes](#patent-notes) ·
+[License](#license)
+
+## Motivation: the patent situation
+
+A brief history, because it repeats.
+
+Schnorr signatures were patented (US 4,995,082), so in 1991 NIST
+standardized something else instead: DSA, and later ECDSA — a scheme
+whose main virtue was not being Schnorr's patent. The Schnorr patent
+expired in 2008; the workaround is still the world's signature scheme.
+
+Now the sequel. Threshold ECDSA in the honest-majority setting is
+thirty-year-old public science (GJKR, 1996). The two modern refinements
+that make it fast in practice:
+
+* **DJNPO20** (*Fast Threshold ECDSA with Honest Majority*, ePrint
+  2020/501) — "appears covered by US Patent 11,757,657", as Jonathan
+  Katz put it at NIST MPTS 2023. The patent was granted to **Sepior**
+  in 2023; Sepior has since been renamed **Blockdaemon**, which sells
+  institutional custody on, among other things, this technology.
+* **KU23** (*key-independent batch presignatures*, ePrint 2024/2011) —
+  described by **Dfns**, the authors' employer, on its own blog as
+  "this patented protocol", saving everyone the guesswork.
+
+So: a signature scheme that exists *because of a patent workaround* now
+has its threshold evolution patented — including claim elements built
+from 1989–1996 public literature (share exponentiation, honest-majority
+multiplication) that the patent's own background section cites. The
+circle of life.
+
+OHM-ECDSA is the counter-move, assembled entirely from the same public
+components, minus the claimed elements: deal `[k⁻¹]` directly instead
+of the patented masked inversion; Beaver triples instead of the claimed
+zero-sharings; Feldman point equality instead of the patented
+honest-share counting check — a check which, unlike ours, cannot even
+say *which* party cheated. Then publish everything, timestamped, so the
+next one can't be patented either (§12.5). Apache-2.0, with its express
+patent grant.
+
 ## How it works
 
 Heavy cryptography runs **offline**, in bulk, ahead of time. When a
@@ -123,6 +170,7 @@ let sig = sim::run_sign(&params, &presigs[..2], b"hello threshold", None).unwrap
 | `wallet_2_of_3` | 2-of-3 wallet: presig pool, single-use store, lost-phone recovery | `cargo run --example wallet_2_of_3` |
 | `consortium_custody` | 3-of-5: batch presigs, T-party subset signing, HD-tweak sub-keys | `cargo run --example consortium_custody` |
 | `identifiable_abort` | tampered share: fail-fast blame vs robust delivery (§10.4) | `cargo run --example identifiable_abort` |
+| `blame_token` | §10.2/§A.4: signed envelopes, offline-verifiable blame tokens, forgery rejection | `cargo run --example blame_token` |
 | `epoch_refresh` | §13.4 refresh + re-share to a new committee, X unchanged | `cargo run --example epoch_refresh` |
 
 ## Choosing parameters (T, n, B)
@@ -142,13 +190,31 @@ quorum to `T + B − 1` (privacy stays `T−1`):
 | 3-of-6 | 2 | 3 | 1 | 1 | one restart without re-sharing |
 | 3-of-9 | 2 | 3 (packed: 5) | 3 | 4 | packed throughput mode |
 
+## How it compares
+
+Against the two encumbered honest-majority protocols, on the metrics
+that are machine-independent (sources and timing context:
+[`SPEC.md`](./SPEC.md) Appendix B):
+
+| | DJNPO20 (patented) | KU23 (patented) | OHM-ECDSA |
+|---|---|---|---|
+| Online signing | 1 round | non-interactive, needs semi-honest coordinator | 1 round |
+| Identifiable abort | ✗ (given up for speed) | ✗ (detects, can't blame) | ✓ — unconditional |
+| Guaranteed delivery | ✗ | ✗ | ✓ (optional, §10.4) |
+| Presignatures | key-independent | key-independent, batched | key-dependent (by design, §12.3) |
+| Reported presig cost | 34 ms (AWS, LAN) | 1.3 ms amortized at batch 10,000 | 9.7 ms; 5.2 ms packed |
+| Reported online cost | 19.9 ms end-to-end | ≈80 µs local + network | 0.28 ms local |
+| Assumptions | ECDLP | ECDLP + GGM + coordinator | ECDLP + ROM |
+| Patent status | US 11,757,657 | per Dfns | none — prior-art published |
+
+Timings are quoted from the respective papers under different hardware
+and network conditions — treat them as context, not a shootout. The
+rows that matter: identifiability, delivery, and encumbrance.
+
 ## Why this is useful
 
-The two practical honest-majority threshold-ECDSA protocols are
-patent-encumbered (Blockdaemon's TSM descends from Sepior; Dfns
-describes its KU23 line as patented). An Apache-2.0 implementation with
-an express patent grant changes what teams can build and operate
-themselves:
+An Apache-2.0 implementation of an unencumbered design (see Motivation
+above) changes what teams can build and operate themselves:
 
 * **Self-hosted institutional custody.** Run and modify your own MPC
   signing core — no per-wallet vendor fee, no closed-source black box in
@@ -167,8 +233,10 @@ themselves:
   provider, recovery agent) enforces segregation of duties
   cryptographically. Identifiable abort turns "who touched this signing
   session" into a verifiable fact: every deviation yields a blame token
-  checkable offline (SPEC §10.2, once the deployment transport signs
-  messages per §13.1) — usable for SLAs, insurance, examiner reviews.
+  checkable offline (SPEC §10.2 — the mechanism is implemented and
+  demonstrated in `examples/blame_token.rs`; a production deployment
+  still needs the full §13.1 transport: mTLS, echo broadcast, transcript
+  persistence) — usable for SLAs, insurance, examiner reviews.
   HD tweaks (§9.4) derive unlimited per-fund or per-investor sub-keys
   locally — one key ceremony, not one per listing.
 * **Long-lived keys with proactive security.** Epoch refresh (§13.4,
@@ -268,7 +336,7 @@ crate root (`ohm_ecdsa::shamir`, `ohm_ecdsa::sim`, …).
 | `runtime/store` | 8.6 | single-use presignature store (atomic consume, `clear` for epoch changes) |
 | `runtime/policy` | 10.3 | `restart_committee` — expel-and-restart committee computation (never lowers `t`) |
 | `protocol/refresh` | 13.4 | committee maintenance with `X` unchanged: proactive zero-constant refresh (`refresh`) and re-sharing to a new committee with public old-share binding (`reshare`), `ReshareTamper` hooks |
-| `runtime/transport` | 4.7, 10.2, 13.1, 13.2 | transport seam: `Envelope` message contract, sync `Transport` trait, `SimTransport` reference impl, `drive_dkg` transport-driven keygen driver |
+| `runtime/transport` | 4.7, 10.2, 13.1, 13.2 | transport seam: `Envelope` message contract, sync `Transport` trait, `SimTransport` reference impl, `drive_dkg` transport-driven keygen driver, signed envelopes (`SignedEnvelope`/`SigningTransport`), offline-verifiable `BlameToken`, `drive_dkg_signed` |
 | `runtime/sim` | 4.7, 10.3, 13.2 | reference orchestrator (keygen routes through the `transport` seam), §10.3 restart wrappers |
 
 ## Security notes
