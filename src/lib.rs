@@ -17,7 +17,9 @@
 //!   channel; swap in a real transport for deployment)
 //! * [`transport`] — the explicit transport seam (SPEC §13.1/§13.2):
 //!   `Envelope` message contract, sync `Transport` trait, `SimTransport`
-//!   reference implementation, transport-driven DKG driver
+//!   reference implementation, transport-driven DKG driver, §10.2 signed
+//!   envelopes (`SignedEnvelope`/`SigningTransport`) and
+//!   offline-verifiable `BlameToken`s
 //!
 //! Security: this is a *reference* implementation of an *unreviewed draft*
 //! protocol. It has not been audited. See SPEC.md §13 for the hardening
@@ -140,6 +142,7 @@ pub(crate) mod tags {
     pub const SESSION_ID: &[u8] = b"OHM-ECDSA/v0.1/session-id";
     pub const REFRESH_COMMIT: &[u8] = b"OHM-ECDSA/v0.1/refresh-commit";
     pub const RESHARE_COMMIT: &[u8] = b"OHM-ECDSA/v0.1/reshare-commit";
+    pub const TRANSPORT_SIGN: &[u8] = b"OHM-ECDSA/v0.1/transport-sign";
 }
 
 /// Hash a Feldman commitment vector into a transcript digest.

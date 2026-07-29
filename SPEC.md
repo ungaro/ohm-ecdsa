@@ -32,6 +32,7 @@ The construction deliberately avoids the claim elements of US Patent 11,757,657 
 13. Implementation Notes and Disclaimers
 14. References
 A. Deployment Topologies (informative)
+B. Performance and Feature Comparison (informative)
 
 ---
 
@@ -452,7 +453,7 @@ Every broadcast value in OHM-ECDSA is either (i) a hash that must match a later 
 
 ### 10.2 Non-repudiation
 
-All protocol messages are signed by their sender under the deployment PKI and carry `(sid, phase, round)`. A **blame token** is the offending message plus the public reference (commitment vector, session id); any third party (auditor, watchtower, the other servers) can verify blame offline. This matters operationally: blame leads to expulsion, and expulsion should be defensible.
+All protocol messages are signed by their sender under the deployment PKI and carry `(sid, phase, round)`. A **blame token** is the offending message plus the public reference (commitment vector, session id); any third party (auditor, watchtower, the other servers) can verify blame offline (implemented in the reference crate: `src/runtime/transport.rs`, demonstrated by `examples/blame_token.rs`). This matters operationally: blame leads to expulsion, and expulsion should be defensible.
 
 ### 10.3 Policy after blame
 
@@ -755,3 +756,45 @@ Notes. Day-to-day signing is `P1 + P2` (one round, sub-millisecond online math).
 | presignature store | per-key binding, duplicate-id rejection | per key |
 | transcripts + blame tokens | integrity (append-only), no confidentiality needed | compliance retention |
 | public commitments `A[x]`, `X` | integrity only | key lifetime |
+
+---
+
+## Appendix B. Performance and feature comparison with DJNPO20 and KU23 (informative)
+
+**Methodology.** Figures for DJNPO20 [^djnpo] and KU23 [^ku23] are quoted from those papers; OHM-ECDSA figures are measured with the reference crate (`cargo run --release --example perf`, Apple M4 Max, single-threaded sim). These are **not** apples-to-apples timings: DJNPO20's numbers are real multi-machine AWS deployments (Java/OpenSSL, including client round-trips and database access), KU23's are single-machine simulations with artificial network delay (Rust, M1, `n=5, t=2`), and ours are single-machine simulations with no network at all. The machine-independent rows (rounds, features) are the fair comparison; the timing rows are context.
+
+### B.1 Rounds (machine-independent)
+
+| Protocol | KeyGen | Presign | Online sign |
+|---|---|---|---|
+| DJNPO20 | ~2 (derived; not stated) | 3 | 1 (non-interactive among servers; shares to the client) |
+| KU23 | out of scope (one-time PRSS setup) | ~5 after setup (derived; not stated) | non-interactive (one message to the coordinator) |
+| OHM-ECDSA | 3 | 4 (+2 piggybacked); constant per batch (§7.3/§8.5) | 1 broadcast round |
+
+### B.2 Reported timings (context, not shootout)
+
+| | Presign | Online sign |
+|---|---|---|
+| DJNPO20 (AWS m5.xlarge, LAN, `n=3, t=1`) | 34.2 ms | 19.9 ms end-to-end |
+| DJNPO20 batched (100/request, `n=3`) | ~600 presig/s per added worker | — |
+| KU23 (M1, `n=5, t=2`, simulated network) | 1.30 ms amortized (batch 10,000); 680 ms unbatched at 50 ms delay | ≈80 µs local + network to coordinator |
+| OHM-ECDSA (M4 Max, sim, 2-of-3) | 9.7 ms single; ~9.5 ms/presig batched; 5.2 ms/presig packed (2-of-5, B=2) | 0.28 ms local |
+
+### B.3 Feature matrix
+
+| | DJNPO20 | KU23 | OHM-ECDSA |
+|---|---|---|---|
+| Identifiable abort | **no** (explicitly given up for speed) | **no** (detects, cannot blame) | **yes** — unconditional detection, §11 C3 |
+| Robustness / GOD | no (optional fairness extension) | no | **yes** (optional, §10.4) |
+| Presignature key-dependence | key-independent | key-independent, batched | **key-dependent** (patent design-around, §12.3) |
+| Coordinator | none | **semi-honest coordinator required** | none (any party may coordinate) |
+| Assumptions | ECDLP only | ECDLP (+ GGM for presig-ECDSA) | ECDLP + ROM |
+| Machinery | no HE/OT/ZK proofs | PRSS, weak multiplication, batch triple check | Shamir + Feldman + Beaver + DLEQ only |
+| Patent status | US 11,757,657 (Sepior → Blockdaemon) | described as patented by Dfns | none; defensive publication (§12.5) |
+
+### B.4 Reading the numbers honestly
+
+1. **KU23's 1.3 ms/presig** is the amortization of *key-independent* batching at `m = 10,000` behind a semi-honest coordinator — a different feature set (and their patent, §12.3). Unbatched with realistic delay it is 680 ms. The comparison that matters for OHM-ECDSA is structural: one-time setup, constant rounds, then local math — which both designs achieve differently.
+2. **DJNPO20's 19.9 ms "sign"** includes the client round-trip and database; OHM-ECDSA's 0.28 ms is local computation only. The machine-independent row — one online round each — is the meaningful comparison.
+3. **OHM-ECDSA's differentiators are not raw speed**: identifiability (unconditional), guaranteed delivery, no coordinator, and unencumbered status. Where the patented systems post better numbers, the stated path is §7.4 packing (measured 1.43–1.83× per item, growing with `n` and `B`) and a real transport (round amortization, §13.5 caveat 1) — not a different cryptography budget.
+4. **Neither patented protocol can name a cheater.** For deployments where accountability is the point (Appendix A — auditors, SLAs, slashing), that is the deciding row of the matrix, and it costs nothing in rounds.

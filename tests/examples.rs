@@ -83,3 +83,17 @@ fn example_epoch_refresh() {
         ],
     );
 }
+
+#[test]
+fn example_blame_token() {
+    let stdout = run_example("blame_token");
+    assert_guarantees(
+        "blame_token",
+        &stdout,
+        &[
+            "blamed: [2]",
+            "auditor verifies the blame token: true",
+            "forgery rejected by the auditor: true",
+        ],
+    );
+}
