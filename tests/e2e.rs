@@ -323,6 +323,35 @@ fn batch_triples_are_multiplicative() {
 }
 
 #[test]
+fn batch_triples_one_bad_proof_blames_prover() {
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 60);
+    // Party 2 broadcasts one invalid DLEQ product proof out of 5 (F3): the
+    // aggregate fast path fails and the per-proof fallback attributes the
+    // blame to that exact prover (per-triple blame, SPEC §7.3).
+    let tamper = TripleTamper {
+        bad_product_proof_at: Some((2, 3)),
+        ..Default::default()
+    };
+    let err = triples::generate_batch_with_tamper(
+        &params,
+        b"triple-batch/60",
+        5,
+        &mut rngs,
+        Some(&tamper),
+    )
+    .unwrap_err();
+    match err {
+        Error::Abort { abort } => {
+            assert_eq!(abort.phase, Phase::Triples);
+            assert_eq!(abort.blamed, vec![2]);
+            assert!(abort.detail.contains("batch index 3"));
+        }
+        other => panic!("expected identifiable abort, got {other:?}"),
+    }
+}
+
+#[test]
 fn batch_presign_sign_distinct_messages() {
     let params = Params::new(3, 2).unwrap();
     let mut rngs = sim::make_rngs(3, 21);

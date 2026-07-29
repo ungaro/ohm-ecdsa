@@ -583,6 +583,7 @@ pub fn presign_batch_with_committee(
         &[sid.as_slice(), b"/triples"].concat(),
         2 * count,
         rngs,
+        None,
     )?;
 
     // P1: one batch joint VSS for u⁽¹..B⁾ (indices 0..B) and a⁽¹..B⁾ (B..2B).

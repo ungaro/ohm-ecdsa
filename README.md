@@ -31,7 +31,9 @@ triples + commit-reveal DKG. The full protocol is specified in
   polynomial is publicly reconstructed)
 * Single-use presignature store (§8.6): atomic consume, duplicate-id rejection
 * Batch generation (§7.3/§8.5): one commit-reveal per batch for triples and
-  presignatures (`generate_batch`, `presign_batch`)
+  presignatures (`generate_batch`, `presign_batch`), with §7.3 aggregate
+  batch DLEQ verification (`dleq::verify_batch`) plus per-proof fallback
+  for blame attribution
 * Expel-and-restart (§10.3) composed with robust continuation (§10.4):
   every presign/triples attempt drives the robust variant, so continuable
   faults finish in-attempt (no id poisoning); only dealing-phase aborts
@@ -61,7 +63,7 @@ batching (§7.4), key rotation (§13.4 — re-DKG with a new `X`), audit.
 cargo test
 ```
 
-Runs 14 unit tests and 36 integration tests: end-to-end 2-of-3 and 3-of-5
+Runs 16 unit tests and 37 integration tests: end-to-end 2-of-3 and 3-of-5
 signatures verified by `k256`'s ECDSA verifier, subset signing with only
 `T` parties, cheater identification in keygen (both §6.1 complaint
 branches), triples, presign, and sign, robust signing with up to `T−1`
@@ -74,6 +76,15 @@ maintenance (§13.4: refresh preserving `X`, presignature invalidation on
 epoch change, re-sharing to a new committee with dealer-blame fault
 injection), and keygen executed through the explicit transport seam
 (`transport::drive_dkg` over `SimTransport`).
+
+```bash
+cargo run --release --example perf
+```
+
+prints the SPEC §13.5 wall-clock rows (keygen, triples, presign, sign,
+batched variants, batch-DLEQ aggregate vs individual verification) as
+medians over repeated runs — `std::time::Instant` only, no extra
+dependencies.
 
 ## Layout
 

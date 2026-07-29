@@ -151,6 +151,11 @@ pub struct TripleTamper {
     /// This party broadcasts an invalid DLEQ product proof in T2 (F3); the
     /// prover is blamed.
     pub bad_product_proof: Option<PartyId>,
+    /// Batch sessions only ([`generate_batch_with_tamper`]): this party
+    /// broadcasts an invalid DLEQ product proof at the given batch index
+    /// in T2 (F3); the prover is blamed with per-triple attribution after
+    /// the aggregate-verification fallback.
+    pub bad_product_proof_at: Option<(PartyId, usize)>,
 }
 
 /// Generate one Beaver triple shared across the `1..=n` committee.
@@ -512,16 +517,28 @@ pub fn generate_batch(
     count: usize,
     rngs: &mut [StdRng],
 ) -> Result<Vec<Vec<(TripleShare, TriplePublic)>>> {
-    generate_batch_with_committee(&Committee::full(params), sid, count, rngs)
+    generate_batch_with_tamper(params, sid, count, rngs, None)
+}
+
+/// [`generate_batch`] with fault-injection hooks (tests).
+pub fn generate_batch_with_tamper(
+    params: &Params,
+    sid: &[u8],
+    count: usize,
+    rngs: &mut [StdRng],
+    tamper: Option<&TripleTamper>,
+) -> Result<Vec<Vec<(TripleShare, TriplePublic)>>> {
+    generate_batch_with_committee(&Committee::full(params), sid, count, rngs, tamper)
 }
 
 /// [`generate_batch`] over an explicit committee (SPEC §10.3 restart).
-/// `rngs[i]` belongs to `committee.ids()[i]`.
+/// `rngs[i]` belongs to `committee.ids()[i]`; tamper hooks name ids.
 pub fn generate_batch_with_committee(
     committee: &Committee,
     sid: &[u8],
     count: usize,
     rngs: &mut [StdRng],
+    tamper: Option<&TripleTamper>,
 ) -> Result<Vec<Vec<(TripleShare, TriplePublic)>>> {
     let ids = committee.ids();
     let n = ids.len();
@@ -574,17 +591,55 @@ pub fn generate_batch_with_committee(
         resh_shares.push(d_shares);
     }
 
+    // Fault injection (tests).
+    if let Some(tamp) = tamper {
+        if let Some((j, idx)) = tamp.bad_product_proof_at {
+            if let Some(p) = committee.position(j) {
+                if let Some(proof) = proofs[p].get_mut(idx) {
+                    proof.2.z += Scalar::ONE; // invalid DLEQ proof (F3)
+                }
+            }
+        }
+    }
+
     // T3: verify all proofs and re-shared shares; Lagrange-combine per b.
     let mut ccs: Vec<Option<FeldmanCommitment>> = (0..count).map(|_| None).collect();
     for (k, &j) in ids.iter().enumerate() {
+        // SPEC §7.3 "batch proof verification" (fast path): all B product
+        // proofs of this prover are checked with ONE aggregate
+        // verification — two multi-scalar multiplications instead of 2B
+        // individual ones. The aggregate accepts an all-valid batch iff
+        // per-proof `dleq::verify` would, so the accept/reject decision is
+        // unchanged. On aggregate failure the per-b loop re-verifies each
+        // proof individually, blaming the exact failing proof (per-triple
+        // blame, F3).
+        let statements: Vec<(
+            ProjectivePoint,
+            ProjectivePoint,
+            ProjectivePoint,
+            ProjectivePoint,
+        )> = (0..count)
+            .map(|b| {
+                let (x1, x2, _) = &proofs[k][b];
+                (
+                    ProjectivePoint::GENERATOR,
+                    *x1,
+                    cbs[b].eval_at(j), // β_j⁽ᵇ⁾·G
+                    *x2,
+                )
+            })
+            .collect();
+        let pfs: Vec<&dleq::DleqProof> = proofs[k].iter().map(|(_, _, p)| p).collect();
+        let aggregate_ok = dleq::verify_batch(sid, tags::TRIPLE_PRODUCT, j, &statements, &pfs);
         for b in 0..count {
             let base_a = cas[b].eval_at(j); // α_j⁽ᵇ⁾·G
-            let base_b = cbs[b].eval_at(j); // β_j⁽ᵇ⁾·G
             let (x1, x2, proof) = &proofs[k][b];
             let c_j = &resh_coms[k][b];
-            if *x1 != base_a
-                || *x2 != c_j.points[0]
-                || !dleq::verify(
+            let proof_ok = aggregate_ok || {
+                // Fallback after aggregate failure: individual
+                // verification for per-triple blame attribution.
+                let base_b = cbs[b].eval_at(j); // β_j⁽ᵇ⁾·G
+                dleq::verify(
                     sid,
                     tags::TRIPLE_PRODUCT,
                     &ProjectivePoint::GENERATOR,
@@ -593,7 +648,8 @@ pub fn generate_batch_with_committee(
                     x2,
                     proof,
                 )
-            {
+            };
+            if *x1 != base_a || *x2 != c_j.points[0] || !proof_ok {
                 // F3: invalid DLEQ product proof — the prover is blamed.
                 return Err(Error::Abort {
                     abort: IdentifiableAbort {
