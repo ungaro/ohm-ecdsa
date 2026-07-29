@@ -107,6 +107,52 @@ fn bench_dleq() {
     println!("| aggregate `dleq::verify_batch` | {} ms |", ms(aggregate));
 }
 
+/// Packed mode (SPEC §7.4) vs §7.3 batching on the same FY-valid
+/// committee: `B` triples / presignatures per session, per-item
+/// amortized. The §7.4 "Accounting" prediction: the win concentrates in
+/// commitment/proof work (2 polys of degree `d` dealt per party vs `2B`
+/// of degree `t−1`; `n` DLEQ proofs vs `B·n`).
+fn bench_packed(n: usize, t: usize, b: usize, iters: usize) {
+    let params = Params::new(n, t).unwrap();
+    let mut seed = 0xBEEFu64;
+    let mut rngs = move || {
+        seed += 1;
+        sim::make_rngs(n, seed)
+    };
+    let keys = sim::run_keygen(&params, b"perf/keys-p", &mut rngs()).unwrap();
+    let ids: Vec<u64> = (1..=b as u64).collect();
+    let tri_batch = median(iters, || {
+        triples::generate_batch(&params, b"perf/tb", b, &mut rngs()).unwrap();
+    });
+    let tri_packed = median(iters, || {
+        triples::generate_packed(&params, b"perf/tp", b, &mut rngs(), None).unwrap();
+    });
+    let pre_batch = median(iters, || {
+        sim::run_presign_batch(&params, &keys, &ids, &mut rngs(), None).unwrap();
+    });
+    let pre_packed = median(iters, || {
+        sim::run_presign_packed(&params, &keys, &ids, &mut rngs(), None).unwrap();
+    });
+    println!("### {t}-of-{n}, B={b}: batch (§7.3) vs packed (§7.4), median ms");
+    println!("| Operation | batch total | batch/item | packed total | packed/item |");
+    println!("|---|---|---|---|---|");
+    println!(
+        "| {b} triples | {} | {} | {} | {} |",
+        ms(tri_batch),
+        ms(tri_batch / b as u32),
+        ms(tri_packed),
+        ms(tri_packed / b as u32)
+    );
+    println!(
+        "| {b} presignatures | {} | {} | {} | {} |",
+        ms(pre_batch),
+        ms(pre_batch / b as u32),
+        ms(pre_packed),
+        ms(pre_packed / b as u32)
+    );
+    println!();
+}
+
 fn main() {
     println!(
         "OHM-ECDSA perf — single-threaded sim, arch {}",
@@ -115,5 +161,7 @@ fn main() {
     println!();
     bench_group(3, 2, 50);
     bench_group(5, 3, 20);
+    bench_packed(5, 2, 2, 20);
+    bench_packed(9, 3, 3, 10);
     bench_dleq();
 }

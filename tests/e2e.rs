@@ -10,6 +10,7 @@ use ohm_ecdsa::dkg::DkgTamper;
 use ohm_ecdsa::open::open;
 use ohm_ecdsa::presign::{self, KeyShare, PresignTamper};
 use ohm_ecdsa::refresh::ReshareTamper;
+use ohm_ecdsa::shamir::{interpolate_at, slot_point};
 use ohm_ecdsa::sim;
 use ohm_ecdsa::transport::{self, SimTransport};
 use ohm_ecdsa::triples::{self, TripleShare, TripleTamper};
@@ -388,6 +389,156 @@ fn batch_presign_cheater_is_identified() {
             assert_eq!(abort.blamed, vec![3]);
         }
         other => panic!("expected identifiable abort, got {other:?}"),
+    }
+}
+
+#[test]
+fn packed_triples_are_multiplicative() {
+    // t=2, B=2, n=5 — FY-minimal committee: n ≥ 2t+2B−3 = 5 (SPEC §7.4.1).
+    let params = Params::new(5, 2).unwrap();
+    let mut rngs = sim::make_rngs(5, 70);
+    let b_pack = 2;
+    let packed =
+        triples::generate_packed(&params, b"packed-triples/70", b_pack, &mut rngs, None).unwrap();
+    assert_eq!(packed.len(), 5);
+    assert!(packed.iter().all(|party| party.len() == b_pack));
+    // Degree d = t+B−2 = 2: commitment vectors carry d+1 points.
+    assert_eq!(packed[0][0].1.ca.points.len(), params.t + b_pack - 1);
+    let ids = params.parties();
+    for b in 0..b_pack {
+        // Open each slot's values by interpolation at the slot point e_b
+        // over all n party points (the packed convention: the TripleShare
+        // scalars are the packed polynomials' evaluations at the party
+        // points; slot values exist only under interpolation).
+        let open_slot = |pick: fn(&TripleShare) -> Scalar, com: &FeldmanCommitment| {
+            let shares: Vec<Scalar> = packed.iter().map(|party| pick(&party[b].0)).collect();
+            for (k, &j) in ids.iter().enumerate() {
+                assert!(com.verify_share(j, &shares[k]), "share must verify");
+            }
+            interpolate_at(&slot_point(b), &ids, &shares)
+        };
+        let pubc = &packed[0][b].1;
+        let alpha = open_slot(|s| s.a, &pubc.ca);
+        let beta = open_slot(|s| s.b, &pubc.cb);
+        let gamma = open_slot(|s| s.c, &pubc.cc);
+        assert_eq!(gamma, alpha * beta, "slot {b} must be multiplicative");
+    }
+    // The packed convention: a/b shares are one scalar per party for all
+    // slots (the packed polynomials' evaluations at the party point).
+    for party in &packed {
+        assert_eq!(party[0].0.a, party[1].0.a);
+        assert_eq!(party[0].0.b, party[1].0.b);
+    }
+}
+
+#[test]
+fn packed_mode_b1_matches_base() {
+    // B = 1 degenerates to base mode: the constraint is n ≥ 2t−1, the
+    // degree is t−1, and slot 0 is point 0 (SPEC §7.4.1) — a base 2-of-3
+    // committee runs packed triples unchanged.
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 71);
+    let packed =
+        triples::generate_packed(&params, b"packed-triples/71", 1, &mut rngs, None).unwrap();
+    assert_eq!(packed[0].len(), 1);
+    assert_eq!(packed[0][0].1.ca.points.len(), params.t); // degree t−1
+    let ids = params.parties();
+    let open_slot0 = |pick: fn(&TripleShare) -> Scalar| {
+        let shares: Vec<Scalar> = packed.iter().map(|party| pick(&party[0].0)).collect();
+        interpolate_at(&slot_point(0), &ids, &shares)
+    };
+    let alpha = open_slot0(|s| s.a);
+    let beta = open_slot0(|s| s.b);
+    let gamma = open_slot0(|s| s.c);
+    assert_eq!(gamma, alpha * beta);
+}
+
+#[test]
+fn packed_presign_and_sign() {
+    // t=2, B=2, n=5: packed presignatures sign distinct messages; the
+    // online quorum is d+1 = t+B−1 = 3 (SPEC §7.4.3).
+    let params = Params::new(5, 2).unwrap();
+    let mut rngs = sim::make_rngs(5, 72);
+    let keys = sim::run_keygen(&params, b"key/72", &mut rngs).unwrap();
+    let presigs = sim::run_presign_packed(&params, &keys, &[1, 2], &mut rngs, None).unwrap();
+    assert_eq!(presigs.len(), 5);
+    assert!(presigs.iter().all(|party| party.len() == 2));
+    let (slot0, slot1): (Vec<_>, Vec<_>) = presigs
+        .into_iter()
+        .map(|mut party| (party.remove(0), party.remove(0)))
+        .unzip();
+    assert!(slot0.iter().all(|p| p.id == 1));
+    assert!(slot1.iter().all(|p| p.id == 2));
+
+    // Slot 0 signs with exactly the quorum d+1 = 3 parties.
+    let msg0 = b"packed presignature, slot 0";
+    let sig0 = sim::run_sign_packed(&params, 2, 0, &slot0[..3], msg0, None).unwrap();
+    assert_valid(&pubkey(&keys), msg0, &sig0);
+
+    // Slot 1 signs a different message with a different quorum subset
+    // (parties 2, 3, 4).
+    let msg1 = b"packed presignature, slot 1";
+    let sig1 = sim::run_sign_packed(&params, 2, 1, &slot1[1..4], msg1, None).unwrap();
+    assert_valid(&pubkey(&keys), msg1, &sig1);
+
+    // The §7.4.3 trade-off: signing with only t = 2 shares FAILS — the
+    // degree-d sharing needs d+1 = 3 points.
+    let err = sim::run_sign_packed(&params, 2, 0, &slot0[..2], msg0, None).unwrap_err();
+    match err {
+        Error::NotEnoughShares { got: 2, need: 3 } => {}
+        other => panic!("expected NotEnoughShares, got {other:?}"),
+    }
+}
+
+#[test]
+fn packed_triples_cheater_is_blamed() {
+    let params = Params::new(5, 2).unwrap();
+    // Bad re-shared share in PT2 (F2): the §6.1 defense does not verify,
+    // so the dealing party is blamed.
+    let mut rngs = sim::make_rngs(5, 73);
+    let tamper = TripleTamper {
+        bad_reshare: Some((2, 4)),
+        ..Default::default()
+    };
+    let err = triples::generate_packed(&params, b"packed-triples/73", 2, &mut rngs, Some(&tamper))
+        .unwrap_err();
+    match err {
+        Error::Abort { abort } => {
+            assert_eq!(abort.phase, Phase::Triples);
+            assert_eq!(abort.blamed, vec![2]);
+        }
+        other => panic!("expected identifiable abort, got {other:?}"),
+    }
+    // Bad DLEQ product proof in PT2 (F3): the prover is blamed.
+    let mut rngs = sim::make_rngs(5, 74);
+    let tamper = TripleTamper {
+        bad_product_proof: Some(3),
+        ..Default::default()
+    };
+    let err = triples::generate_packed(&params, b"packed-triples/74", 2, &mut rngs, Some(&tamper))
+        .unwrap_err();
+    match err {
+        Error::Abort { abort } => {
+            assert_eq!(abort.phase, Phase::Triples);
+            assert_eq!(abort.blamed, vec![3]);
+        }
+        other => panic!("expected identifiable abort, got {other:?}"),
+    }
+}
+
+#[test]
+fn packed_mode_rejects_undersized_committee() {
+    // 2-of-3 admits only B = 1: B = 2 needs n ≥ 2t+2B−3 = 5 (SPEC §7.4.1).
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 75);
+    match triples::generate_packed(&params, b"packed-triples/75", 2, &mut rngs, None) {
+        Err(Error::InvalidParams(_)) => {}
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+    let keys = sim::run_keygen(&params, b"key/75", &mut rngs).unwrap();
+    match sim::run_presign_packed(&params, &keys, &[1, 2], &mut rngs, None) {
+        Err(Error::InvalidParams(_)) => {}
+        other => panic!("expected InvalidParams, got {other:?}"),
     }
 }
 

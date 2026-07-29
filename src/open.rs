@@ -9,13 +9,15 @@ use std::collections::BTreeMap;
 
 use k256::Scalar;
 
-use crate::shamir::interpolate_at_zero;
+use crate::shamir::{interpolate_at, interpolate_at_zero};
 use crate::vss::FeldmanCommitment;
 use crate::{Error, IdentifiableAbort, PartyId, Phase, Result};
 
 /// Open a committed sharing from broadcast shares.
 ///
-/// * `t` — signing threshold (number of shares needed).
+/// * `t` — number of shares needed to interpolate (the sharing's degree
+///   plus one; for packed degree-`d` sharings this is `d + 1`, SPEC
+///   §7.4.3).
 /// * `com` — public commitment to the sharing polynomial.
 /// * `shares` — broadcast shares keyed by sender.
 /// * `phase` — used for abort attribution.
@@ -24,6 +26,21 @@ use crate::{Error, IdentifiableAbort, PartyId, Phase, Result};
 /// returns `Error::Abort` blaming the sender(s) — this is the structural
 /// identifiable-abort mechanism.
 pub fn open(
+    t: usize,
+    com: &FeldmanCommitment,
+    shares: &BTreeMap<PartyId, Scalar>,
+    phase: Phase,
+) -> Result<Scalar> {
+    open_at(&Scalar::ZERO, t, com, shares, phase)
+}
+
+/// [`open`] interpolating at an arbitrary point instead of 0 (SPEC §7.4:
+/// packed slot openings interpolate at the slot point `e_b = -(b)`).
+/// Share verification is unchanged — point equality against the public
+/// commitment at the senders' party points; only the interpolation point
+/// moves.
+pub fn open_at(
+    point: &Scalar,
     t: usize,
     com: &FeldmanCommitment,
     shares: &BTreeMap<PartyId, Scalar>,
@@ -57,7 +74,10 @@ pub fn open(
     }
     valid_parties.truncate(t);
     valid_shares.truncate(t);
-    Ok(interpolate_at_zero(&valid_parties, &valid_shares))
+    if *point == Scalar::ZERO {
+        return Ok(interpolate_at_zero(&valid_parties, &valid_shares));
+    }
+    Ok(interpolate_at(point, &valid_parties, &valid_shares))
 }
 
 /// Robust variant of [`open`] (SPEC §10.4): bad shares are filtered out

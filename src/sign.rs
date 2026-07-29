@@ -4,11 +4,17 @@
 //! sharing is a public linear combination of committed sharings, every
 //! share is verified against `A[s] = m·A[u] + r·A[z]` by point equality —
 //! a bad share identifies its sender before it can enter interpolation.
+//!
+//! [`combine_at`] is the packed-mode entry point (SPEC §7.4.3): the
+//! presignature is a degree-`d` sharing, so interpolation runs at the
+//! record's slot point `e_b` with quorum `d + 1 = t + B − 1`. Share
+//! verification is unchanged — only the interpolation point and quorum
+//! move.
 
 use k256::Scalar;
 
 use crate::presign::Presignature;
-use crate::shamir::interpolate_at_zero;
+use crate::shamir::{interpolate_at, interpolate_at_zero};
 use crate::{Error, IdentifiableAbort, Params, PartyId, Phase, Result};
 
 /// A broadcast signature share.
@@ -37,6 +43,23 @@ pub fn combine(
     m: &Scalar,
     shares: &[SignShare],
 ) -> Result<(Scalar, Scalar)> {
+    combine_at(params.t, &Scalar::ZERO, meta, m, shares)
+}
+
+/// [`combine`] interpolating at an arbitrary point with an explicit
+/// quorum (SPEC §7.4.3: packed presignatures are degree-`d` sharings, so
+/// the signature share sharing interpolates at the record's slot point
+/// `e_b = -(b)` and needs `d + 1 = t + B − 1` shares). Every share is
+/// still verified against `m·A[u] + r·A[z]` by point equality —
+/// verification semantics are unchanged; only the interpolation point
+/// and quorum move.
+pub fn combine_at(
+    quorum: usize,
+    point: &Scalar,
+    meta: &Presignature,
+    m: &Scalar,
+    shares: &[SignShare],
+) -> Result<(Scalar, Scalar)> {
     let s_com = meta.u_com.scale(m).add(&meta.z_com.scale(&meta.r));
     let mut valid_parties = Vec::new();
     let mut valid_shares = Vec::new();
@@ -58,16 +81,18 @@ pub fn combine(
             },
         });
     }
-    if valid_parties.len() < params.t {
+    if valid_parties.len() < quorum {
         return Err(Error::NotEnoughShares {
             got: valid_parties.len(),
-            need: params.t,
+            need: quorum,
         });
     }
-    valid_parties.truncate(params.t);
-    valid_shares.truncate(params.t);
-    let s = interpolate_at_zero(&valid_parties, &valid_shares);
-    Ok((meta.r, s))
+    valid_parties.truncate(quorum);
+    valid_shares.truncate(quorum);
+    if *point == Scalar::ZERO {
+        return Ok((meta.r, interpolate_at_zero(&valid_parties, &valid_shares)));
+    }
+    Ok((meta.r, interpolate_at(point, &valid_parties, &valid_shares)))
 }
 
 /// Robust variant of [`combine`] (SPEC §10.4): bad signature shares are

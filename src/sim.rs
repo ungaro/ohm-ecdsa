@@ -100,6 +100,19 @@ pub fn run_presign_batch(
     presign::presign_batch(params, keys, ids, rngs, tamper)
 }
 
+/// Packed presign (SPEC §7.4.3): returns, per party, `ids.len()`
+/// degree-`d` presignatures (`d = t + B − 2`). Record `b` signs via
+/// [`run_sign_packed`] at slot `b` with quorum `t + B − 1`.
+pub fn run_presign_packed(
+    params: &Params,
+    keys: &[KeyShare],
+    ids: &[u64],
+    rngs: &mut [StdRng],
+    tamper: Option<&PresignTamper>,
+) -> Result<Vec<Vec<Presignature>>> {
+    presign::presign_packed(params, keys, ids, rngs, tamper)
+}
+
 // --- §10.3 expel-and-restart policy -------------------------------------
 //
 // Dealing-phase failures (commit-reveal mismatch F1, bad dealt share F2,
@@ -399,6 +412,40 @@ pub fn run_sign(
         }
     }
     let (r, s) = sign::combine(params, &presigs[0], &m, &shares)?;
+    let sig = Signature::from_scalars(r, s)?;
+    Ok(sig.normalize_s().unwrap_or(sig))
+}
+
+/// Online signing with a PACKED presignature (SPEC §7.4.3): like
+/// [`run_sign`], but the record is a degree-`d` sharing (`d = t + B − 2`),
+/// so the combine interpolates at `slot_point(slot)` and needs
+/// `t + B − 1` valid shares — with only `t` shares it fails with
+/// `Error::NotEnoughShares`. Per-share verification against
+/// `m·A[u] + r·A[z]` is unchanged.
+pub fn run_sign_packed(
+    params: &Params,
+    b_pack: usize,
+    slot: usize,
+    presigs: &[Presignature],
+    msg: &[u8],
+    tamper: Option<(PartyId, Scalar)>,
+) -> Result<Signature> {
+    let m = message_scalar(msg);
+    let mut shares: Vec<SignShare> = presigs.iter().map(|p| sign::sign_share(p, &m)).collect();
+    if let Some((party, fake)) = tamper {
+        for sh in shares.iter_mut() {
+            if sh.from == party {
+                sh.s = fake;
+            }
+        }
+    }
+    let (r, s) = sign::combine_at(
+        params.t + b_pack - 1,
+        &crate::shamir::slot_point(slot),
+        &presigs[0],
+        &m,
+        &shares,
+    )?;
     let sig = Signature::from_scalars(r, s)?;
     Ok(sig.normalize_s().unwrap_or(sig))
 }

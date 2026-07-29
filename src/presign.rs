@@ -8,6 +8,13 @@
 //! [`presign_batch`] generates `B` records per session (SPEC §8.5): one
 //! commit-reveal covers all `2B` ephemeral VSS instances.
 //!
+//! [`presign_packed`] consumes packed triples (SPEC §7.4.3): `u`, `a` are
+//! dealt as degree-`d` packed sharings (`d = t + B − 2`), the key enters
+//! P4 as a publicly-bound constant-pack re-sharing, and the output
+//! records are degree-`d` sharings — online signing interpolates at the
+//! record's slot point with quorum `t + B − 1` (the §7.4.3 trade-off;
+//! privacy unchanged).
+//!
 //! [`presign_robust`] is the §10.4 blame-and-continue variant: once the
 //! commit-reveal dealing phases have bound everyone to the same
 //! polynomials, bad opening shares and bad nonce points are filtered out
@@ -20,14 +27,15 @@
 
 use std::collections::BTreeMap;
 
+use k256::elliptic_curve::ff::Field;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::{AffinePoint, ProjectivePoint, Scalar};
 use rand::rngs::StdRng;
 use zeroize::Zeroize;
 
 use crate::dkg::DkgOutput;
-use crate::open::{open, open_robust};
-use crate::shamir::lagrange_coeffs;
+use crate::open::{open, open_at, open_robust};
+use crate::shamir::{lagrange_coeffs, lagrange_coeffs_at, slot_point, ShamirPoly};
 use crate::triples::{self, TripleTamper};
 use crate::vss::FeldmanCommitment;
 use crate::{
@@ -531,6 +539,325 @@ pub fn presign_robust_with_committee(
     Ok((presigs, blamed))
 }
 
+/// Run the presign protocol over PACKED triples (SPEC §7.4.3) for a batch
+/// of `b_pack = ids.len()` presignature ids.
+///
+/// Everything runs at the packed degree `d = t + B − 2` (§7.4.1):
+/// the `2B` triples come from two [`triples::generate_packed`] sessions
+/// (B slots each), and P1 deals `⟦u⟧_pack`, `⟦a⟧_pack` as packed sharings
+/// in ONE commit-reveal session. The masked-value openings (δ, ε, δ′, ε′)
+/// are slot-independent SHARE broadcasts — one per party — interpolated
+/// at each slot point `e_b = -(b)` with quorum `d + 1 = t + B − 1`.
+///
+/// **P4 key binding.** A Beaver product at slot `e_b` sees whatever the
+/// operand polynomials evaluate to at `e_b`; the long-term key's
+/// degree-`(t−1)` polynomial evaluates to `p_x(e_b) ≠ x` there for
+/// `b ≥ 1`, so `x` must enter as a CONSTANT packed vector. Each party
+/// therefore deals (in the same commit-reveal session as `u`/`a`) a
+/// degree-`d` constant-pack re-sharing `q_j` with `q_j(e_b) = λ_j·x_j` at
+/// every slot, publicly bound to the key commitment by slot-point point
+/// equality `EvalCom(C[q_j], e_b) == λ_j·EvalCom(A[x], j)` — a mismatch
+/// blames the dealer. The combined `⟦x̂⟧ = Σ_j ⟦q_j⟧` has slot value `x`
+/// at every slot; `x` itself stays degree-`(t−1)` and is never opened at
+/// any new point.
+///
+/// **Trade-off (SPEC §7.4.3).** Output records are degree-`d` sharings:
+/// online signing interpolates at the record's slot point and needs
+/// quorum `t + B − 1` instead of `t` (availability, not privacy — secrecy
+/// stays at `t − 1`). `B = 1` degenerates to base mode. The committee
+/// must satisfy `n ≥ 2t + 2B − 3` (§7.4.1) or `Error::InvalidParams`.
+///
+/// Returns, per party, `b_pack` presignatures in `ids` order; record `b`
+/// signs via slot `b` ([`crate::sign::combine_at`]). Zero `v`/`r` at slot
+/// `b` is `Error::ZeroValue` naming the slot. `tamper` (tests) applies to
+/// slot 0 as in [`presign_batch`].
+pub fn presign_packed(
+    params: &Params,
+    keys: &[KeyShare],
+    ids: &[u64],
+    rngs: &mut [StdRng],
+    tamper: Option<&PresignTamper>,
+) -> Result<Vec<Vec<Presignature>>> {
+    presign_packed_with_committee(&Committee::full(params), keys, ids, ids.len(), rngs, tamper)
+}
+
+/// [`presign_packed`] over an explicit committee (SPEC §10.3 restart).
+/// `keys[k]`/`rngs[k]` belong to `committee.ids()[k]` (positionally;
+/// `keys[k].index` is checked). `b_pack` must equal `ids.len()`. Tamper
+/// hooks name party ids.
+pub fn presign_packed_with_committee(
+    committee: &Committee,
+    keys: &[KeyShare],
+    ids: &[u64],
+    b_pack: usize,
+    rngs: &mut [StdRng],
+    tamper: Option<&PresignTamper>,
+) -> Result<Vec<Vec<Presignature>>> {
+    check_committee_inputs(committee, keys, rngs)?;
+    let cids = committee.ids();
+    let n = cids.len();
+    let t = committee.t();
+    let count = ids.len();
+    if count == 0 {
+        return Err(Error::InvalidParams("empty presignature batch"));
+    }
+    if count != b_pack {
+        return Err(Error::InvalidParams(
+            "ids must match the packed batch size B",
+        ));
+    }
+    if n < 2 * t + 2 * b_pack - 3 {
+        return Err(Error::InvalidParams(
+            "packed mode requires n >= 2t + 2B - 3 (SPEC §7.4.1)",
+        ));
+    }
+    let d = t + b_pack - 2; // packed degree (§7.4.1)
+    let quorum = d + 1; // degree-d openings interpolate d + 1 points (§7.4.3)
+    let mut sid = b"ohm-ecdsa/presign-packed".to_vec();
+    for id in ids {
+        sid.extend_from_slice(&id.to_be_bytes());
+    }
+
+    // 2B packed triples from two packed sessions of B slots each (§7.4.2);
+    // session t1 serves P2, session t2 serves P4. The `triple_tamper`
+    // fault-injection hook (tests) targets the FIRST session's dealing.
+    let t_tamper = tamper.and_then(|tamp| tamp.triple_tamper);
+    let t1 = triples::generate_packed_with_committee(
+        committee,
+        &[sid.as_slice(), b"/t1"].concat(),
+        b_pack,
+        rngs,
+        t_tamper.as_ref(),
+    )?;
+    let t2 = triples::generate_packed_with_committee(
+        committee,
+        &[sid.as_slice(), b"/t2"].concat(),
+        b_pack,
+        rngs,
+        None,
+    )?;
+
+    // P1 (§7.4.3): ONE commit-reveal session dealing, per party, three
+    // degree-d polynomials: the u-pack, the a-pack (both uniform random),
+    // and the constant-pack re-sharing of λ_j·x_j (P4 key binding, above).
+    let key_lambdas = lagrange_coeffs(cids);
+    let polys: Vec<Vec<ShamirPoly>> = (0..n)
+        .map(|k| {
+            vec![
+                ShamirPoly::random(Scalar::random(&mut rngs[k]), d + 1, &mut rngs[k]),
+                ShamirPoly::random(Scalar::random(&mut rngs[k]), d + 1, &mut rngs[k]),
+                ShamirPoly::random_packed_const(
+                    key_lambdas[k] * keys[k].share,
+                    b_pack,
+                    t,
+                    &mut rngs[k],
+                ),
+            ]
+        })
+        .collect();
+    let (joint, revealed) = triples::joint_deal(
+        committee,
+        &[sid.as_slice(), b"/uax"].concat(),
+        Phase::Presign,
+        polys,
+    )?;
+    // Slot binding of the dealt key re-sharings (§7.4.3 P4): dealer j's
+    // third polynomial must evaluate to λ_j·x_j at EVERY slot point —
+    // point equality against the public key commitment; a mismatch blames
+    // the dealer (the dealt shares themselves were already §6.1-verified).
+    for (k, &j) in cids.iter().enumerate() {
+        let com = &revealed[&j].coms[2];
+        let bound = keys[0].com.eval_at(j) * key_lambdas[k];
+        for b in 0..b_pack {
+            if com.eval_at_point(&slot_point(b)) != bound {
+                return Err(Error::Abort {
+                    abort: IdentifiableAbort {
+                        phase: Phase::Presign,
+                        blamed: vec![j],
+                        detail: "packed key re-sharing violates the slot binding".into(),
+                    },
+                });
+            }
+        }
+    }
+    let u_shares: Vec<Scalar> = joint.iter().map(|o| o[0].share).collect();
+    let a_shares: Vec<Scalar> = joint.iter().map(|o| o[1].share).collect();
+    let x_shares: Vec<Scalar> = joint.iter().map(|o| o[2].share).collect();
+    let u_com = joint[0][0].com.clone();
+    let a_com = joint[0][1].com.clone();
+    let x_com = joint[0][2].com.clone();
+
+    let neg = -Scalar::ONE;
+    let slots: Vec<Scalar> = (0..b_pack).map(slot_point).collect();
+    let slot_lambdas: Vec<Vec<Scalar>> =
+        slots.iter().map(|s| lagrange_coeffs_at(s, cids)).collect();
+
+    // P2: packed Beaver per slot. The δ/ε SHARES are slot-independent (the
+    // packed convention keeps one share scalar per party for every slot),
+    // so one broadcast per party serves all slots; each value opens by
+    // interpolating at its slot point.
+    let delta_com = u_com.add(&t1[0][0].1.ca.scale(&neg));
+    let eps_com = a_com.add(&t1[0][0].1.cb.scale(&neg));
+    let delta_shares: BTreeMap<PartyId, Scalar> = cids
+        .iter()
+        .enumerate()
+        .map(|(k, &j)| (j, u_shares[k] - t1[k][0].0.a))
+        .collect();
+    let eps_shares: BTreeMap<PartyId, Scalar> = cids
+        .iter()
+        .enumerate()
+        .map(|(k, &j)| (j, a_shares[k] - t1[k][0].0.b))
+        .collect();
+    let deltas: Vec<Scalar> = slots
+        .iter()
+        .map(|s| open_at(s, quorum, &delta_com, &delta_shares, Phase::Presign))
+        .collect::<Result<_>>()?;
+    let epsilons: Vec<Scalar> = slots
+        .iter()
+        .map(|s| open_at(s, quorum, &eps_com, &eps_shares, Phase::Presign))
+        .collect::<Result<_>>()?;
+
+    // v_b = a_b·u_b via triple-session-1 slot b, opened at e_b.
+    let mut v_invs = Vec::with_capacity(count);
+    for b in 0..count {
+        let pub1 = &t1[0][b].1;
+        let v_com = pub1
+            .cc
+            .clone()
+            .add(&pub1.cb.scale(&deltas[b]))
+            .add(&pub1.ca.scale(&epsilons[b]))
+            .add_const(&(deltas[b] * epsilons[b]));
+        let mut v_shares: BTreeMap<PartyId, Scalar> = cids
+            .iter()
+            .enumerate()
+            .map(|(k, &j)| {
+                (
+                    j,
+                    t1[k][b].0.c
+                        + deltas[b] * t1[k][b].0.b
+                        + epsilons[b] * t1[k][b].0.a
+                        + deltas[b] * epsilons[b],
+                )
+            })
+            .collect();
+        if let Some(tamp) = tamper {
+            if b == 0 {
+                if let Some(j) = tamp.bad_open_share {
+                    if let Some(s) = v_shares.get_mut(&j) {
+                        *s += Scalar::ONE; // malicious: wrong opening share (slot 0)
+                    }
+                }
+            }
+        }
+        let v = open_at(&slots[b], quorum, &v_com, &v_shares, Phase::Presign)?;
+        if v == Scalar::ZERO {
+            return Err(Error::ZeroValue(format!("v = 0 at packed slot {b}")));
+        }
+        v_invs.push(
+            Option::<Scalar>::from(v.invert())
+                .ok_or_else(|| Error::ZeroValue(format!("v = 0 at packed slot {b}")))?,
+        );
+    }
+
+    // P3: [k_b] = v_b⁻¹·[a]; nonce points with per-share point checks
+    // (same EvalCom(A[k_b], j) equality and blame); R_b is interpolated
+    // at the slot point e_b.
+    let mut big_rs = Vec::with_capacity(count);
+    let mut r_scalars = Vec::with_capacity(count);
+    for b in 0..count {
+        let k_com = a_com.scale(&v_invs[b]);
+        let mut r_points = Vec::with_capacity(n);
+        for (k, &j) in cids.iter().enumerate() {
+            let k_share = v_invs[b] * a_shares[k];
+            let mut r_j = ProjectivePoint::GENERATOR * k_share;
+            if let Some(tamp) = tamper {
+                if b == 0 && tamp.bad_nonce_point == Some(j) {
+                    r_j += ProjectivePoint::GENERATOR; // malicious: wrong point
+                }
+            }
+            if r_j != k_com.eval_at(j) {
+                return Err(Error::Abort {
+                    abort: IdentifiableAbort {
+                        phase: Phase::Presign,
+                        blamed: vec![j],
+                        detail: format!("invalid nonce point R_j (packed slot {b})"),
+                    },
+                });
+            }
+            r_points.push(r_j);
+        }
+        let mut big_r_proj = ProjectivePoint::IDENTITY;
+        for (l, rp) in slot_lambdas[b].iter().zip(r_points.iter()) {
+            big_r_proj += *rp * l;
+        }
+        let big_r = big_r_proj.to_affine();
+        let r_encoded = big_r.to_encoded_point(false);
+        let r_scalar = scalar_from_digest(r_encoded.x().expect("uncompressed point has x"));
+        if r_scalar == Scalar::ZERO {
+            return Err(Error::ZeroValue(format!("r = 0 at packed slot {b}")));
+        }
+        big_rs.push(big_r);
+        r_scalars.push(r_scalar);
+    }
+
+    // P4: z_b = u_b·x per slot via triple-session-2 slot b and the
+    // constant-pack key sharing [x̂] (slot value x at every e_b).
+    let d2_com = u_com.add(&t2[0][0].1.ca.scale(&neg));
+    let e2_com = x_com.add(&t2[0][0].1.cb.scale(&neg));
+    let d2_shares: BTreeMap<PartyId, Scalar> = cids
+        .iter()
+        .enumerate()
+        .map(|(k, &j)| (j, u_shares[k] - t2[k][0].0.a))
+        .collect();
+    let e2_shares: BTreeMap<PartyId, Scalar> = cids
+        .iter()
+        .enumerate()
+        .map(|(k, &j)| (j, x_shares[k] - t2[k][0].0.b))
+        .collect();
+    let d2s: Vec<Scalar> = slots
+        .iter()
+        .map(|s| open_at(s, quorum, &d2_com, &d2_shares, Phase::Presign))
+        .collect::<Result<_>>()?;
+    let e2s: Vec<Scalar> = slots
+        .iter()
+        .map(|s| open_at(s, quorum, &e2_com, &e2_shares, Phase::Presign))
+        .collect::<Result<_>>()?;
+    let z_coms: Vec<FeldmanCommitment> = (0..count)
+        .map(|b| {
+            let pub2 = &t2[0][b].1;
+            pub2.cc
+                .clone()
+                .add(&pub2.cb.scale(&d2s[b]))
+                .add(&pub2.ca.scale(&e2s[b]))
+                .add_const(&(d2s[b] * e2s[b]))
+        })
+        .collect();
+
+    let presigs = (0..n)
+        .map(|k| {
+            let j = cids[k];
+            (0..count)
+                .map(|b| {
+                    let t2s = &t2[k][b].0;
+                    Presignature {
+                        id: ids[b],
+                        index: j,
+                        r: r_scalars[b],
+                        big_r: big_rs[b],
+                        // The packed convention: one share scalar per party
+                        // for every slot; the slot values are recovered by
+                        // slot-point interpolation at signing time.
+                        u_share: u_shares[k],
+                        z_share: t2s.c + d2s[b] * t2s.b + e2s[b] * t2s.a + d2s[b] * e2s[b],
+                        u_com: u_com.clone(),
+                        z_com: z_coms[b].clone(),
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    Ok(presigs)
+}
 /// Run the presign protocol for a batch of presignature ids (SPEC §8.5).
 ///
 /// One batch joint VSS (§7.3 machinery) covers all `u⁽¹..B⁾, a⁽¹..B⁾`;

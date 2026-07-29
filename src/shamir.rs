@@ -40,13 +40,62 @@ impl ShamirPoly {
     /// Evaluate at party index `j` (must be ≥ 1).
     pub fn eval(&self, j: PartyId) -> Scalar {
         debug_assert!(j >= 1, "party indices start at 1; 0 is the secret");
-        let x = Scalar::from(j as u64);
+        self.eval_at(&Scalar::from(j as u64))
+    }
+
+    /// Evaluate at an arbitrary point `x` (SPEC §7.4.1: packed slot points
+    /// are the reserved negative indices `-(b)`, not party indices).
+    pub fn eval_at(&self, x: &Scalar) -> Scalar {
         let mut acc = Scalar::ZERO;
         for c in self.coeffs.iter().rev() {
             acc = acc * x + c;
         }
         acc
     }
+
+    /// Sample a uniform random packed sharing of the CONSTANT vector
+    /// `(value, …, value)` (SPEC §7.4.1): a degree-`d = t + B − 2`
+    /// polynomial `q` with `q(e_b) = value` at every slot point
+    /// `e_b = -(b)`, `b ∈ 0..B`. Constructed as `q(X) = value + V(X)·r(X)`
+    /// with `V(X) = ∏_{b=0}^{B−1} (X + b)` (vanishing on the slots) and
+    /// `r` uniform of degree `t − 2`, so the masking carries exactly the
+    /// `t − 1` random coefficients of an ordinary degree-`(t−1)` sharing.
+    /// `B = 1` degenerates to an ordinary sharing of `value` at point 0.
+    pub fn random_packed_const(value: Scalar, b: usize, t: usize, rng: &mut impl RngCore) -> Self {
+        debug_assert!(b >= 1 && t >= 1);
+        let d = t + b - 2;
+        // V(X) = ∏_{i=0}^{B−1} (X + i), coefficient form.
+        let mut v = vec![Scalar::ONE];
+        for i in 0..b {
+            let mut nv = vec![Scalar::ZERO; v.len() + 1];
+            for (k, c) in v.iter().enumerate() {
+                nv[k] += *c * Scalar::from(i as u64);
+                nv[k + 1] += *c;
+            }
+            v = nv;
+        }
+        // r(X) uniform of degree t − 2 (t − 1 random coefficients).
+        let r: Vec<Scalar> = (0..t.saturating_sub(1))
+            .map(|_| Scalar::random(&mut *rng))
+            .collect();
+        let mut coeffs = vec![Scalar::ZERO; d + 1];
+        coeffs[0] = value;
+        // q(X) = value + V(X)·r(X): coeffs[i + ℓ] += v_i·r_ℓ.
+        for (i, c) in v.iter().enumerate() {
+            for (l, rc) in r.iter().enumerate() {
+                coeffs[i + l] += *c * rc;
+            }
+        }
+        Self { coeffs }
+    }
+}
+
+/// Slot point `e_b = -(b)` of a packed sharing (SPEC §7.4.1): slot 0 is
+/// point 0 (the ordinary secret point); slots `b ≥ 1` are the reserved
+/// negative indices. Party points remain `1..=n`, so slot points never
+/// collide with party points.
+pub fn slot_point(b: usize) -> Scalar {
+    Scalar::ZERO - Scalar::from(b as u64)
 }
 
 /// Lagrange coefficients for interpolation at `x = 0` over `parties`.
@@ -125,6 +174,28 @@ mod tests {
         v.zeroize();
         // `Vec::zeroize` erases every element, then clears the vector.
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn packed_const_poly_hits_every_slot() {
+        // SPEC §7.4.1: a degree-(t + B − 2) constant-pack polynomial takes
+        // the same value at every slot point e_b = -(b).
+        let mut rng = StdRng::seed_from_u64(31);
+        for (t, b) in [(2usize, 1usize), (2, 3), (3, 2), (1, 2)] {
+            let value = Scalar::random(&mut rng);
+            let q = ShamirPoly::random_packed_const(value, b, t, &mut rng);
+            assert_eq!(q.coeffs.len(), t + b - 1); // degree d = t + B − 2
+            for slot in 0..b {
+                assert_eq!(q.eval_at(&slot_point(slot)), value);
+            }
+            // B = 1 degenerates to an ordinary sharing of `value` at 0.
+            if b == 1 {
+                assert_eq!(q.eval_at(&Scalar::ZERO), value);
+            }
+        }
+        // Slot points: e_0 = 0, e_b = -(b).
+        assert_eq!(slot_point(0), Scalar::ZERO);
+        assert_eq!(slot_point(3) + Scalar::from(3u64), Scalar::ZERO);
     }
 
     #[test]

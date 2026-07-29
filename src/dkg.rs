@@ -252,7 +252,9 @@ pub struct DkgBatchP2P {
 /// Per-party batch DKG state: `B` polynomials dealt in ONE commit-reveal
 /// session (SPEC §7.3) — the R1 hash covers the concatenation of all `B`
 /// commitment vectors, the reveal carries all `B` vectors, and each P2P
-/// message carries `B` shares.
+/// message carries `B` shares. Polynomials may carry any uniform degree
+/// (SPEC §7.4 packed dealing uses degree `d = t + B_pack − 2`; the
+/// default is `t − 1`).
 pub struct DkgBatchInstance {
     /// The party-id set this instance runs over (see [`DkgInstance`]).
     pub committee: Committee,
@@ -261,6 +263,9 @@ pub struct DkgBatchInstance {
     pub me: PartyId,
     polys: Vec<ShamirPoly>,
     coms: Vec<FeldmanCommitment>,
+    /// Uniform coefficient count of the dealt polynomials; revealed
+    /// vectors of any other length are malformed (F1).
+    poly_len: usize,
 }
 
 impl DkgBatchInstance {
@@ -287,10 +292,51 @@ impl DkgBatchInstance {
         count: usize,
         rng: &mut impl RngCore,
     ) -> (Self, DkgBcast1) {
-        debug_assert!(committee.ids().contains(&me), "me must be a member");
         let polys: Vec<ShamirPoly> = (0..count)
             .map(|_| ShamirPoly::random(Scalar::random(&mut *rng), committee.t(), &mut *rng))
             .collect();
+        Self::start_with_polys(committee, sid, tag, me, polys)
+    }
+
+    /// Start a batch DKG dealing `count` uniform random polynomials of the
+    /// given DEGREE (SPEC §7.4.2 PT1: packed sharings are ordinary
+    /// degree-`d` polynomials; their slot values are whatever the
+    /// polynomial evaluates to at the slot points).
+    pub fn start_committee_with_degree(
+        committee: &Committee,
+        sid: &[u8],
+        tag: &'static [u8],
+        me: PartyId,
+        count: usize,
+        degree: usize,
+        rng: &mut impl RngCore,
+    ) -> (Self, DkgBcast1) {
+        let polys: Vec<ShamirPoly> = (0..count)
+            .map(|_| ShamirPoly::random(Scalar::random(&mut *rng), degree + 1, &mut *rng))
+            .collect();
+        Self::start_with_polys(committee, sid, tag, me, polys)
+    }
+
+    /// Start a batch DKG dealing EXPLICIT polynomials (SPEC §7.4: packed
+    /// re-sharings whose slot values are constrained, e.g. the
+    /// constant-pack key re-sharing of §7.4.3 P4). Commit-reveal and §6.1
+    /// complaint handling are identical to [`Self::start_committee`].
+    pub fn start_with_polys(
+        committee: &Committee,
+        sid: &[u8],
+        tag: &'static [u8],
+        me: PartyId,
+        polys: Vec<ShamirPoly>,
+    ) -> (Self, DkgBcast1) {
+        debug_assert!(committee.ids().contains(&me), "me must be a member");
+        debug_assert!(!polys.is_empty(), "at least one polynomial");
+        debug_assert!(
+            polys
+                .iter()
+                .all(|p| p.coeffs.len() == polys[0].coeffs.len()),
+            "uniform polynomial length"
+        );
+        let poly_len = polys[0].coeffs.len();
         let coms: Vec<FeldmanCommitment> = polys.iter().map(FeldmanCommitment::from_poly).collect();
         let hash = hash_commitments(sid, tag, me, &coms);
         let inst = Self {
@@ -300,6 +346,7 @@ impl DkgBatchInstance {
             me,
             polys,
             coms,
+            poly_len,
         };
         (inst, DkgBcast1 { from: me, hash })
     }
@@ -365,7 +412,7 @@ impl DkgBatchInstance {
             let defense = &defenses[&i];
             // (a) commit-reveal consistency (F1: the dealer is blamed)
             if b2.coms.len() != count
-                || b2.coms.iter().any(|c| c.points.len() != self.committee.t())
+                || b2.coms.iter().any(|c| c.points.len() != self.poly_len)
                 || shares.len() != count
             {
                 return Err(Error::Abort {

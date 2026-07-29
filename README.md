@@ -34,6 +34,13 @@ triples + commit-reveal DKG. The full protocol is specified in
   presignatures (`generate_batch`, `presign_batch`), with §7.3 aggregate
   batch DLEQ verification (`dleq::verify_batch`) plus per-proof fallback
   for blame attribution
+* Packed-Shamir batching (§7.4, Franklin–Yung): `B` triples in ONE pair of
+  degree-`d` packed sharings with one DLEQ proof per party
+  (`triples::generate_packed`), packed presignatures
+  (`presign::presign_packed`) with a publicly-bound constant-pack key
+  re-sharing in P4, and slot-point signing (`sign::combine_at`,
+  `sim::run_sign_packed`) — the §7.4.3 trade-off: the online quorum
+  becomes `T + B − 1` (availability only; privacy stays at `T−1`)
 * Expel-and-restart (§10.3) composed with robust continuation (§10.4):
   every presign/triples attempt drives the robust variant, so continuable
   faults finish in-attempt (no id poisoning); only dealing-phase aborts
@@ -54,8 +61,8 @@ triples + commit-reveal DKG. The full protocol is specified in
 
 **Not yet** (roadmap): production transport over the seam (mTLS + echo
 broadcast + per-message signatures — the `transport` module is the
-contract, not an implementation), serde wire format, packed-Shamir
-batching (§7.4), key rotation (§13.4 — re-DKG with a new `X`), audit.
+contract, not an implementation), serde wire format, key rotation
+(§13.4 — re-DKG with a new `X`), audit.
 
 ## Quick start
 
@@ -63,7 +70,7 @@ batching (§7.4), key rotation (§13.4 — re-DKG with a new `X`), audit.
 cargo test
 ```
 
-Runs 16 unit tests and 37 integration tests: end-to-end 2-of-3 and 3-of-5
+Runs 18 unit tests and 42 integration tests: end-to-end 2-of-3 and 3-of-5
 signatures verified by `k256`'s ECDSA verifier, subset signing with only
 `T` parties, cheater identification in keygen (both §6.1 complaint
 branches), triples, presign, and sign, robust signing with up to `T−1`
@@ -71,7 +78,10 @@ cheaters, robust presign/triples continuation with correct blame (§10.4),
 expel-and-restart composed with the robust path (§10.3+§10.4, 3-of-6):
 continuable faults complete in-attempt, dealing-phase aborts restart with
 id poisoning, zero-slack refusal, presignature single-use enforcement,
-HD-tweak signing, batched triple/presignature generation, committee
+HD-tweak signing, batched triple/presignature generation, packed mode
+(§7.4: slot-multiplicative packed triples on the FY-minimal committee,
+packed presign+sign with the `T+B−1` online quorum, PT2 cheater blame,
+undersized-committee rejection), committee
 maintenance (§13.4: refresh preserving `X`, presignature invalidation on
 epoch change, re-sharing to a new committee with dealer-blame fault
 injection), and keygen executed through the explicit transport seam
@@ -90,14 +100,14 @@ dependencies.
 
 | Module | SPEC § | Contents |
 |---|---|---|
-| `shamir` | 4.1 | Shamir sharing, Lagrange interpolation (at 0 and at arbitrary points) |
-| `vss` | 4.2 | Feldman commitments, homomorphic commitment ops |
+| `shamir` | 4.1, 7.4.1 | Shamir sharing, Lagrange interpolation (at 0 and at arbitrary points), packed slot points and constant-pack polynomials |
+| `vss` | 4.2, 7.4.3 | Feldman commitments, homomorphic commitment ops (mixed-length zero-padding), arbitrary-point commitment evaluation |
 | `dleq` | 4.4 | Chaum–Pedersen DLEQ (triple product proofs) |
-| `open` | 4.6, 10.4 | verified-opening subprotocol (structural identifiable abort), robust variant |
-| `dkg` | 6, 6.1, 7.3 | commit-reveal DKG (message-oriented), complaint arbitration, batch VSS, committee support (§10.3 restarts) |
-| `triples` | 7, 7.3, 10.4 | triple factory (joint random + degree reduction), robust reconstruction of a cheater's re-sharing polynomial, batched, `*_with_committee` variants |
-| `presign` | 8, 8.5, 10.4 | presignatures, tweak derivation, tamper hooks, robust continuation, batched, `*_with_committee` variants |
-| `sign` | 9, 10.4 | share computation, verified combine, robust combine |
+| `open` | 4.6, 7.4, 10.4 | verified-opening subprotocol (structural identifiable abort), robust variant, arbitrary-point openings with explicit quorum |
+| `dkg` | 6, 6.1, 7.3, 7.4 | commit-reveal DKG (message-oriented), complaint arbitration, batch VSS at any uniform degree (packed dealing, explicit-polynomial dealing), committee support (§10.3 restarts) |
+| `triples` | 7, 7.3, 7.4, 10.4 | triple factory (joint random + degree reduction), robust reconstruction of a cheater's re-sharing polynomial, batched, packed (Franklin–Yung: constant-pack re-sharing + slot-binding checks), `*_with_committee` variants |
+| `presign` | 8, 8.5, 10.4, 7.4.3 | presignatures, tweak derivation, tamper hooks, robust continuation, batched, packed (degree-`d` throughout, constant-pack key binding in P4), `*_with_committee` variants |
+| `sign` | 9, 10.4, 7.4.3 | share computation, verified combine, robust combine, slot-point combine with explicit quorum (packed mode) |
 | `store` | 8.6 | single-use presignature store (atomic consume, `clear` for epoch changes) |
 | `policy` | 10.3 | `restart_committee` — expel-and-restart committee computation (never lowers `t`) |
 | `refresh` | 13.4 | committee maintenance with `X` unchanged: proactive zero-constant refresh (`refresh`) and re-sharing to a new committee with public old-share binding (`reshare`), `ReshareTamper` hooks |

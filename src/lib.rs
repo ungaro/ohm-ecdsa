@@ -138,6 +138,7 @@ impl Committee {
 pub(crate) mod tags {
     pub const DKG_COMMIT: &[u8] = b"OHM-ECDSA/v0.1/dkg-commit";
     pub const DKG_BATCH_COMMIT: &[u8] = b"OHM-ECDSA/v0.1/dkg-batch-commit";
+    pub const DKG_PACKED_COMMIT: &[u8] = b"OHM-ECDSA/v0.1/dkg-packed-commit";
     pub const TRIPLE_PRODUCT: &[u8] = b"OHM-ECDSA/v0.1/triple-product";
     pub const DLEQ_BATCH_RHO: &[u8] = b"OHM-ECDSA/v0.1/dleq-batch-rho";
     pub const SESSION_ID: &[u8] = b"OHM-ECDSA/v0.1/session-id";
