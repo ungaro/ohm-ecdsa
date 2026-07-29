@@ -12,6 +12,70 @@ triples + commit-reveal DKG. The full protocol is specified in
 [`SPEC.md`](./SPEC.md), including the patent design-around analysis
 (US 11,757,657 / Sepior and KU23 / Dfns; §12).
 
+## Why this is useful
+
+The two practical honest-majority threshold-ECDSA protocols are
+patent-encumbered (Blockdaemon's TSM descends from Sepior; Dfns
+describes its KU23 line as patented). An Apache-2.0 implementation with
+an express patent grant changes what teams can build and operate
+themselves:
+
+* **Self-hosted institutional custody.** Run and modify your own MPC
+  signing core — no per-wallet vendor fee, no closed-source black box in
+  the security-critical path, and a public element-by-element
+  design-around analysis (SPEC §12) instead of a known-encumbered
+  construction (still get an FTO opinion for commercial use — §12.6).
+  Same dynamic that made GG18-class open code explode the wallet
+  ecosystem, but for the honest-majority regime.
+* **On-chain multisig replacement.** The output is an ordinary ECDSA
+  signature under an ordinary key: the threshold policy is invisible
+  on-chain — no multisig contract to deploy or audit, lower fees, policy
+  privacy, and it works on any ECDSA chain, including ones with limited
+  or no scripting.
+* **Regulated issuance (RWA / tokenized securities).** A 3-of-5 across
+  legally accountable entities (issuer, custodian, auditor, HSM
+  provider, recovery agent) enforces segregation of duties
+  cryptographically. Identifiable abort turns "who touched this signing
+  session" into a verifiable fact: every deviation yields a blame token
+  checkable offline (SPEC §10.2, once the deployment transport signs
+  messages per §13.1) — usable for SLAs, insurance, examiner reviews.
+  HD tweaks (§9.4) derive unlimited per-fund or per-investor sub-keys
+  locally — one key ceremony, not one per listing.
+* **Long-lived keys with proactive security.** Epoch refresh (§13.4,
+  implemented) re-randomizes all shares while the public key stays put:
+  shares from different epochs do not combine, so compromise of up to
+  `T−1` parties *per epoch* — not just over the key's lifetime — yields
+  nothing. Committee changes re-share to new operators without changing
+  the key.
+* **Chain infrastructure.** The NEAR Chain Signatures / ICP pattern: a
+  validator committee is the key holder, so a chain holds and moves
+  native BTC/ETH/etc. without bridge contracts or wrapped-asset
+  counterparties. OHM-ECDSA is an open signing layer for exactly that
+  topology (NEAR runs the sibling cait-sith construction in production).
+* **High-throughput hot operations.** Triples and presignatures are
+  produced offline in bulk (batched or packed, §7.3/§7.4/§8.5); the
+  online path is one broadcast round plus sub-millisecond local math
+  (§13.5) — exchange-grade withdrawal signing without any single
+  machine able to sign. Honest majority also buys optional guaranteed
+  output delivery: blame the saboteur and *still ship the signature*
+  (§10.4 — impossible in the dishonest-majority model).
+* **Seedless consumer wallets.** 2-of-3 (device + service + recovery)
+  with one-round signing: normal-wallet UX, and compromise of any
+  single party yields nothing. Open license means no per-user royalties
+  on MPC recovery.
+* **Standardization.** NIST's threshold standardization (MPTS) is
+  evaluating threshold ECDSA now — and standards bodies route around
+  encumbered technology (that routing is how ECDSA itself replaced
+  Schnorr). Publishing this spec as defensive prior art keeps the
+  construction unpatentable by others and gives that process an
+  unencumbered candidate.
+
+Where this does **not** fit: customer-facing 2-of-2 or any deployment
+without an honest-majority assumption — that is CGGMP/DKLs territory
+(Paillier/OT-flavored). OHM-ECDSA targets settings where a vetted
+committee is the natural trust model: custodians, consortia, validator
+sets, issuers, auditors.
+
 ## Status
 
 **Implemented**
