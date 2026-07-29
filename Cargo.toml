@@ -1,0 +1,16 @@
+[package]
+name = "ohm-ecdsa"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "OHM-ECDSA: open honest-majority threshold ECDSA (reference implementation)"
+keywords = ["ecdsa", "threshold", "mpc", "tss"]
+rust-version = "1.75"
+
+[dependencies]
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+sha2 = "0.10"
+thiserror = "2"
+rand = "0.8"
+
+[dev-dependencies]

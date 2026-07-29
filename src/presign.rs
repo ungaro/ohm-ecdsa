@@ -1,0 +1,397 @@
+//! Key-dependent presignatures (SPEC §8): `([u] = [k⁻¹], [z] = [k⁻¹x], R, r)`.
+//!
+//! The inverse is *generated directly*: `u` is dealt as a random value and
+//! defined to be `k⁻¹`; `k` is derived publicly as `k = v⁻¹·a` where
+//! `v = a·u` is opened through a Beaver triple. No inversion protocol, no
+//! zero-sharing-blinded products (SPEC §12).
+//!
+//! [`presign_batch`] generates `B` records per session (SPEC §8.5): one
+//! commit-reveal covers all `2B` ephemeral VSS instances.
+
+use std::collections::BTreeMap;
+
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::{AffinePoint, ProjectivePoint, Scalar};
+use rand::rngs::StdRng;
+
+use crate::dkg::DkgOutput;
+use crate::open::open;
+use crate::shamir::lagrange_coeffs;
+use crate::triples::{self};
+use crate::vss::FeldmanCommitment;
+use crate::{scalar_from_digest, Error, IdentifiableAbort, Params, PartyId, Phase, Result};
+
+/// Long-term key share = DKG output.
+pub type KeyShare = DkgOutput;
+
+/// One party's presignature record (single-use; key-equivalent — SPEC §8.6).
+#[derive(Debug)]
+pub struct Presignature {
+    pub id: u64,
+    pub index: PartyId,
+    pub r: Scalar,
+    pub big_r: AffinePoint,
+    /// Share of `u = k⁻¹`.
+    pub u_share: Scalar,
+    /// Share of `z = k⁻¹·x`.
+    pub z_share: Scalar,
+    pub u_com: FeldmanCommitment,
+    pub z_com: FeldmanCommitment,
+}
+
+impl Drop for Presignature {
+    fn drop(&mut self) {
+        self.u_share = Scalar::ZERO;
+        self.z_share = Scalar::ZERO;
+    }
+}
+
+impl Presignature {
+    /// Additive key derivation (SPEC §9.4): rebind this presignature to
+    /// `x' = x + τ` with a local linear update.
+    pub fn apply_tweak(&mut self, tau: &Scalar) {
+        self.z_share += *tau * self.u_share;
+        self.z_com = self.z_com.add(&self.u_com.scale(tau));
+    }
+}
+
+/// Fault-injection hooks for testing identifiable abort.
+#[derive(Debug, Default)]
+pub struct PresignTamper {
+    /// This party broadcasts a wrong nonce point `R_j`.
+    pub bad_nonce_point: Option<PartyId>,
+}
+
+/// Run the presign protocol for one presignature id (SPEC §8, P1–P4).
+///
+/// `keys[i]`, `rngs[i]` belong to party `i + 1`. Returns one
+/// [`Presignature`] per party.
+pub fn presign(
+    params: &Params,
+    keys: &[KeyShare],
+    id: u64,
+    rngs: &mut [StdRng],
+    tamper: Option<&PresignTamper>,
+) -> Result<Vec<Presignature>> {
+    let n = params.n;
+    let t = params.t;
+    let sid = format!("ohm-ecdsa/presign/{id}").into_bytes();
+
+    // Two fresh triples (SPEC §7).
+    let t1 = triples::generate(params, &[sid.as_slice(), b"/t1"].concat(), rngs)?;
+    let t2 = triples::generate(params, &[sid.as_slice(), b"/t2"].concat(), rngs)?;
+    let pub1 = &t1[0].1;
+    let pub2 = &t2[0].1;
+
+    // P1: ephemeral joint randomness [u] (:= k⁻¹) and [a].
+    let u_out = triples::joint_random(
+        params,
+        &[sid.as_slice(), b"/u"].concat(),
+        rngs,
+        Phase::Presign,
+    )?;
+    let a_out = triples::joint_random(
+        params,
+        &[sid.as_slice(), b"/a"].concat(),
+        rngs,
+        Phase::Presign,
+    )?;
+    let u_shares: Vec<Scalar> = u_out.iter().map(|o| o.share).collect();
+    let a_shares: Vec<Scalar> = a_out.iter().map(|o| o.share).collect();
+    let u_com = u_out[0].com.clone();
+    let a_com = a_out[0].com.clone();
+
+    // P2: open δ = u − α, ε = a − β; form and open v = a·u via triple 1.
+    let neg = -Scalar::ONE;
+    let delta_com = u_com.add(&pub1.ca.scale(&neg));
+    let eps_com = a_com.add(&pub1.cb.scale(&neg));
+    let deltas: BTreeMap<PartyId, Scalar> =
+        (0..n).map(|k| (k + 1, u_shares[k] - t1[k].0.a)).collect();
+    let epsilons: BTreeMap<PartyId, Scalar> =
+        (0..n).map(|k| (k + 1, a_shares[k] - t1[k].0.b)).collect();
+    let delta = open(t, &delta_com, &deltas, Phase::Presign)?;
+    let eps = open(t, &eps_com, &epsilons, Phase::Presign)?;
+
+    let v_com = pub1
+        .cc
+        .clone()
+        .add(&pub1.cb.scale(&delta))
+        .add(&pub1.ca.scale(&eps))
+        .add_const(&(delta * eps));
+    let v_shares: BTreeMap<PartyId, Scalar> = (0..n)
+        .map(|k| {
+            (
+                k + 1,
+                t1[k].0.c + delta * t1[k].0.b + eps * t1[k].0.a + delta * eps,
+            )
+        })
+        .collect();
+    let v = open(t, &v_com, &v_shares, Phase::Presign)?;
+    if v == Scalar::ZERO {
+        return Err(Error::ZeroValue("v = 0".into())); // restart with fresh randomness
+    }
+    let v_inv =
+        Option::<Scalar>::from(v.invert()).ok_or_else(|| Error::ZeroValue("v = 0".into()))?;
+
+    // P3: [k] = v⁻¹·[a]; nonce point R with per-share point checks.
+    let k_com = a_com.scale(&v_inv);
+    let mut r_points = Vec::with_capacity(n);
+    for k in 0..n {
+        let j = k + 1;
+        let k_share = v_inv * a_shares[k];
+        let mut r_j = ProjectivePoint::GENERATOR * k_share;
+        if let Some(tamp) = tamper {
+            if tamp.bad_nonce_point == Some(j) {
+                r_j += ProjectivePoint::GENERATOR; // malicious: wrong point
+            }
+        }
+        if r_j != k_com.eval_at(j) {
+            return Err(Error::Abort {
+                abort: IdentifiableAbort {
+                    phase: Phase::Presign,
+                    blamed: vec![j],
+                    detail: "invalid nonce point R_j".into(),
+                },
+            });
+        }
+        r_points.push(r_j);
+    }
+    let lambdas = lagrange_coeffs(&params.parties());
+    let mut big_r_proj = ProjectivePoint::IDENTITY;
+    for (l, rp) in lambdas.iter().zip(r_points.iter()) {
+        big_r_proj += *rp * l;
+    }
+    let big_r = big_r_proj.to_affine();
+    let r_encoded = big_r.to_encoded_point(false);
+    let r_scalar = scalar_from_digest(r_encoded.x().expect("uncompressed point has x"));
+    if r_scalar == Scalar::ZERO {
+        return Err(Error::ZeroValue("r = 0".into()));
+    }
+
+    // P4: z = u·x via triple 2 (binds the presignature to the key).
+    let d2_com = u_com.add(&pub2.ca.scale(&neg));
+    let e2_com = keys[0].com.add(&pub2.cb.scale(&neg));
+    let d2: BTreeMap<PartyId, Scalar> = (0..n).map(|k| (k + 1, u_shares[k] - t2[k].0.a)).collect();
+    let e2: BTreeMap<PartyId, Scalar> =
+        (0..n).map(|k| (k + 1, keys[k].share - t2[k].0.b)).collect();
+    let d2v = open(t, &d2_com, &d2, Phase::Presign)?;
+    let e2v = open(t, &e2_com, &e2, Phase::Presign)?;
+    let z_com = pub2
+        .cc
+        .clone()
+        .add(&pub2.cb.scale(&d2v))
+        .add(&pub2.ca.scale(&e2v))
+        .add_const(&(d2v * e2v));
+
+    let presigs = (0..n)
+        .map(|k| {
+            let j = k + 1;
+            let z_share = t2[k].0.c + d2v * t2[k].0.b + e2v * t2[k].0.a + d2v * e2v;
+            Presignature {
+                id,
+                index: j,
+                r: r_scalar,
+                big_r,
+                u_share: u_shares[k],
+                z_share,
+                u_com: u_com.clone(),
+                z_com: z_com.clone(),
+            }
+        })
+        .collect();
+    Ok(presigs)
+}
+
+/// Run the presign protocol for a batch of presignature ids (SPEC §8.5).
+///
+/// One batch joint VSS (§7.3 machinery) covers all `u⁽¹..B⁾, a⁽¹..B⁾`;
+/// the `2B` triples come from one [`triples::generate_batch`] session; and
+/// the per-`b` Beaver openings (P2, P4) and nonce points `R_j⁽ᵇ⁾` (P3,
+/// same `EvalCom(A[k], j)` point-equality check and blame) are grouped so
+/// each logical broadcast round carries the whole batch.
+///
+/// Returns, per party, `B` presignatures in `ids` order. A zero `v` or `r`
+/// at batch index `b` is `Error::ZeroValue` naming `b` (restart policy
+/// stays with the caller, as in [`presign`]). `tamper` (tests) applies to
+/// batch item 0.
+pub fn presign_batch(
+    params: &Params,
+    keys: &[KeyShare],
+    ids: &[u64],
+    rngs: &mut [StdRng],
+    tamper: Option<&PresignTamper>,
+) -> Result<Vec<Vec<Presignature>>> {
+    let n = params.n;
+    let t = params.t;
+    let count = ids.len();
+    if count == 0 {
+        return Err(Error::InvalidParams("empty presignature batch"));
+    }
+    let mut sid = b"ohm-ecdsa/presign-batch".to_vec();
+    for id in ids {
+        sid.extend_from_slice(&id.to_be_bytes());
+    }
+
+    // 2B fresh triples from one batched session (SPEC §7.3): triples 2b
+    // and 2b+1 serve as t1/t2 of item b.
+    let triples = triples::generate_batch(
+        params,
+        &[sid.as_slice(), b"/triples"].concat(),
+        2 * count,
+        rngs,
+    )?;
+
+    // P1: one batch joint VSS for u⁽¹..B⁾ (indices 0..B) and a⁽¹..B⁾ (B..2B).
+    let joint = triples::joint_random_batch(
+        params,
+        &[sid.as_slice(), b"/ua"].concat(),
+        rngs,
+        Phase::Presign,
+        2 * count,
+    )?;
+    let u_shares: Vec<Vec<Scalar>> = (0..n)
+        .map(|k| (0..count).map(|b| joint[k][b].share).collect())
+        .collect();
+    let a_shares: Vec<Vec<Scalar>> = (0..n)
+        .map(|k| (0..count).map(|b| joint[k][count + b].share).collect())
+        .collect();
+    let u_coms: Vec<FeldmanCommitment> = (0..count).map(|b| joint[0][b].com.clone()).collect();
+    let a_coms: Vec<FeldmanCommitment> = (0..count)
+        .map(|b| joint[0][count + b].com.clone())
+        .collect();
+
+    let neg = -Scalar::ONE;
+    let lambdas = lagrange_coeffs(&params.parties());
+
+    // P2 (all Beaver openings ride in the same broadcast rounds): per b,
+    // open δ = u − α, ε = a − β, then v = a·u via triple 2b.
+    let mut v_invs = Vec::with_capacity(count);
+    for b in 0..count {
+        let pub1 = &triples[0][2 * b].1;
+        let delta_com = u_coms[b].add(&pub1.ca.scale(&neg));
+        let eps_com = a_coms[b].add(&pub1.cb.scale(&neg));
+        let deltas: BTreeMap<PartyId, Scalar> = (0..n)
+            .map(|k| (k + 1, u_shares[k][b] - triples[k][2 * b].0.a))
+            .collect();
+        let epsilons: BTreeMap<PartyId, Scalar> = (0..n)
+            .map(|k| (k + 1, a_shares[k][b] - triples[k][2 * b].0.b))
+            .collect();
+        let delta = open(t, &delta_com, &deltas, Phase::Presign)?;
+        let eps = open(t, &eps_com, &epsilons, Phase::Presign)?;
+
+        let v_com = pub1
+            .cc
+            .clone()
+            .add(&pub1.cb.scale(&delta))
+            .add(&pub1.ca.scale(&eps))
+            .add_const(&(delta * eps));
+        let v_shares: BTreeMap<PartyId, Scalar> = (0..n)
+            .map(|k| {
+                (
+                    k + 1,
+                    triples[k][2 * b].0.c
+                        + delta * triples[k][2 * b].0.b
+                        + eps * triples[k][2 * b].0.a
+                        + delta * eps,
+                )
+            })
+            .collect();
+        let v = open(t, &v_com, &v_shares, Phase::Presign)?;
+        if v == Scalar::ZERO {
+            return Err(Error::ZeroValue(format!("v = 0 at batch index {b}")));
+        }
+        v_invs.push(
+            Option::<Scalar>::from(v.invert())
+                .ok_or_else(|| Error::ZeroValue(format!("v = 0 at batch index {b}")))?,
+        );
+    }
+
+    // P3 (all R_j⁽ᵇ⁾ ride in one round): [k] = v⁻¹·[a]; nonce points with
+    // per-share point checks.
+    let mut big_rs = Vec::with_capacity(count);
+    let mut r_scalars = Vec::with_capacity(count);
+    for b in 0..count {
+        let k_com = a_coms[b].scale(&v_invs[b]);
+        let mut r_points = Vec::with_capacity(n);
+        for (k, a_shares_k) in a_shares.iter().enumerate() {
+            let j = k + 1;
+            let k_share = v_invs[b] * a_shares_k[b];
+            let mut r_j = ProjectivePoint::GENERATOR * k_share;
+            if let Some(tamp) = tamper {
+                if b == 0 && tamp.bad_nonce_point == Some(j) {
+                    r_j += ProjectivePoint::GENERATOR; // malicious: wrong point
+                }
+            }
+            if r_j != k_com.eval_at(j) {
+                return Err(Error::Abort {
+                    abort: IdentifiableAbort {
+                        phase: Phase::Presign,
+                        blamed: vec![j],
+                        detail: format!("invalid nonce point R_j (batch index {b})"),
+                    },
+                });
+            }
+            r_points.push(r_j);
+        }
+        let mut big_r_proj = ProjectivePoint::IDENTITY;
+        for (l, rp) in lambdas.iter().zip(r_points.iter()) {
+            big_r_proj += *rp * l;
+        }
+        let big_r = big_r_proj.to_affine();
+        let r_encoded = big_r.to_encoded_point(false);
+        let r_scalar = scalar_from_digest(r_encoded.x().expect("uncompressed point has x"));
+        if r_scalar == Scalar::ZERO {
+            return Err(Error::ZeroValue(format!("r = 0 at batch index {b}")));
+        }
+        big_rs.push(big_r);
+        r_scalars.push(r_scalar);
+    }
+
+    // P4: z = u·x via triple 2b+1 (binds each record to the key).
+    let mut z_coms = Vec::with_capacity(count);
+    let mut d2e2 = Vec::with_capacity(count);
+    for b in 0..count {
+        let pub2 = &triples[0][2 * b + 1].1;
+        let d2_com = u_coms[b].add(&pub2.ca.scale(&neg));
+        let e2_com = keys[0].com.add(&pub2.cb.scale(&neg));
+        let d2: BTreeMap<PartyId, Scalar> = (0..n)
+            .map(|k| (k + 1, u_shares[k][b] - triples[k][2 * b + 1].0.a))
+            .collect();
+        let e2: BTreeMap<PartyId, Scalar> = (0..n)
+            .map(|k| (k + 1, keys[k].share - triples[k][2 * b + 1].0.b))
+            .collect();
+        let d2v = open(t, &d2_com, &d2, Phase::Presign)?;
+        let e2v = open(t, &e2_com, &e2, Phase::Presign)?;
+        z_coms.push(
+            pub2.cc
+                .clone()
+                .add(&pub2.cb.scale(&d2v))
+                .add(&pub2.ca.scale(&e2v))
+                .add_const(&(d2v * e2v)),
+        );
+        d2e2.push((d2v, e2v));
+    }
+
+    let presigs = (0..n)
+        .map(|k| {
+            let j = k + 1;
+            (0..count)
+                .map(|b| {
+                    let t2 = &triples[k][2 * b + 1].0;
+                    let (d2v, e2v) = d2e2[b];
+                    Presignature {
+                        id: ids[b],
+                        index: j,
+                        r: r_scalars[b],
+                        big_r: big_rs[b],
+                        u_share: u_shares[k][b],
+                        z_share: t2.c + d2v * t2.b + e2v * t2.a + d2v * e2v,
+                        u_com: u_coms[b].clone(),
+                        z_com: z_coms[b].clone(),
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    Ok(presigs)
+}
