@@ -61,6 +61,71 @@ public Feldman commitments fails and names the cheater — no proof
 systems, no trusted hardware. Full diagrams per phase:
 [`SPEC.md`](./SPEC.md) §5, §6, §8, §9.
 
+## Quick start
+
+Rust 1.75+ (MSRV), no system dependencies:
+
+```bash
+cargo test
+```
+
+64 tests (18 unit + 46 integration): end-to-end signing verified by
+`k256`'s ECDSA verifier, cheater identification in every phase, robust
+continuation, expel-and-restart, refresh/re-sharing, batch and packed
+generation, single-use enforcement — plus smoke tests that run the four
+narrative examples below and check their guarantee lines. Everything is
+deterministic — no OS randomness in tests.
+
+```bash
+cargo run --release --example perf
+```
+
+prints the SPEC §13.5 wall-clock rows (keygen, triples, presign, sign,
+batched and packed variants) as medians — `std::time::Instant` only, no
+extra dependencies. Signatures produced are **ordinary ECDSA**: they
+verify with any standard verifier (k256, OpenSSL, a bitcoin node).
+
+## Usage
+
+```rust
+use ohm_ecdsa::{sim, Params};
+
+let params = Params::new(3, 2).unwrap();            // 2-of-3, honest majority
+let mut rngs = sim::make_rngs(params.n, 0xC0FFEE);  // OS CSPRNG in production
+
+let keys    = sim::run_keygen(&params, b"key/0", &mut rngs).unwrap();
+let presigs = sim::run_presign(&params, &keys, 1, &mut rngs, None).unwrap();
+
+// any T parties sign; one round; low-s normalized
+let sig = sim::run_sign(&params, &presigs[..2], b"hello threshold", None).unwrap();
+```
+
+## Examples
+
+| Example | Shows | Command |
+|---|---|---|
+| `wallet_2_of_3` | 2-of-3 wallet: presig pool, single-use store, lost-phone recovery | `cargo run --example wallet_2_of_3` |
+| `consortium_custody` | 3-of-5: batch presigs, T-party subset signing, HD-tweak sub-keys | `cargo run --example consortium_custody` |
+| `identifiable_abort` | tampered share: fail-fast blame vs robust delivery (§10.4) | `cargo run --example identifiable_abort` |
+| `epoch_refresh` | §13.4 refresh + re-share to a new committee, X unchanged | `cargo run --example epoch_refresh` |
+
+## Choosing parameters (T, n, B)
+
+`n ≥ 2T − 1` is the honest-majority condition (`Params::new` enforces
+it). Signing needs any `T` parties; up to `T−1` may be malicious.
+**Slack** (`n − (2T−1)`) is what expel-and-restart (§10.3) spends: at
+zero slack, any expulsion forces committee re-sharing (§13.4). Packed
+mode (§7.4) additionally requires `n ≥ 2T + 2B − 3` and moves the online
+quorum to `T + B − 1` (privacy stays `T−1`):
+
+| Committee | Tolerates | Sign quorum | Max packed B | Slack | Notes |
+|---|---|---|---|---|---|
+| 2-of-3 | 1 | 2 | 1 | 0 | minimal; expulsion ⇒ re-share |
+| 2-of-5 | 1 | 2 | 2 | 2 | restarts + small packed batches |
+| 3-of-5 | 2 | 3 | 1 | 0 | typical consortium size |
+| 3-of-6 | 2 | 3 | 1 | 1 | one restart without re-sharing |
+| 3-of-9 | 2 | 3 (packed: 5) | 3 | 4 | packed throughput mode |
+
 ## Why this is useful
 
 The two practical honest-majority threshold-ECDSA protocols are
@@ -129,85 +194,41 @@ sets, issuers, auditors.
 
 **Implemented**
 
-* Commit-then-reveal Pedersen DKG with public complaint arbitration (SPEC §6)
-* Feldman VSS — every opening verified by point equality, no NIZKs (§4.2)
-* Chaum–Pedersen DLEQ proofs (§4.4)
-* Beaver triple factory with verifiable degree reduction (§7)
-* Key-dependent presignatures `([k⁻¹], [k⁻¹x], R)` (§8)
-* One-round signing with per-share verification and identifiable abort (§9–§10)
-* Additive key derivation / HD tweaks (§9.4)
-* Robust continuation (§10.4): blamed parties are excluded and the honest
-  majority still delivers — online signing (`run_sign_robust`), presign
-  (`run_presign_robust`: openings via `open_robust`, `R` interpolated over
-  the valid nonce points), and triple generation
-  (`triples::generate_robust`: the cheater's committed re-sharing
-  polynomial is publicly reconstructed)
-* Single-use presignature store (§8.6): atomic consume, duplicate-id rejection
-* Batch generation (§7.3/§8.5): one commit-reveal per batch for triples and
-  presignatures (`generate_batch`, `presign_batch`), with §7.3 aggregate
-  batch DLEQ verification (`dleq::verify_batch`) plus per-proof fallback
-  for blame attribution
-* Packed-Shamir batching (§7.4, Franklin–Yung): `B` triples in ONE pair of
-  degree-`d` packed sharings with one DLEQ proof per party
-  (`triples::generate_packed`), packed presignatures
-  (`presign::presign_packed`) with a publicly-bound constant-pack key
-  re-sharing in P4, and slot-point signing (`sign::combine_at`,
-  `sim::run_sign_packed`) — the §7.4.3 trade-off: the online quorum
-  becomes `T + B − 1` (availability only; privacy stays at `T−1`)
-* Expel-and-restart (§10.3) composed with robust continuation (§10.4):
-  every presign/triples attempt drives the robust variant, so continuable
-  faults finish in-attempt (no id poisoning); only dealing-phase aborts
-  expel the blamed and restart over the surviving committee —
-  keygen/triples renumber freely, presign keeps the survivors' original ids
-  (`run_keygen_with_restart`, `run_presign_with_restart`,
-  `run_triples_with_restart`); the aborted sid/id is poisoned, and `t` is
-  never silently lowered (zero-slack refusal points at §13.4)
-* Committee maintenance (§13.4), public key unchanged: proactive refresh
-  (zero-constant re-sharing over the same committee, `run_refresh`) and
-  committee-change re-sharing to a new id set with public old-share binding
-  (`C_j.points[0] == EvalCom(A[x], j)`, `run_reshare`); `PresigStore::clear`
-  invalidates outstanding presignatures on epoch change (§8.6)
-* Explicit transport seam (§13.1/§13.2): `Envelope` per-message contract,
-  sync `Transport` trait, `SimTransport` reference implementation; keygen
-  delivery runs through the seam (`transport::drive_dkg`)
-* Single-threaded reference orchestrator + fault-injection hooks
+* Commit-reveal Pedersen DKG with public complaint arbitration (§6, §6.1)
+* Feldman VSS — every opening verified by point equality, no NIZKs (§4.2);
+  Chaum–Pedersen DLEQ product proofs (§4.4)
+* Beaver triple factory (§7): single, batched (§7.3, one commit-reveal per
+  batch + aggregate DLEQ verification), packed (§7.4 Franklin–Yung)
+* Key-dependent presignatures (§8), batched (§8.5) and packed; additive
+  HD tweaks (§9.4)
+* One-round signing with per-share identifiable abort (§9–§10)
+* Robust continuation (§10.4) in sign, presign, and triples: blame the
+  cheater and still deliver
+* Expel-and-restart (§10.3) composed with robust continuation; aborted
+  ids poisoned; `T` never silently lowered
+* Single-use presignature store (§8.6): atomic consume, duplicate-id
+  rejection
+* Committee maintenance (§13.4): proactive refresh and committee-change
+  re-sharing, public key unchanged
+* Explicit transport seam (§13.1/§13.2) + single-threaded reference
+  orchestrator with fault-injection hooks
 
 **Not yet** (roadmap): production transport over the seam (mTLS + echo
 broadcast + per-message signatures — the `transport` module is the
 contract, not an implementation), serde wire format, key rotation
 (§13.4 — re-DKG with a new `X`), audit.
 
-## Quick start
+## Documentation map
 
-```bash
-cargo test
-```
+* Protocol design, notation, diagrams → [`SPEC.md`](./SPEC.md) §1–§10
+* Security claims and proof obligations → SPEC §11
+* Patent design-around analysis → SPEC §12
+* Deployment, transport, and hardening checklists → SPEC §13
+* References (GJKR96, Beaver, Groth–Shoup, DJNPO20, KU23, …) → SPEC §14
+* Contributor conventions (and guidance for AI agents) → `AGENTS.md`
 
-Runs 18 unit tests and 42 integration tests: end-to-end 2-of-3 and 3-of-5
-signatures verified by `k256`'s ECDSA verifier, subset signing with only
-`T` parties, cheater identification in keygen (both §6.1 complaint
-branches), triples, presign, and sign, robust signing with up to `T−1`
-cheaters, robust presign/triples continuation with correct blame (§10.4),
-expel-and-restart composed with the robust path (§10.3+§10.4, 3-of-6):
-continuable faults complete in-attempt, dealing-phase aborts restart with
-id poisoning, zero-slack refusal, presignature single-use enforcement,
-HD-tweak signing, batched triple/presignature generation, packed mode
-(§7.4: slot-multiplicative packed triples on the FY-minimal committee,
-packed presign+sign with the `T+B−1` online quorum, PT2 cheater blame,
-undersized-committee rejection), committee
-maintenance (§13.4: refresh preserving `X`, presignature invalidation on
-epoch change, re-sharing to a new committee with dealer-blame fault
-injection), and keygen executed through the explicit transport seam
-(`transport::drive_dkg` over `SimTransport`).
-
-```bash
-cargo run --release --example perf
-```
-
-prints the SPEC §13.5 wall-clock rows (keygen, triples, presign, sign,
-batched variants, batch-DLEQ aggregate vs individual verification) as
-medians over repeated runs — `std::time::Instant` only, no extra
-dependencies.
+Contributions: keep `cargo fmt && cargo clippy --all-targets &&
+cargo test` green; follow `AGENTS.md`.
 
 ## Layout
 
@@ -232,21 +253,6 @@ crate root (`ohm_ecdsa::shamir`, `ohm_ecdsa::sim`, …).
 | `runtime/transport` | 4.7, 10.2, 13.1, 13.2 | transport seam: `Envelope` message contract, sync `Transport` trait, `SimTransport` reference impl, `drive_dkg` transport-driven keygen driver |
 | `runtime/sim` | 4.7, 10.3, 13.2 | reference orchestrator (keygen routes through the `transport` seam), §10.3 restart wrappers |
 
-## Usage
-
-```rust
-use ohm_ecdsa::{sim, Params};
-
-let params = Params::new(3, 2).unwrap();            // 2-of-3, honest majority
-let mut rngs = sim::make_rngs(params.n, 0xC0FFEE);  // OS CSPRNG in production
-
-let keys    = sim::run_keygen(&params, b"key/0", &mut rngs).unwrap();
-let presigs = sim::run_presign(&params, &keys, 1, &mut rngs, None).unwrap();
-
-// any T parties sign; one round; low-s normalized
-let sig = sim::run_sign(&params, &presigs[..2], b"hello threshold", None).unwrap();
-```
-
 ## Security notes
 
 * Presignature records are **single-use** and their shares are
@@ -255,6 +261,8 @@ let sig = sim::run_sign(&params, &presigs[..2], b"hello threshold", None).unwrap
   aborts with the sender's identity (`Error::Abort`).
 * Secret-holding structs erase on `Drop` via `zeroize` (compiler-fenced;
   production additionally needs mlock, ideally HSMs; §13.3).
+* The full transport, storage, and hardening checklist for deployments
+  is SPEC §13.
 
 ## Patent notes
 

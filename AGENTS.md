@@ -41,12 +41,22 @@ keep those citations accurate when changing code.
 - `cargo build` — build the library.
 - `cargo test` — runs 18 unit tests (inline `#[cfg(test)]` modules in
   `src/lib.rs`, `src/primitives/{shamir,vss,open,dleq}.rs`,
-  `src/protocol/{dkg,triples}.rs`, `src/runtime/{policy,transport}.rs`) and
-  42 integration tests in `tests/e2e.rs`. All 60 pass at the time of
-  writing.
+  `src/protocol/{dkg,triples}.rs`, `src/runtime/{policy,transport}.rs`),
+  42 integration tests in `tests/e2e.rs`, and 4 example smoke tests in
+  `tests/examples.rs` (each narrative example is run via `cargo run
+  --example` and checked for its guarantee lines). All 64 pass at the
+  time of writing.
 - `cargo run --release --example perf` — `examples/perf.rs` wall-clock
   micro-benchmarks for the SPEC §13.5 rows (std `Instant` only, no extra
   dependencies).
+- `cargo run --example NAME` — narrative examples (living documentation,
+  deterministic `sim::make_rngs` seeds, every signature k256-verified):
+  `wallet_2_of_3` (presig pool + single-use stores + lost-phone
+  recovery), `consortium_custody` (3-of-5 batch presign, subset signing,
+  §9.4 HD tweak), `identifiable_abort` (fail-fast blame vs §10.4 robust
+  delivery), `epoch_refresh` (§13.4 refresh + re-share, X unchanged).
+  All four are smoke-tested by `tests/examples.rs` (run + stdout
+  guarantee lines).
 - `cargo fmt` / `cargo clippy` — standard toolchain; no custom config
   files, use defaults.
 
