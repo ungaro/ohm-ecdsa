@@ -50,8 +50,9 @@ use std::collections::BTreeMap;
 
 use k256::ecdsa::signature::{Signer, Verifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
-use k256::elliptic_curve::sec1::ToEncodedPoint;
-use k256::{ProjectivePoint, Scalar, SecretKey};
+use k256::elliptic_curve::ff::PrimeField;
+use k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+use k256::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar, SecretKey};
 use rand::RngCore;
 
 use crate::dkg::{DkgBcast1, DkgBcast2, DkgInstance, DkgOutput, DkgP2P, DkgTamper};
@@ -256,15 +257,27 @@ fn reveals_of(envs: BTreeMap<PartyId, Envelope<DkgMessage>>) -> BTreeMap<PartyId
 
 // --- §10.2/§13.1 signed envelopes and blame tokens -------------------------
 
-/// Canonical byte encoding for transport signing (SPEC §13.1): no serde —
-/// every field is fixed-width or length-prefixed, so the encoding of
-/// `(sid ‖ phase ‖ round ‖ from ‖ to ‖ payload)` is unambiguous.
+/// Canonical byte encoding (SPEC §13.1): no serde — every field is
+/// fixed-width or length-prefixed, so the encoding of any value (and of
+/// `(sid ‖ phase ‖ round ‖ from ‖ to ‖ payload)` in particular) is
+/// unambiguous. This is THE canonical wire format of the protocol: it is
+/// what transport signatures cover ([`signing_bytes`]) and what the
+/// companion node crate (`ohm-ecdsa-node`) frames on the wire.
 ///
 /// Implemented for [`DkgMessage`] (the demo/driver path); other message
 /// types implement it as their phases migrate to the signed transport.
 pub trait Encode {
     /// Append the canonical encoding of `self` to `out`.
     fn encode(&self, out: &mut Vec<u8>);
+}
+
+/// The inverse of [`Encode`]: decode one value from the front of `bytes`,
+/// returning the value and the number of bytes consumed. `None` on any
+/// malformed input (truncation, non-canonical scalar/point encodings,
+/// unknown tags) — decoders MUST NOT panic on untrusted wire data.
+pub trait Decode: Sized {
+    /// Decode one value; `Some((value, consumed))` on success.
+    fn decode(bytes: &[u8]) -> Option<(Self, usize)>;
 }
 
 fn put_u8(out: &mut Vec<u8>, v: u8) {
@@ -298,12 +311,115 @@ fn phase_code(phase: Phase) -> u8 {
     }
 }
 
+fn phase_decode(code: u8) -> Option<Phase> {
+    match code {
+        1 => Some(Phase::KeyGen),
+        2 => Some(Phase::Triples),
+        3 => Some(Phase::Presign),
+        4 => Some(Phase::Sign),
+        5 => Some(Phase::Refresh),
+        _ => None,
+    }
+}
+
+// --- canonical decoding (the inverse of the put_* helpers) -----------------
+
+fn take_u8(b: &[u8]) -> Option<(u8, usize)> {
+    b.first().copied().map(|v| (v, 1))
+}
+
+fn take_u64(b: &[u8]) -> Option<(u64, usize)> {
+    let a: [u8; 8] = b.get(..8)?.try_into().ok()?;
+    Some((u64::from_be_bytes(a), 8))
+}
+
+fn take_bytes(b: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let (n, used) = take_u64(b)?;
+    let n = usize::try_from(n).ok()?;
+    let end = used.checked_add(n)?;
+    Some((b.get(used..end)?.to_vec(), end))
+}
+
+fn take_scalar(b: &[u8]) -> Option<(Scalar, usize)> {
+    let a: [u8; 32] = b.get(..32)?.try_into().ok()?;
+    // Canonical scalars only: `from_repr` rejects encodings >= q.
+    let s = Option::<Scalar>::from(Scalar::from_repr(a.into()))?;
+    Some((s, 32))
+}
+
+fn take_point(b: &[u8]) -> Option<(ProjectivePoint, usize)> {
+    match b.first()? {
+        // SEC1 infinity encoding (what `to_encoded_point` emits for the
+        // identity — e.g. zero-padded high coefficients, §7.4.3).
+        0x00 => Some((ProjectivePoint::IDENTITY, 1)),
+        // Compressed SEC1 (the canonical form `put_point` emits).
+        0x02 | 0x03 => {
+            let ep = EncodedPoint::from_bytes(b.get(..33)?).ok()?;
+            let aff = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&ep))?;
+            Some((ProjectivePoint::from(aff), 33))
+        }
+        _ => None,
+    }
+}
+
+impl Decode for Scalar {
+    fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
+        take_scalar(bytes)
+    }
+}
+
+impl Decode for ProjectivePoint {
+    fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
+        take_point(bytes)
+    }
+}
+
+impl Encode for Signature {
+    fn encode(&self, out: &mut Vec<u8>) {
+        // Fixed-width 64-byte (r ‖ s) encoding.
+        out.extend_from_slice(&self.to_bytes());
+    }
+}
+
+impl Decode for Signature {
+    fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
+        let sig = Signature::from_slice(bytes.get(..64)?).ok()?;
+        Some((sig, 64))
+    }
+}
+
+impl Encode for Scalar {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_scalar(out, self);
+    }
+}
+
+impl Encode for ProjectivePoint {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_point(out, self);
+    }
+}
+
 impl Encode for FeldmanCommitment {
     fn encode(&self, out: &mut Vec<u8>) {
         put_u64(out, self.points.len() as u64);
         for p in &self.points {
             put_point(out, p);
         }
+    }
+}
+
+impl Decode for FeldmanCommitment {
+    fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
+        let (n, mut used) = take_u64(bytes)?;
+        // No `with_capacity`: the length is untrusted wire data.
+        let mut points = Vec::new();
+        for _ in 0..n {
+            let (p, u) = take_point(bytes.get(used..)?)?;
+            points.push(p);
+            used += u;
+        }
+        Some((Self { points }, used))
     }
 }
 
@@ -314,10 +430,41 @@ impl Encode for DkgBcast1 {
     }
 }
 
+impl Decode for DkgBcast1 {
+    fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
+        let (from, mut used) = take_u64(bytes)?;
+        let (hash, u) = take_bytes(bytes.get(used..)?)?;
+        used += u;
+        let hash: [u8; 32] = hash.try_into().ok()?;
+        Some((
+            Self {
+                from: usize::try_from(from).ok()?,
+                hash,
+            },
+            used,
+        ))
+    }
+}
+
 impl Encode for DkgBcast2 {
     fn encode(&self, out: &mut Vec<u8>) {
         put_u64(out, self.from as u64);
         self.com.encode(out);
+    }
+}
+
+impl Decode for DkgBcast2 {
+    fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
+        let (from, mut used) = take_u64(bytes)?;
+        let (com, u) = FeldmanCommitment::decode(bytes.get(used..)?)?;
+        used += u;
+        Some((
+            Self {
+                from: usize::try_from(from).ok()?,
+                com,
+            },
+            used,
+        ))
     }
 }
 
@@ -326,6 +473,24 @@ impl Encode for DkgP2P {
         put_u64(out, self.from as u64);
         put_u64(out, self.to as u64);
         put_scalar(out, &self.share);
+    }
+}
+
+impl Decode for DkgP2P {
+    fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
+        let (from, mut used) = take_u64(bytes)?;
+        let (to, u) = take_u64(bytes.get(used..)?)?;
+        used += u;
+        let (share, u) = take_scalar(bytes.get(used..)?)?;
+        used += u;
+        Some((
+            Self {
+                from: usize::try_from(from).ok()?,
+                to: usize::try_from(to).ok()?,
+                share,
+            },
+            used,
+        ))
     }
 }
 
@@ -348,24 +513,120 @@ impl Encode for DkgMessage {
     }
 }
 
+impl Decode for DkgMessage {
+    fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
+        let (tag, mut used) = take_u8(bytes)?;
+        let (msg, u) = match tag {
+            1 => {
+                let (b, u) = DkgBcast1::decode(bytes.get(used..)?)?;
+                (DkgMessage::Commit(b), u)
+            }
+            2 => {
+                let (b, u) = DkgBcast2::decode(bytes.get(used..)?)?;
+                (DkgMessage::Reveal(b), u)
+            }
+            3 => {
+                let (s, u) = DkgP2P::decode(bytes.get(used..)?)?;
+                (DkgMessage::Share(s), u)
+            }
+            _ => return None,
+        };
+        used += u;
+        Some((msg, used))
+    }
+}
+
+impl<M: Encode> Encode for Envelope<M> {
+    /// The six-field encoding `(sid ‖ phase ‖ round ‖ from ‖ to ‖
+    /// payload)` — exactly the bytes [`signing_bytes`] covers (after the
+    /// domain-separation tag).
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_bytes(out, &self.sid);
+        put_u8(out, phase_code(self.phase));
+        put_u8(out, self.round);
+        put_u64(out, self.from as u64);
+        match self.to {
+            None => put_u8(out, 0),
+            Some(to) => {
+                put_u8(out, 1);
+                put_u64(out, to as u64);
+            }
+        }
+        let mut payload = Vec::new();
+        self.payload.encode(&mut payload);
+        put_bytes(out, &payload);
+    }
+}
+
+impl<M: Decode> Decode for Envelope<M> {
+    fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
+        let (sid, mut used) = take_bytes(bytes)?;
+        let (phase, u) = take_u8(bytes.get(used..)?)?;
+        used += u;
+        let phase = phase_decode(phase)?;
+        let (round, u) = take_u8(bytes.get(used..)?)?;
+        used += u;
+        let (from, u) = take_u64(bytes.get(used..)?)?;
+        used += u;
+        let (to_tag, u) = take_u8(bytes.get(used..)?)?;
+        used += u;
+        let to = match to_tag {
+            0 => None,
+            1 => {
+                let (to, u) = take_u64(bytes.get(used..)?)?;
+                used += u;
+                Some(usize::try_from(to).ok()?)
+            }
+            _ => return None,
+        };
+        let (payload_bytes, u) = take_bytes(bytes.get(used..)?)?;
+        used += u;
+        // The payload field is self-delimited: it must decode EXACTLY.
+        let (payload, payload_used) = M::decode(&payload_bytes)?;
+        if payload_used != payload_bytes.len() {
+            return None;
+        }
+        Some((
+            Self {
+                sid,
+                phase,
+                round,
+                from: usize::try_from(from).ok()?,
+                to,
+                payload,
+            },
+            used,
+        ))
+    }
+}
+
+impl<M: Encode> Encode for SignedEnvelope<M> {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.envelope.encode(out);
+        self.signature.encode(out);
+    }
+}
+
+impl<M: Decode> Decode for SignedEnvelope<M> {
+    fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
+        let (envelope, mut used) = Envelope::decode(bytes)?;
+        let (signature, u) = Signature::decode(bytes.get(used..)?)?;
+        used += u;
+        Some((
+            Self {
+                envelope,
+                signature,
+            },
+            used,
+        ))
+    }
+}
+
 /// The canonical signing bytes of an envelope: the domain-separation tag
 /// followed by the unambiguous encoding of all six fields.
 fn signing_bytes<M: Encode>(env: &Envelope<M>) -> Vec<u8> {
     let mut out = tags::TRANSPORT_SIGN.to_vec();
-    put_bytes(&mut out, &env.sid);
-    put_u8(&mut out, phase_code(env.phase));
-    put_u8(&mut out, env.round);
-    put_u64(&mut out, env.from as u64);
-    match env.to {
-        None => put_u8(&mut out, 0),
-        Some(to) => {
-            put_u8(&mut out, 1);
-            put_u64(&mut out, to as u64);
-        }
-    }
-    let mut payload = Vec::new();
-    env.payload.encode(&mut payload);
-    put_bytes(&mut out, &payload);
+    env.encode(&mut out);
     out
 }
 
@@ -924,6 +1185,8 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
+    use k256::elliptic_curve::Field; // Scalar::random in wire tests
+
     fn make_signers(n: usize, seed: u64) -> Vec<(PartyId, SecretKey)> {
         let mut rng = StdRng::seed_from_u64(seed);
         (1..=n).map(|i| (i, SecretKey::random(&mut rng))).collect()
@@ -1117,5 +1380,189 @@ mod tests {
             .map(|(p, sk)| (*p, *SigningKey::from(sk).verifying_key()))
             .collect();
         assert!(!token.verify(&wrong_registry));
+    }
+
+    // --- canonical wire format: Encode → Decode roundtrips ---------------
+
+    fn roundtrip<T: Encode + Decode>(v: &T) -> (T, usize) {
+        let mut buf = Vec::new();
+        v.encode(&mut buf);
+        T::decode(&buf).expect("encoding must decode")
+    }
+
+    #[test]
+    fn wire_roundtrip_scalar_and_point() {
+        let mut rng = StdRng::seed_from_u64(31);
+        for _ in 0..4 {
+            let s = Scalar::random(&mut rng);
+            let (d, used) = roundtrip(&s);
+            assert_eq!(used, 32);
+            assert_eq!(d, s);
+            let p = ProjectivePoint::GENERATOR * s;
+            let (d, used) = roundtrip(&p);
+            assert_eq!(used, 33);
+            assert_eq!(d, p);
+        }
+        // Edge cases: zero scalar, identity point (SEC1 0x00, 1 byte).
+        let (d, used) = roundtrip(&Scalar::ZERO);
+        assert_eq!((d, used), (Scalar::ZERO, 32));
+        let (d, used) = roundtrip(&ProjectivePoint::IDENTITY);
+        assert_eq!((d, used), (ProjectivePoint::IDENTITY, 1));
+    }
+
+    #[test]
+    fn wire_roundtrip_feldman_commitment() {
+        let mut rng = StdRng::seed_from_u64(32);
+        // Include an identity point: §7.4.3 zero-padded high coefficients.
+        let com = FeldmanCommitment {
+            points: vec![
+                ProjectivePoint::GENERATOR * Scalar::random(&mut rng),
+                ProjectivePoint::IDENTITY,
+                ProjectivePoint::GENERATOR * Scalar::random(&mut rng),
+            ],
+        };
+        let (d, used) = roundtrip(&com);
+        let mut buf = Vec::new();
+        com.encode(&mut buf);
+        assert_eq!(used, buf.len());
+        assert_eq!(d.points, com.points);
+        // The empty vector roundtrips too.
+        let empty = FeldmanCommitment { points: vec![] };
+        let (d, _) = roundtrip(&empty);
+        assert!(d.points.is_empty());
+    }
+
+    #[test]
+    fn wire_roundtrip_dkg_messages() {
+        let mut rng = StdRng::seed_from_u64(33);
+        let com = FeldmanCommitment {
+            points: vec![
+                ProjectivePoint::GENERATOR * Scalar::random(&mut rng),
+                ProjectivePoint::GENERATOR * Scalar::random(&mut rng),
+            ],
+        };
+        let msgs = [
+            DkgMessage::Commit(DkgBcast1 {
+                from: 2,
+                hash: [9; 32],
+            }),
+            DkgMessage::Reveal(DkgBcast2 { from: 3, com }),
+            DkgMessage::Share(DkgP2P {
+                from: 1,
+                to: 3,
+                share: Scalar::random(&mut rng),
+            }),
+        ];
+        for m in &msgs {
+            let mut buf = Vec::new();
+            m.encode(&mut buf);
+            let (d, used) = DkgMessage::decode(&buf).unwrap();
+            assert_eq!(used, buf.len());
+            // DkgMessage has no PartialEq; compare semantically (point
+            // equality normalizes the projective representation).
+            match (&d, m) {
+                (DkgMessage::Commit(a), DkgMessage::Commit(b)) => {
+                    assert_eq!((a.from, a.hash), (b.from, b.hash))
+                }
+                (DkgMessage::Reveal(a), DkgMessage::Reveal(b)) => {
+                    assert_eq!(a.from, b.from);
+                    assert_eq!(a.com.points, b.com.points);
+                }
+                (DkgMessage::Share(a), DkgMessage::Share(b)) => {
+                    assert_eq!((a.from, a.to, a.share), (b.from, b.to, b.share))
+                }
+                _ => panic!("decoded to the wrong variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn wire_roundtrip_envelope_and_signed_envelope() {
+        let mut rng = StdRng::seed_from_u64(34);
+        let key = SecretKey::random(&mut rng);
+        let signing = SigningKey::from(&key);
+        let share = DkgMessage::Share(DkgP2P {
+            from: 2,
+            to: 1,
+            share: Scalar::random(&mut rng),
+        });
+        for to in [None, Some(1)] {
+            let env = Envelope {
+                sid: b"sid/wire".to_vec(),
+                phase: Phase::KeyGen,
+                round: DKG_ROUND_REVEAL,
+                from: 2,
+                to,
+                payload: share.clone(),
+            };
+            let signed = SignedEnvelope::sign(env, &signing);
+            let (d, used) = roundtrip(&signed);
+            let mut buf = Vec::new();
+            signed.encode(&mut buf);
+            assert_eq!(used, buf.len());
+            // DkgMessage has no PartialEq; compare field by field.
+            assert_eq!(d.envelope.sid, signed.envelope.sid);
+            assert_eq!(d.envelope.phase, signed.envelope.phase);
+            assert_eq!(d.envelope.round, signed.envelope.round);
+            assert_eq!(d.envelope.from, signed.envelope.from);
+            assert_eq!(d.envelope.to, signed.envelope.to);
+            assert_eq!(
+                format!("{:?}", d.envelope.payload),
+                format!("{:?}", signed.envelope.payload)
+            );
+            assert_eq!(d.signature.to_bytes(), signed.signature.to_bytes());
+            // The decoded copy still verifies under the sender's key.
+            assert!(d.verify_signature(signing.verifying_key()));
+        }
+    }
+
+    #[test]
+    fn wire_decode_rejects_malformed() {
+        let mut rng = StdRng::seed_from_u64(35);
+        let s = Scalar::random(&mut rng);
+        let mut buf = Vec::new();
+        s.encode(&mut buf);
+        // Truncation.
+        assert!(Scalar::decode(&buf[..31]).is_none());
+        // Non-canonical scalar (>= q).
+        assert!(Scalar::decode(&[0xFF; 32]).is_none());
+        // Trailing bytes are reported via `consumed`, not rejected.
+        let mut longer = buf.clone();
+        longer.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(Scalar::decode(&longer).unwrap().1, 32);
+
+        // Points: truncation, bad tag, not-on-curve x.
+        let p = ProjectivePoint::GENERATOR * s;
+        let mut pbuf = Vec::new();
+        p.encode(&mut pbuf);
+        assert!(ProjectivePoint::decode(&pbuf[..32]).is_none());
+        let mut bad = pbuf.clone();
+        bad[0] = 0x04; // uncompressed form is not the canonical wire format
+        assert!(ProjectivePoint::decode(&bad).is_none());
+
+        // Enum tag out of range.
+        assert!(DkgMessage::decode(&[7]).is_none());
+        // Phase code out of range (inside an envelope).
+        let env = Envelope::broadcast(b"sid", Phase::KeyGen, 1, 1, commit_msg(1));
+        let mut ebuf = Vec::new();
+        env.encode(&mut ebuf);
+        let mut bad = ebuf.clone();
+        // sid is put_bytes: 8 length bytes then 3 bytes of "sid"; phase follows.
+        bad[8 + 3] = 99;
+        assert!(Envelope::<DkgMessage>::decode(&bad).is_none());
+        // A signature with an out-of-range scalar half is rejected.
+        let key = SigningKey::from(&SecretKey::random(&mut rng));
+        let signed = SignedEnvelope::sign(env, &key);
+        let mut sbuf = Vec::new();
+        signed.encode(&mut sbuf);
+        let n = sbuf.len();
+        for b in &mut sbuf[n - 32..] {
+            *b = 0xFF;
+        }
+        assert!(SignedEnvelope::<DkgMessage>::decode(&sbuf).is_none());
+        // Truncated anywhere: every strict prefix must fail to decode.
+        for cut in [0, 1, 8, 11, 13, 21, sbuf.len() - 1] {
+            assert!(SignedEnvelope::<DkgMessage>::decode(&sbuf[..cut]).is_none());
+        }
     }
 }

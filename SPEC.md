@@ -646,7 +646,7 @@ This document is itself a defensive publication: once timestamped publicly, it i
 
 ### 13.2 From the reference orchestrator to production
 
-`src/sim.rs` models broadcast by delivering identical message sets; per-party logic in `dkg.rs`, `triples.rs`, `presign.rs`, `sign.rs` is already message-oriented (`Bcast`/`P2P` structs keyed by sender). A production node wraps these in an async runtime with the transport of §13.1. Keep the deterministic RNG seeds out of production: use OS CSPRNG per party.
+`src/sim.rs` models broadcast by delivering identical message sets; per-party logic in `dkg.rs`, `triples.rs`, `presign.rs`, `sign.rs` is already message-oriented (`Bcast`/`P2P` structs keyed by sender). A production node wraps these in an async runtime with the transport of §13.1. Keep the deterministic RNG seeds out of production: use OS CSPRNG per party. A first milestone of this path exists as the companion crate `ohm-ecdsa-node` (`node/`): a localhost-scale reference node over real TCP with §4.7 echo broadcast and §10.2 signed envelopes, driving keygen through the transport seam — TLS, persistence, and per-party process separation remain open (§13.1), and the §13.6 disclaimers apply unchanged.
 
 ### 13.3 Hardening checklist (reference implementation status)
 

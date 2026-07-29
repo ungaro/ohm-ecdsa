@@ -3,7 +3,7 @@
 use crate::PartyId;
 
 /// Which protocol phase an abort occurred in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Phase {
     KeyGen,
     Triples,

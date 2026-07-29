@@ -10,6 +10,11 @@ OHM-ECDSA: an open, honest-majority threshold ECDSA protocol over secp256k1.
 It is a **reference implementation of an unreviewed protocol draft** —
 unaudited research code, not for securing real assets (see `SPEC.md` §13).
 
+The repo is a **two-crate workspace**: the core library at the repo root
+(`ohm-ecdsa`, dependency-pure, no networking) and the M1 transport
+companion in `node/` (`ohm-ecdsa-node`, which owns all networking — see
+`node/README.md`).
+
 Protocol properties:
 
 - Honest majority: `n >= 2t - 1`, tolerates `t - 1` malicious parties
@@ -28,9 +33,14 @@ keep those citations accurate when changing code.
 ## Technology stack
 
 - Rust, edition 2021, MSRV 1.75 (`Cargo.toml`).
-- Dependencies: `k256` (0.13, features `ecdsa` + `sha256`) for all curve /
-  ECDSA arithmetic, `sha2`, `thiserror`, `rand` (0.8). No serde, no async,
-  no networking. `Cargo.lock` is committed — keep it reproducible.
+- Core crate dependencies: `k256` (0.13, features `ecdsa` + `sha256`) for
+  all curve / ECDSA arithmetic, `sha2`, `thiserror`, `rand` (0.8),
+  `zeroize`. No serde, no async, no networking **in the core crate** — the
+  "no networking" rule is core-only; the `node/` companion crate owns all
+  networking (M1: `std::net` blocking threads, no external runtime; its
+  only extra dependencies are the path dependency on the core plus `k256`
+  and `rand` for keys/RNGs). `Cargo.lock` is committed — keep it
+  reproducible.
 - Parties are numbered `1..=n` (`PartyId = usize`); evaluation point 0 is
   reserved for the secret.
 - Fiat–Shamir / hashing domain separation uses versioned tags in
@@ -38,14 +48,28 @@ keep those citations accurate when changing code.
 
 ## Build and test commands
 
-- `cargo build` — build the library.
-- `cargo test` — runs 24 unit tests (inline `#[cfg(test)]` modules in
-  `src/lib.rs`, `src/primitives/{shamir,vss,open,dleq}.rs`,
-  `src/protocol/{dkg,triples}.rs`, `src/runtime/{policy,transport}.rs`),
+Commands run workspace-wide by default (both crates); scope to the core
+with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
+
+- `cargo build` / `cargo build --workspace` — build the library and the
+  node crate.
+- `cargo test -p ohm-ecdsa` — runs 29 unit tests (inline `#[cfg(test)]`
+  modules in `src/lib.rs`, `src/primitives/{shamir,vss,open,dleq}.rs`,
+  `src/protocol/{dkg,triples}.rs`, `src/runtime/{policy,transport}.rs` —
+  including the `wire_*` canonical `Encode`→`Decode` roundtrip and
+  malformed-input tests),
   42 integration tests in `tests/e2e.rs`, and 5 example smoke tests in
   `tests/examples.rs` (each narrative example is run via `cargo run
-  --example` and checked for its guarantee lines). All 71 pass at the
+  --example` and checked for its guarantee lines). All 76 pass at the
   time of writing.
+- `cargo test -p ohm-ecdsa-node` — 3 integration tests in
+  `node/tests/mesh_keygen.rs` (3 nodes on localhost ephemeral ports:
+  keygen over `MeshTransport` reconstructs the joint key, a cheating
+  dealer is blamed with a verifying `BlameToken`, forged/unknown-sender/
+  malformed frames are dropped while the honest keygen completes).
+- `cargo run -p ohm-ecdsa-node [-- PORT_BASE]` — M1 demo: 3-node
+  committee on localhost real TCP, keygen through `drive_dkg_signed`,
+  prints the joint public key; exits 0 (`PORT_BASE` 0 = ephemeral ports).
 - `cargo run --release --example perf` — `examples/perf.rs` wall-clock
   micro-benchmarks for the SPEC §13.5 rows (std `Instant` only, no extra
   dependencies).
@@ -67,10 +91,11 @@ pipeline in the repo.
 
 ## Code organization
 
-Single crate, one module per protocol building block, grouped into three
-layers mirroring the spec (`src/`, ~5400 lines total): `primitives/`
-(SPEC §4 building blocks), `protocol/` (§6–§9, §13.4), `runtime/`
-(transport/orchestration/policy). `lib.rs` declares the three layer
+Two crates: the core library at the repo root (one module per protocol
+building block, grouped into three layers mirroring the spec (`src/`,
+~5400 lines total): `primitives/` (SPEC §4 building blocks), `protocol/`
+(§6–§9, §13.4), `runtime/` (transport/orchestration/policy)) and the M1
+transport companion in `node/`. `lib.rs` declares the three layer
 modules and re-exports each building-block module FLAT
 (`pub use primitives::{dleq, open, shamir, vss};` etc.), so the public
 paths `ohm_ecdsa::shamir`, `ohm_ecdsa::sim`, … are unchanged by the
@@ -92,8 +117,9 @@ re-exports too:
 | `protocol/refresh.rs` | 13.4 | Committee maintenance, `X` unchanged: `refresh` — proactive zero-constant re-sharing over the same committee (dealt via `DkgInstance::start_with_secret`; per-dealer zero-constant check on the revealed vectors; new shares `x'_j = x_j + Σ_i z_i(j)`); `reshare` — re-sharing to a NEW committee (each old party deals `x_j` over the new id set; public binding check `C_j.points[0] == EvalCom(A[x], j)`; new shares `x'_m = Σ_j λ_j^S · p_j(m)`, new commitment `A'[x] = Σ_j λ_j^S · C_j`); `ReshareTamper` fault-injection hooks (`bad_deal`, `bad_commitment`). Both assert `A'[x].points[0] == X`; both mandate `PresigStore::clear` on epoch change (§8.6) |
 | `runtime/store.rs` | 8.6 | `PresigStore`: per-party single-use presignature store bound to one key (atomic `consume`, duplicate-id rejection, `clear` for the §13.4 epoch-change invalidation) |
 | `runtime/policy.rs` | 10.3 | `restart_committee`: expel-and-restart committee computation — removes blamed ids, refuses (never lowers `t`) when the remainder would drop below `2t−1` (below the bound, use §13.4 re-sharing — `protocol/refresh.rs`) |
-| `runtime/transport.rs` | 4.7, 10.2, 13.1, 13.2 | The explicit transport seam: `Envelope<M>` (exactly the per-message fields a production transport signs — sid/phase/round/from/to/payload), object-safe sync `Transport<M>` trait modeling the LOGICAL rounds (§2.2), `DkgMessage` payload enum, `SimTransport` reference in-process impl (delivers identical accepted sets — echo-broadcast consistency), `drive_dkg` transport-driven DKG driver. §10.2/§13.1 signing: `Encode` (canonical length-prefixed encoding, no serde — implemented for `DkgMessage`; other message types implement it as needed), `SignedEnvelope<M>` (sender ECDSA signature over the canonical encoding, domain-separated under `tags::TRANSPORT_SIGN`), `SigningTransport` (wraps any `Transport<SignedEnvelope<M>>` — signs on send, verifies accepted sets against the party key registry, a forged/tampered envelope is `Error::Abort` blaming the claimed sender), `BlameToken` (§A.4 evidence: abort + offending signed share envelope + dealer commitment; `verify(party_keys)` is the auditor's offline check), `drive_dkg_signed` (returns `SignedDriveError { error, token }` — `drive_dkg` stays the unsigned entry point for `sim::run_keygen*`); triples/presign orchestration still drives DKG instances internally (incremental pattern in the `transport` module docs) |
+| `runtime/transport.rs` | 4.7, 10.2, 13.1, 13.2 | The explicit transport seam: `Envelope<M>` (exactly the per-message fields a production transport signs — sid/phase/round/from/to/payload), object-safe sync `Transport<M>` trait modeling the LOGICAL rounds (§2.2), `DkgMessage` payload enum, `SimTransport` reference in-process impl (delivers identical accepted sets — echo-broadcast consistency), `drive_dkg` transport-driven DKG driver. §10.2/§13.1 signing: `Encode`/`Decode` (THE canonical wire format: length-prefixed, no serde — implemented for `DkgMessage`, the DKG bcast/p2p structs, `FeldmanCommitment`, the scalar/point/`Signature` primitives, and `Envelope`/`SignedEnvelope` themselves; other message types implement it as needed), `SignedEnvelope<M>` (sender ECDSA signature over the canonical encoding, domain-separated under `tags::TRANSPORT_SIGN`), `SigningTransport` (wraps any `Transport<SignedEnvelope<M>>` — signs on send, verifies accepted sets against the party key registry, a forged/tampered envelope is `Error::Abort` blaming the claimed sender), `BlameToken` (§A.4 evidence: abort + offending signed share envelope + dealer commitment; `verify(party_keys)` is the auditor's offline check), `drive_dkg_signed` (returns `SignedDriveError { error, token }` — `drive_dkg` stays the unsigned entry point for `sim::run_keygen*`); triples/presign orchestration still drives DKG instances internally (incremental pattern in the `transport` module docs) |
 | `runtime/sim.rs` | 4.7, 10.3, 13.2, 7.4.3 | Single-threaded reference orchestrator: `run_keygen` / `run_keygen_with_tamper` (message delivery routes through `transport::SimTransport` + `transport::drive_dkg`), `run_presign` / `run_presign_robust` / `run_presign_batch` / `run_presign_packed` (§7.4.3), `run_sign` / `run_sign_stored` / `run_sign_robust` / `run_sign_packed` (§7.4.3 — slot-point interpolation, quorum `t + B − 1`), §10.3 expel-and-restart wrappers `run_keygen_with_restart` / `run_presign_with_restart` / `run_triples_with_restart` (poisoned sid/id per retry; blame in original ids; keygen/triples retries renumber, presign retries keep original ids; the presign/triples wrappers drive the §10.4 ROBUST variants per attempt, so continuable faults complete in-attempt without poisoning — only dealing-phase aborts cascade to restart), §13.4 wrappers `run_refresh` / `run_reshare` (caller must clear presignature stores on epoch change), `make_rngs` (deterministic `StdRng` seeds — tests only) |
+| `node/` (crate `ohm-ecdsa-node`) | 4.7, 10.2, 13.1, 13.2 | M1 transport companion (localhost scale, `std::net` blocking threads, NO async runtime — tokio/rustls are M2): `src/wire.rs` (length-prefixed framing of the core's canonical `Encode`/`Decode` format; `WireMessage` = original signed envelope or echoer-signed §4.7 echo; `verify` against the party key registry), `src/mesh.rs` (`Node`: listener + full-mesh connections + reader threads; first-echo-per-slot rule; unknown sender/bad signature/misrouted p2p dropped + logged), `src/transport.rs` (`MeshTransport` implementing the core `Transport<SignedEnvelope<DkgMessage>>`: echo-broadcast acceptor — accept on `⌈(n+1)/2⌉` echoes from parties OTHER than the sender, dedup by `(sid, phase, round, from)`; blocking round collection with a generous timeout that returns the partial set and lets the DKG fail closed), `src/main.rs` (demo: 3-node keygen through `drive_dkg_signed`). M1 is the reference-orchestration pattern (one process holds all transport keys, as the core drives `SimTransport`); TLS, persistence, per-party process separation are M2 |
 
 Architecture: per-party protocol logic is message-oriented (broadcast/P2P
 structs keyed by sender); the `runtime/transport.rs` seam (`Envelope` /
@@ -125,7 +151,8 @@ signatures, SPEC §13.1) without changing the per-party logic.
 
 ## Testing instructions
 
-- Run the full suite with `cargo test` (fast: < 2 s integration).
+- Run the full suite with `cargo test --workspace` (fast: < 3 s total).
+  Core: `cargo test -p ohm-ecdsa`; node: `cargo test -p ohm-ecdsa-node`.
 - `tests/e2e.rs` verifies real ECDSA signatures with `k256`'s verifier and
   asserts low-`s` normalization (BIP-62/EIP-2). Coverage: 2-of-3 and
   3-of-5 end-to-end, signing with only `t` parties, cheater identification
@@ -159,11 +186,19 @@ signatures, SPEC §13.1) without changing the per-party logic.
   `transport::drive_dkg` over `SimTransport` and signs end-to-end;
   `src/runtime/transport.rs` unit-tests accepted-set consistency (same broadcast
   set for all parties, p2p only to the addressee), driver key
-  reconstruction, and the §10.2 signing layer (signed roundtrip,
+  reconstruction, the §10.2 signing layer (signed roundtrip,
   wrong-key and tampered-payload rejection blaming the claimed sender,
   `drive_dkg_signed` honest run, blame-token `verify` positive and
-  negative — forgery and wrong registry); `src/lib.rs` unit-tests
-  `session_id` determinism and per-field domain separation. Committee maintenance (§13.4): refresh
+  negative — forgery and wrong registry), and the canonical wire format
+  (`wire_*`: `Encode`→`Decode` roundtrips for scalars/points — including
+  the identity point — commitments, all `DkgMessage` variants, and signed
+  envelopes; malformed-input rejection — truncation, non-canonical
+  scalars, bad tags); `src/lib.rs` unit-tests
+  `session_id` determinism and per-field domain separation. The node crate
+  (`node/tests/mesh_keygen.rs`) runs the same keygen over real TCP:
+  joint-key reconstruction through `MeshTransport`, a cheating dealer
+  blamed with a verifying `BlameToken`, and forged/unknown-sender/
+  malformed frames dropped while the honest keygen completes. Committee maintenance (§13.4): refresh
   preserves `X` while replacing every share and enables post-refresh
   presign+sign, outstanding presignatures are invalidated on refresh
   (`PresigStore::clear` — stale-id signing fails with `Error::PresigStore`),
