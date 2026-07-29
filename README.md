@@ -221,9 +221,10 @@ contract, not an implementation), serde wire format, key rotation
 ## Documentation map
 
 * Protocol design, notation, diagrams → [`SPEC.md`](./SPEC.md) §1–§10
-* Security claims and proof obligations → SPEC §11
+* Security claims, proof obligations, and the game-based proof skeleton → SPEC §11 (esp. §11.4)
 * Patent design-around analysis → SPEC §12
 * Deployment, transport, and hardening checklists → SPEC §13
+* Deployment topologies (who holds which share, blame-token evidence flow, storage duties) → SPEC Appendix A
 * References (GJKR96, Beaver, Groth–Shoup, DJNPO20, KU23, …) → SPEC §14
 * Contributor conventions (and guidance for AI agents) → `AGENTS.md`
 

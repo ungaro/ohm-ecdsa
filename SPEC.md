@@ -31,6 +31,7 @@ The construction deliberately avoids the claim elements of US Patent 11,757,657 
 12. Patent Design-Around Analysis
 13. Implementation Notes and Disclaimers
 14. References
+A. Deployment Topologies (informative)
 
 ---
 
@@ -475,7 +476,7 @@ All openings are of values masked by fresh uniform randomness (`δ, ε, v, δ′
 
 ## 11. Security Analysis Sketch
 
-**Status: structured sketch, not a proof.** This section states the intended security theorem, decomposes it into proof obligations C1–C6, and gives for each an explicit argument skeleton (simulator construction or reduction) rather than informal intuition. What separates this from a proof is enumerated precisely in §11.3. A full game-based or UC treatment remains future work and is a prerequisite to production use, alongside independent implementation review.
+**Status: structured sketch, not a proof.** This section states the intended security theorem, decomposes it into proof obligations C1–C6, and gives for each an explicit argument skeleton (simulator construction or reduction) rather than informal intuition. What separates this from a proof is enumerated precisely in §11.3, and a game-based proof outline is given in §11.4. A full game-based or UC treatment remains future work and is a prerequisite to production use, alongside independent implementation review.
 
 ### 11.1 Ideal functionality (informal)
 
@@ -510,6 +511,30 @@ All openings are of values masked by fresh uniform randomness (`δ, ε, v, δ′
 4. Abort-leakage accounting: the C2 simulator must also reproduce the *distribution of aborts*; this is expected to be immediate because every abort decision is a function of public verification outcomes (§10.5), but a proof must state and use this.
 5. Composition: arbitrarily many keys, presignature sessions, and interleaved aborts under one functionality. A game-based treatment needs a per-session hygiene lemma (fresh `sid` ⇒ independent sessions); a UC treatment needs `ℱ_TECDSA` re-stated with global consumption state, which §11.1 elides.
 6. Static vs. adaptive corruption (this spec claims **static** only).
+
+### 11.4 Proof skeleton (game-based outline)
+
+A full proof is expected to proceed by the following hybrid sequence. Each game names the change, the intended indistinguishability argument, and the gap it depends on; gaps are cross-referenced to §11.3. This is an outline for whoever carries out the proof — not itself a proof.
+
+**Game 0 (real execution).** `𝒜` statically corrupts `≤ T−1` of `n ≥ 2T−1` servers, sees all broadcast traffic, and makes adaptive Presign/Sign queries per message. `𝒜` wins if (a) it outputs a signature on a message with fewer than `T` Sign queries (**forgery**), (b) an honest party accepts a wrong protocol value without abort (**soundness break**), or (c) an honest party is ever blamed (**framing**). Conditions (b) and (c) are impossible outright by C3: every check is a deterministic point equality with exactly one passing scalar, so wrong values are rejected with probability 1 and blame follows deterministically from public data. The game sequence below therefore targets (a).
+
+**Game 1 (program the DKG).** `𝒮` receives the challenge public key `X` and programs the commit-reveal so the joint public key comes out as `X`: extract the adversarial dealers' polynomials from their R1/R2 messages, then set the simulated honest dealer's commitment vector (in the exponent, via Lagrange) so that `Σ_i A_{i,0} = X`; adversary shares of `[x]` are known to `𝒮`, honest-party shares are not. **Gap L1 (§11.3(1)):** extraction against a *rushing* adversary — the R1 hash commit must be extractable (RO rewinding or an extractable commitment); this is the GJKR caveat and the skeleton's main technical debt. Bound: extraction failure probability.
+
+**Game 2 (program every joint VSS).** The same programming is applied to each ephemeral commit-reveal instance (`u`, `a`, triple `α, β`, refresh zero-sharings, reshare sub-sharings): `𝒮` knows the adversary's shares of every dealt value and programs honest commitment vectors in the exponent. Fresh `sid`s keep instances independent (§11.3(5)). Bound: per-instance extraction failure, union over instances.
+
+**Game 3 (simulate DLEQ proofs).** All product proofs are replaced by RO-programmed honest-verifier-ZK simulations (§4.4). Bound: RO programming failure, `O(q_H²/q)` total over `q_H` hash queries — statistical, standard.
+
+**Game 4 (program the openings).** Every opened scalar in Presign (`δ, ε, v, δ′, ε′`) is one-time-padded by a mask `𝒮` either chose or can set, so `𝒮` opens uniform values and solves for the consistent honest-party shares. **Lemma (freedom counting).** *For each degree-`T−1` sharing, the adversary's `T−1` shares plus one prescribed value (the opening, or `X` at point 0) leave exactly one consistent honest contribution; commitment vectors are programmed in the exponent to match, so the simulation is exact.* Sketch: a degree-`T−1` polynomial has `T` free coefficients; the adversary's `T−1` shares fix `T−1` linear constraints and the prescribed value fixes one more; the honest dealer's contribution is the unique solution, and exponent-Lagrange yields the matching commitment points without knowing the scalars. This is the sense in which privacy here is **statistical**, not computational — the only computational content of the view is Feldman *hiding* on values that are never opened (`x`, unused `u, z`), deferred to **Gap L2 (§11.3(2))**: a hybrid replacing those commitments with commitments to zero, justified under ECDLP/OMDL or in the AGM [^gs21].
+
+**Game 5 (sign from the oracle).** `𝒮` answers Sign queries using the presignature-model signing oracle of Groth–Shoup [^gs21]: given the true `(r, s)` and the adversary's `T−1` shares `s_j` (computable from `m`, `r`, and its known `u_j, z_j`), each honest party's share is the evaluation of the unique degree-`T−1` polynomial through `(0, s)` and the adversarial points — consistent with the public `A[s] = m·A[u] + r·A[z]` by construction. Exact, per Game 4's lemma. Presignature-consumption hygiene (§8.6) is enforced by the environment per **§11.3(3)**.
+
+**Extraction.** `𝒜`'s forgery in the final game is a forgery in the Groth–Shoup presignature model, and `𝒮`'s query count matches `𝒜`'s one-for-one. Closing statement:
+
+```
+Adv_OHM(𝒜)  ≤  Adv_GS-EUF(ℱ)  +  O(q_H²/q)  +  ε_L1  +  ε_L2
+```
+
+with `ε_L1` the DKG-extraction gap (§11.3(1)) and `ε_L2` the hiding-hybrid gap (§11.3(2)). Robustness (C6) and abort-distribution indistinguishability (§11.3(4)) are independent, simpler lemmas: every abort decision is a function of public verification outcomes, and continuation uses only publicly committed values.
 
 ---
 
@@ -676,3 +701,57 @@ This document and the accompanying code are **research artifacts**: unreviewed p
 [^dkls]: J. Doerner, Y. Kondi, E. Lee, a. shelat, *Secure Two-party Threshold ECDSA from ECDSA Assumptions* (DKLs18), IEEE S&P 2018. https://eprint.iacr.org/2018/499
 [^cait]: NEAR, *cait-sith* — threshold ECDSA with Beaver triples and presignatures (Apache-2.0; documents that presignature shares are key-equivalent). https://github.com/near/cait-sith
 [^real]: A. Gagol et al., *Real Threshold ECDSA* (robustness requires honest majority `n ≥ 2t−1`), NDSS 2024. https://www.ndss-symposium.com/ndss-paper/real-threshold-ecdsa/
+
+---
+
+## Appendix A. Deployment topologies (informative)
+
+Non-normative. Three reference topologies showing who holds shares, where presignature stores live, and how blame evidence flows; followed by the storage-duty matrix every topology shares. Parameter sizing: `n ≥ 2T−1` always; slack (`n − (2T−1)`) is what §10.3 restart spends; packed mode (§7.4) needs `n ≥ 2T + 2B − 3` and moves the online quorum to `T + B − 1`.
+
+### A.1 Institutional custody (3-of-5, five roles)
+
+| Role | Holds | Infrastructure | Duties |
+|---|---|---|---|
+| `P1` issuer operations | key share, presig store | cloud HSM | initiates signing sessions |
+| `P2` custodian core | key share, presig store | HSM, region A | offline factories (triples/presign) |
+| `P3` custodian replica | key share, presig store | HSM, region B | offline factories |
+| `P4` auditor / watchtower | key share, presig store | locked-down VM | observes; archives signed transcripts and blame tokens (§A.4) |
+| `P5` recovery agent | key share; presig shares in cold encrypted escrow | offline / cold HSM | joins only recovery sessions |
+
+Notes. Any 3 of 5 sign; up to 2 may be malicious. `P5` participates in DKG and presign dealing (the committee must run at full size) but keeps its presignature shares cold — key-equivalent material (§8.6) stays offline until a recovery session brings it online, at which point the id pool for `P5` is restocked. This topology has zero slack: any expulsion forces §13.4 re-sharing, which here doubles as the compliance process for removing a role.
+
+### A.2 Consumer wallet (2-of-3)
+
+| Role | Holds | Infrastructure |
+|---|---|---|
+| `P1` user device | key share, presig store | secure enclave / keystore |
+| `P2` signing service | key share, presig store | HSM / KMS |
+| `P3` recovery | key share, presig store (cold) | user's second device, or sealed escrow |
+
+Notes. Day-to-day signing is `P1 + P2` (one round, sub-millisecond online math). Lost device: `P2 + P3` run §13.4 **reshare** to a fresh committee including the replacement device — the public key (wallet address) never changes, and the lost device's shares are useless from that epoch on. One-round signing means the recovery party adds no latency to the happy path; zero slack is acceptable because recovery *is* the re-sharing path.
+
+### A.3 Validator committee (chain infrastructure)
+
+`n` = validator set size, `T` per the chain's fault model; committee keys secure chain-held assets (bridgeless cross-chain accounts, treasury, forced-withdrawal paths).
+
+* **Epoch rhythm.** Run §13.4 **refresh** at every epoch boundary (re-randomizes shares, `X` unchanged); run **reshare** whenever the validator set changes; clear presignature stores on every epoch change (§13.4) and let the factories rebuild the pool from the new epoch's shares.
+* **Sizing for churn.** Zero-slack committees (`n = 2T−1`) make every ejection a re-sharing event; deploying with slack (`n > 2T−1`) lets §10.3 expel-and-restart absorb ejections between epochs.
+* **Sizing for throughput.** Oversize the committee and use packed mode (§7.4) for block-rate presignature production; the online quorum becomes `T + B − 1` — set `B` so the quorum stays below the expected online validator count.
+* **Liveness.** The robust path (§10.4) lets the chain keep signing while equivocating validators are blamed; blame tokens double as slashing evidence (§A.4).
+
+### A.4 Blame-token evidence flow (all topologies)
+
+1. The transport signs every message envelope `(sid, phase, round, from, to, payload)` (§13.1) and every party persists its accepted-message sets per session (§4.7).
+2. On abort, the `IdentifiableAbort { phase, blamed, detail }` plus the offending signed message plus the public reference (commitment vector, `sid`) form the **blame token** (§10.2).
+3. Any third party verifies the token offline by recomputing the failed check — point equality against `EvalCom`, or DLEQ verification. No trusted party and no secret material is involved: detection is unconditional (§11 C3).
+4. Retention is safe: transcripts and tokens contain only commitments, masked openings, and public values (§10.5), so they can be archived for compliance, SLAs, insurance, or slashing without creating a key-material store.
+
+### A.5 Storage duties per artifact
+
+| Artifact | Protection | Lifetime |
+|---|---|---|
+| key share `x_j` | HSM-grade; `zeroize` on free (§13.3); mlock where available | until refresh/reshare |
+| presignature shares `u_j, z_j` | **key-share-grade** (§8.6(2)); single-use, atomic consume (§8.6(1)) | one signature; cleared on epoch change (§13.4) |
+| presignature store | per-key binding, duplicate-id rejection | per key |
+| transcripts + blame tokens | integrity (append-only), no confidentiality needed | compliance retention |
+| public commitments `A[x]`, `X` | integrity only | key lifetime |
