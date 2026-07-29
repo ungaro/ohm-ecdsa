@@ -39,12 +39,12 @@ keep those citations accurate when changing code.
 ## Build and test commands
 
 - `cargo build` — build the library.
-- `cargo test` — runs 18 unit tests (inline `#[cfg(test)]` modules in
+- `cargo test` — runs 24 unit tests (inline `#[cfg(test)]` modules in
   `src/lib.rs`, `src/primitives/{shamir,vss,open,dleq}.rs`,
   `src/protocol/{dkg,triples}.rs`, `src/runtime/{policy,transport}.rs`),
-  42 integration tests in `tests/e2e.rs`, and 4 example smoke tests in
+  42 integration tests in `tests/e2e.rs`, and 5 example smoke tests in
   `tests/examples.rs` (each narrative example is run via `cargo run
-  --example` and checked for its guarantee lines). All 64 pass at the
+  --example` and checked for its guarantee lines). All 71 pass at the
   time of writing.
 - `cargo run --release --example perf` — `examples/perf.rs` wall-clock
   micro-benchmarks for the SPEC §13.5 rows (std `Instant` only, no extra
@@ -54,8 +54,10 @@ keep those citations accurate when changing code.
   `wallet_2_of_3` (presig pool + single-use stores + lost-phone
   recovery), `consortium_custody` (3-of-5 batch presign, subset signing,
   §9.4 HD tweak), `identifiable_abort` (fail-fast blame vs §10.4 robust
-  delivery), `epoch_refresh` (§13.4 refresh + re-share, X unchanged).
-  All four are smoke-tested by `tests/examples.rs` (run + stdout
+  delivery), `blame_token` (§10.2/§A.4 signed envelopes + offline-verifiable
+  blame tokens, forgery rejection), `epoch_refresh` (§13.4 refresh +
+  re-share, X unchanged).
+  All five are smoke-tested by `tests/examples.rs` (run + stdout
   guarantee lines).
 - `cargo fmt` / `cargo clippy` — standard toolchain; no custom config
   files, use defaults.
@@ -90,7 +92,7 @@ re-exports too:
 | `protocol/refresh.rs` | 13.4 | Committee maintenance, `X` unchanged: `refresh` — proactive zero-constant re-sharing over the same committee (dealt via `DkgInstance::start_with_secret`; per-dealer zero-constant check on the revealed vectors; new shares `x'_j = x_j + Σ_i z_i(j)`); `reshare` — re-sharing to a NEW committee (each old party deals `x_j` over the new id set; public binding check `C_j.points[0] == EvalCom(A[x], j)`; new shares `x'_m = Σ_j λ_j^S · p_j(m)`, new commitment `A'[x] = Σ_j λ_j^S · C_j`); `ReshareTamper` fault-injection hooks (`bad_deal`, `bad_commitment`). Both assert `A'[x].points[0] == X`; both mandate `PresigStore::clear` on epoch change (§8.6) |
 | `runtime/store.rs` | 8.6 | `PresigStore`: per-party single-use presignature store bound to one key (atomic `consume`, duplicate-id rejection, `clear` for the §13.4 epoch-change invalidation) |
 | `runtime/policy.rs` | 10.3 | `restart_committee`: expel-and-restart committee computation — removes blamed ids, refuses (never lowers `t`) when the remainder would drop below `2t−1` (below the bound, use §13.4 re-sharing — `protocol/refresh.rs`) |
-| `runtime/transport.rs` | 4.7, 10.2, 13.1, 13.2 | The explicit transport seam: `Envelope<M>` (exactly the per-message fields a production transport signs — sid/phase/round/from/to/payload), object-safe sync `Transport<M>` trait modeling the LOGICAL rounds (§2.2), `DkgMessage` payload enum, `SimTransport` reference in-process impl (delivers identical accepted sets — echo-broadcast consistency), `drive_dkg` transport-driven DKG driver. `sim::run_keygen*` routes through `SimTransport` + `drive_dkg`; triples/presign orchestration still drives DKG instances internally (incremental pattern in the `transport` module docs) |
+| `runtime/transport.rs` | 4.7, 10.2, 13.1, 13.2 | The explicit transport seam: `Envelope<M>` (exactly the per-message fields a production transport signs — sid/phase/round/from/to/payload), object-safe sync `Transport<M>` trait modeling the LOGICAL rounds (§2.2), `DkgMessage` payload enum, `SimTransport` reference in-process impl (delivers identical accepted sets — echo-broadcast consistency), `drive_dkg` transport-driven DKG driver. §10.2/§13.1 signing: `Encode` (canonical length-prefixed encoding, no serde — implemented for `DkgMessage`; other message types implement it as needed), `SignedEnvelope<M>` (sender ECDSA signature over the canonical encoding, domain-separated under `tags::TRANSPORT_SIGN`), `SigningTransport` (wraps any `Transport<SignedEnvelope<M>>` — signs on send, verifies accepted sets against the party key registry, a forged/tampered envelope is `Error::Abort` blaming the claimed sender), `BlameToken` (§A.4 evidence: abort + offending signed share envelope + dealer commitment; `verify(party_keys)` is the auditor's offline check), `drive_dkg_signed` (returns `SignedDriveError { error, token }` — `drive_dkg` stays the unsigned entry point for `sim::run_keygen*`); triples/presign orchestration still drives DKG instances internally (incremental pattern in the `transport` module docs) |
 | `runtime/sim.rs` | 4.7, 10.3, 13.2, 7.4.3 | Single-threaded reference orchestrator: `run_keygen` / `run_keygen_with_tamper` (message delivery routes through `transport::SimTransport` + `transport::drive_dkg`), `run_presign` / `run_presign_robust` / `run_presign_batch` / `run_presign_packed` (§7.4.3), `run_sign` / `run_sign_stored` / `run_sign_robust` / `run_sign_packed` (§7.4.3 — slot-point interpolation, quorum `t + B − 1`), §10.3 expel-and-restart wrappers `run_keygen_with_restart` / `run_presign_with_restart` / `run_triples_with_restart` (poisoned sid/id per retry; blame in original ids; keygen/triples retries renumber, presign retries keep original ids; the presign/triples wrappers drive the §10.4 ROBUST variants per attempt, so continuable faults complete in-attempt without poisoning — only dealing-phase aborts cascade to restart), §13.4 wrappers `run_refresh` / `run_reshare` (caller must clear presignature stores on epoch change), `make_rngs` (deterministic `StdRng` seeds — tests only) |
 
 Architecture: per-party protocol logic is message-oriented (broadcast/P2P
@@ -156,9 +158,12 @@ signatures, SPEC §13.1) without changing the per-party logic.
   Transport seam (§13.2): `tests/e2e.rs` runs keygen through
   `transport::drive_dkg` over `SimTransport` and signs end-to-end;
   `src/runtime/transport.rs` unit-tests accepted-set consistency (same broadcast
-  set for all parties, p2p only to the addressee) and driver key
-  reconstruction; `src/lib.rs` unit-tests `session_id` determinism and
-  per-field domain separation. Committee maintenance (§13.4): refresh
+  set for all parties, p2p only to the addressee), driver key
+  reconstruction, and the §10.2 signing layer (signed roundtrip,
+  wrong-key and tampered-payload rejection blaming the claimed sender,
+  `drive_dkg_signed` honest run, blame-token `verify` positive and
+  negative — forgery and wrong registry); `src/lib.rs` unit-tests
+  `session_id` determinism and per-field domain separation. Committee maintenance (§13.4): refresh
   preserves `X` while replacing every share and enables post-refresh
   presign+sign, outstanding presignatures are invalidated on refresh
   (`PresigStore::clear` — stale-id signing fails with `Error::PresigStore`),
