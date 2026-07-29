@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use k256::elliptic_curve::ff::Field;
 use k256::Scalar;
 use rand::RngCore;
+use zeroize::Zeroize;
 
 use crate::shamir::ShamirPoly;
 use crate::vss::FeldmanCommitment;
@@ -72,6 +73,15 @@ pub struct DkgOutput {
     pub com: FeldmanCommitment,
 }
 
+impl Drop for DkgOutput {
+    fn drop(&mut self) {
+        // Compiler-fenced erasure of the key share via `zeroize` (SPEC
+        // §13.3); k256's `Scalar` implements `DefaultIsZeroes`, so this is
+        // a volatile write the compiler cannot elide.
+        self.share.zeroize();
+    }
+}
+
 impl DkgInstance {
     /// Start a DKG over the default committee `1..=n`: sample the dealing
     /// polynomial and broadcast its hash.
@@ -94,8 +104,23 @@ impl DkgInstance {
         me: PartyId,
         rng: &mut impl RngCore,
     ) -> (Self, DkgBcast1) {
+        Self::start_with_secret(committee, sid, tag, me, Scalar::random(&mut *rng), rng)
+    }
+
+    /// Start a DKG over an explicit committee dealing a FIXED `secret`
+    /// instead of a sampled one (SPEC §13.4: zero-constant refresh deals).
+    /// Commit-reveal and §6.1 complaint handling are identical to
+    /// [`Self::start_committee`].
+    pub fn start_with_secret(
+        committee: &Committee,
+        sid: &[u8],
+        tag: &'static [u8],
+        me: PartyId,
+        secret: Scalar,
+        rng: &mut impl RngCore,
+    ) -> (Self, DkgBcast1) {
         debug_assert!(committee.ids().contains(&me), "me must be a member");
-        let poly = ShamirPoly::random(Scalar::random(&mut *rng), committee.t(), rng);
+        let poly = ShamirPoly::random(secret, committee.t(), rng);
         let com = FeldmanCommitment::from_poly(&poly);
         let hash = hash_commitment(sid, tag, me, &com);
         let inst = Self {

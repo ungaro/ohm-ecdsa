@@ -7,6 +7,7 @@
 use k256::elliptic_curve::ff::Field;
 use k256::Scalar;
 use rand::RngCore;
+use zeroize::Zeroize;
 
 use crate::PartyId;
 
@@ -14,6 +15,15 @@ use crate::PartyId;
 #[derive(Clone, Debug)]
 pub struct ShamirPoly {
     pub coeffs: Vec<Scalar>,
+}
+
+impl Drop for ShamirPoly {
+    fn drop(&mut self) {
+        // Compiler-fenced erasure of the coefficients (they include the
+        // secret `c_0`): k256's `Scalar` implements `zeroize::DefaultIsZeroes`,
+        // so this is a volatile write, not an elidable plain store (SPEC §13.3).
+        self.coeffs.zeroize();
+    }
 }
 
 impl ShamirPoly {
@@ -101,6 +111,20 @@ mod tests {
             poly.eval(2)
         );
         assert_eq!(interpolate_at_zero(&parties, &shares), secret);
+    }
+
+    #[test]
+    fn scalar_zeroize_is_native() {
+        // All Drop impls rely on k256's `Scalar` implementing
+        // `zeroize::Zeroize` natively (via `DefaultIsZeroes`); pin that
+        // assumption so a k256 upgrade that drops the impl fails loudly.
+        let mut s = Scalar::from(42u64);
+        s.zeroize();
+        assert_eq!(s, Scalar::ZERO);
+        let mut v = vec![Scalar::from(1u64), Scalar::from(2u64)];
+        v.zeroize();
+        // `Vec::zeroize` erases every element, then clears the vector.
+        assert!(v.is_empty());
     }
 
     #[test]

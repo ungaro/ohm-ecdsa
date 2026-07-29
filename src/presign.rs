@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::{AffinePoint, ProjectivePoint, Scalar};
 use rand::rngs::StdRng;
+use zeroize::Zeroize;
 
 use crate::dkg::DkgOutput;
 use crate::open::{open, open_robust};
@@ -53,8 +54,11 @@ pub struct Presignature {
 
 impl Drop for Presignature {
     fn drop(&mut self) {
-        self.u_share = Scalar::ZERO;
-        self.z_share = Scalar::ZERO;
+        // Compiler-fenced erasure via `zeroize` (SPEC §13.3); k256's
+        // `Scalar` implements `DefaultIsZeroes`, so these are volatile
+        // writes the compiler cannot elide.
+        self.u_share.zeroize();
+        self.z_share.zeroize();
     }
 }
 

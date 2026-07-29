@@ -11,6 +11,8 @@
 //! * [`sign`] — one-round online signing with per-share verification
 //! * [`store`] — single-use presignature store (SPEC §8.6)
 //! * [`policy`] — §10.3 policy after blame (expel-and-restart committee)
+//! * [`refresh`] — §13.4 committee maintenance: proactive refresh and
+//!   committee-change re-sharing (public key unchanged)
 //! * [`sim`] — single-threaded reference orchestrator (models the broadcast
 //!   channel; swap in a real transport for deployment)
 //! * [`transport`] — the explicit transport seam (SPEC §13.1/§13.2):
@@ -27,6 +29,7 @@ mod error;
 pub mod open;
 pub mod policy;
 pub mod presign;
+pub mod refresh;
 pub mod shamir;
 pub mod sign;
 pub mod sim;
@@ -137,6 +140,8 @@ pub(crate) mod tags {
     pub const DKG_BATCH_COMMIT: &[u8] = b"OHM-ECDSA/v0.1/dkg-batch-commit";
     pub const TRIPLE_PRODUCT: &[u8] = b"OHM-ECDSA/v0.1/triple-product";
     pub const SESSION_ID: &[u8] = b"OHM-ECDSA/v0.1/session-id";
+    pub const REFRESH_COMMIT: &[u8] = b"OHM-ECDSA/v0.1/refresh-commit";
+    pub const RESHARE_COMMIT: &[u8] = b"OHM-ECDSA/v0.1/reshare-commit";
 }
 
 /// Hash a Feldman commitment vector into a transcript digest.

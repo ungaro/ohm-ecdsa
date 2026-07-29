@@ -3,7 +3,7 @@
 //! An instance that aborts with blame is restarted without the blamed
 //! parties — but only while the remaining committee still satisfies the
 //! honest-majority bound `n' >= 2t - 1`. Below that bound the correct move
-//! is committee re-sharing (SPEC §13.4), which is NOT implemented here;
+//! is committee re-sharing (SPEC §13.4, implemented in `crate::refresh`);
 //! `t` is never silently lowered.
 
 use crate::{Error, PartyId, Result};
@@ -31,7 +31,7 @@ pub fn restart_committee(
     survivors.sort_unstable();
     if survivors.len() < 2 * t - 1 {
         return Err(Error::InvalidParams(
-            "expulsion leaves n' < 2t-1: committee re-sharing required (SPEC 13.4, not implemented)",
+            "expulsion leaves n' < 2t-1: committee re-sharing required (SPEC 13.4, see refresh::reshare)",
         ));
     }
     Ok(survivors)

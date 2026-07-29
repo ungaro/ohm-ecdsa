@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 
 use k256::{ProjectivePoint, Scalar};
 use rand::rngs::StdRng;
+use zeroize::Zeroize;
 
 use crate::dkg::{resolve_complaint, DkgBatchInstance, DkgInstance, DkgOutput};
 use crate::shamir::{interpolate_at, lagrange_coeffs, ShamirPoly};
@@ -39,10 +40,12 @@ pub struct TripleShare {
 
 impl Drop for TripleShare {
     fn drop(&mut self) {
-        // Best-effort scrubbing of secret material (see SPEC §13 hardening).
-        self.a = Scalar::ZERO;
-        self.b = Scalar::ZERO;
-        self.c = Scalar::ZERO;
+        // Compiler-fenced erasure via `zeroize` (k256's `Scalar` implements
+        // `DefaultIsZeroes`, so `zeroize()` is a volatile write, not an
+        // elidable plain store). See SPEC §13.3.
+        self.a.zeroize();
+        self.b.zeroize();
+        self.c.zeroize();
     }
 }
 

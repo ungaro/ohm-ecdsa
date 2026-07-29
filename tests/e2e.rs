@@ -8,12 +8,13 @@ use std::collections::BTreeMap;
 
 use ohm_ecdsa::dkg::DkgTamper;
 use ohm_ecdsa::open::open;
-use ohm_ecdsa::presign::{KeyShare, PresignTamper};
+use ohm_ecdsa::presign::{self, KeyShare, PresignTamper};
+use ohm_ecdsa::refresh::ReshareTamper;
 use ohm_ecdsa::sim;
 use ohm_ecdsa::transport::{self, SimTransport};
 use ohm_ecdsa::triples::{self, TripleShare, TripleTamper};
 use ohm_ecdsa::vss::FeldmanCommitment;
-use ohm_ecdsa::{Error, Params, PartyId, Phase, PresigStore};
+use ohm_ecdsa::{Committee, Error, Params, PartyId, Phase, PresigStore};
 
 fn pubkey(keys: &[KeyShare]) -> ProjectivePoint {
     keys[0].com.points[0]
@@ -450,13 +451,39 @@ fn robust_triples_bad_product_proof_aborts() {
 }
 
 #[test]
-fn presign_restart_expels_cheater_and_recovers() {
+fn presign_restart_robust_handles_opening_fault_in_attempt() {
+    // 3-of-6: party 2 broadcasts a wrong P2 v-opening share — a fault the
+    // §10.4 robust path continues from, so the composed wrapper completes
+    // on the FIRST attempt: no restart, the id is NOT poisoned.
+    let params = Params::new(6, 3).unwrap();
+    let mut rngs = sim::make_rngs(6, 34);
+    let keys = sim::run_keygen(&params, b"key/34", &mut rngs).unwrap();
+    let tamper = PresignTamper {
+        bad_open_share: Some(2),
+        ..Default::default()
+    };
+    let (presigs, blamed, used_id) =
+        sim::run_presign_with_restart(&params, &keys, 41, &mut rngs, Some(&tamper)).unwrap();
+    assert_eq!(blamed, vec![2]);
+    assert_eq!(used_id, 41, "a completed attempt must not poison the id");
+    assert_eq!(presigs.len(), 5);
+    assert!(presigs.iter().all(|p| p.id == used_id));
+    let ids: Vec<PartyId> = presigs.iter().map(|p| p.index).collect();
+    assert_eq!(ids, vec![1, 3, 4, 5, 6]);
+    let msg = b"restart wrapper, in-attempt robust presign";
+    let sig = sim::run_sign(&params, &presigs, msg, None).unwrap();
+    assert_valid(&pubkey(&keys), msg, &sig);
+}
+
+#[test]
+fn presign_restart_still_restarts_on_dealing_fault() {
     // 3-of-6: one slack, so one expulsion still leaves n′ = 5 ≥ 2t−1.
     let params = Params::new(6, 3).unwrap();
     let mut rngs = sim::make_rngs(6, 30);
     let keys = sim::run_keygen(&params, b"key/30", &mut rngs).unwrap();
     // Dealing-phase fault (F2): party 2 re-shares a wrong share in the
-    // first triple session — the fail-fast presign aborts.
+    // first triple session — the dealing phase stays fail-fast even on
+    // the robust path, so the attempt aborts and §10.3 restarts it.
     let tamper = PresignTamper {
         triple_tamper: Some(TripleTamper {
             bad_reshare: Some((2, 3)),
@@ -532,7 +559,42 @@ fn keygen_restart_expels_cheater_and_recovers() {
 }
 
 #[test]
-fn triples_restart_expels_cheater_and_recovers() {
+fn triples_restart_robust_recovers_reshare_fault_in_attempt() {
+    // 3-of-6: dealer 2 re-shares a wrong share to party 3 (T2) — the
+    // §10.4 robust path publicly reconstructs g_2 and completes the
+    // FIRST attempt: no restart (the survivors keep their original ids;
+    // a restart would renumber to 1..=5).
+    let params = Params::new(6, 3).unwrap();
+    let mut rngs = sim::make_rngs(6, 35);
+    let tamper = TripleTamper {
+        bad_reshare: Some((2, 3)),
+        ..Default::default()
+    };
+    let (triple, blamed) =
+        sim::run_triples_with_restart(&params, b"triple/35", &mut rngs, Some(&tamper)).unwrap();
+    assert_eq!(blamed, vec![2]);
+    assert_eq!(triple.len(), 5);
+    let ids: Vec<PartyId> = triple.iter().map(|(s, _)| s.index).collect();
+    assert_eq!(
+        ids,
+        vec![1, 3, 4, 5, 6],
+        "in-attempt completion, no renumbering"
+    );
+    // The reconstructed triple is multiplicative.
+    let pubc = &triple[0].1;
+    let open_of = |pick: fn(&TripleShare) -> Scalar, com: &FeldmanCommitment| {
+        let shares: BTreeMap<PartyId, Scalar> =
+            triple.iter().map(|(s, _)| (s.index, pick(s))).collect();
+        open(params.t, com, &shares, Phase::Triples).unwrap()
+    };
+    let a = open_of(|s| s.a, &pubc.ca);
+    let b_ = open_of(|s| s.b, &pubc.cb);
+    let c = open_of(|s| s.c, &pubc.cc);
+    assert_eq!(c, a * b_);
+}
+
+#[test]
+fn triples_restart_restarts_on_bad_product_proof() {
     // 3-of-6 with an F3 fault (bad DLEQ product proof) — not continuable
     // even on the §10.4 robust path, so the §10.3 restart handles it.
     let params = Params::new(6, 3).unwrap();
@@ -580,4 +642,167 @@ fn keygen_via_transport_driver_signs_end_to_end() {
     let msg = b"keygen through the transport seam, 2-of-3";
     let sig = sim::run_sign(&params, &presigs, msg, None).unwrap();
     assert_valid(&pubkey(&keys), msg, &sig);
+}
+
+// --- §13.4 committee maintenance -------------------------------------------
+
+#[test]
+fn refresh_preserves_key_and_enables_signing() {
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 80);
+    let keys = sim::run_keygen(&params, b"key/80", &mut rngs).unwrap();
+    let x = pubkey(&keys);
+    let refreshed = sim::run_refresh(&params, &keys, b"refresh/80", &mut rngs, None).unwrap();
+    // The public key is unchanged (checked against the ORIGINAL keyshare
+    // commitment), but every share is new.
+    assert_eq!(pubkey(&refreshed), x);
+    for (old, new) in keys.iter().zip(&refreshed) {
+        assert_eq!(old.index, new.index);
+        assert_ne!(old.share, new.share);
+    }
+    // The refreshed shares presign and sign end-to-end.
+    let presigs = sim::run_presign(&params, &refreshed, 1, &mut rngs, None).unwrap();
+    let msg = b"post-refresh signature, 2-of-3";
+    let sig = sim::run_sign(&params, &presigs, msg, None).unwrap();
+    assert_valid(&x, msg, &sig);
+}
+
+#[test]
+fn refresh_invalidates_presignatures() {
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 81);
+    let keys = sim::run_keygen(&params, b"key/81", &mut rngs).unwrap();
+    let presigs = sim::run_presign(&params, &keys, 1, &mut rngs, None).unwrap();
+    let pk = pubkey(&keys).to_affine();
+    let mut stores: Vec<PresigStore> = (0..3).map(|_| PresigStore::new(pk)).collect();
+    for (store, presig) in stores.iter_mut().zip(presigs) {
+        store.insert(presig).unwrap();
+    }
+    // Refresh, then apply the §13.4 invalidation (stores are caller-owned).
+    let refreshed = sim::run_refresh(&params, &keys, b"refresh/81", &mut rngs, None).unwrap();
+    for store in stores.iter_mut() {
+        store.clear();
+    }
+    assert!(stores.iter().all(|s| s.is_empty()));
+    // The pre-refresh presignature id is gone from every store.
+    let err = sim::run_sign_stored(&params, &mut stores, 1, b"m", None).unwrap_err();
+    match err {
+        Error::PresigStore("unknown or consumed presignature id") => {}
+        other => panic!("expected PresigStore, got {other:?}"),
+    }
+    // Fresh presignatures under the refreshed shares sign as usual.
+    let presigs = sim::run_presign(&params, &refreshed, 2, &mut rngs, None).unwrap();
+    for (store, presig) in stores.iter_mut().zip(presigs) {
+        store.insert(presig).unwrap();
+    }
+    let msg = b"post-refresh stored signature";
+    let sig = sim::run_sign_stored(&params, &mut stores, 2, msg, None).unwrap();
+    assert_valid(&pubkey(&keys), msg, &sig);
+}
+
+#[test]
+fn refresh_cheating_dealer_is_blamed() {
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 82);
+    let keys = sim::run_keygen(&params, b"key/82", &mut rngs).unwrap();
+    // Dealer 3 deals a wrong zero-constant share to party 1 (§6.1 F2): its
+    // defense fails verification, so the dealer is blamed.
+    let tamper = DkgTamper {
+        bad_deal: Some((3, 1)),
+        ..Default::default()
+    };
+    let err =
+        sim::run_refresh(&params, &keys, b"refresh/82", &mut rngs, Some(&tamper)).unwrap_err();
+    match err {
+        Error::Abort { abort } => {
+            assert_eq!(abort.phase, Phase::Refresh);
+            assert_eq!(abort.blamed, vec![3]);
+        }
+        other => panic!("expected identifiable abort, got {other:?}"),
+    }
+}
+
+#[test]
+fn reshare_to_new_committee_signs() {
+    let params = Params::new(5, 3).unwrap();
+    let mut rngs = sim::make_rngs(5, 83);
+    let keys = sim::run_keygen(&params, b"key/83", &mut rngs).unwrap();
+    let x = pubkey(&keys);
+    let old = Committee::full(&params);
+    // Re-share to a NEW 2-of-3 committee with fresh ids {6,7,8}.
+    let new_params = Params::new(3, 2).unwrap();
+    let new = Committee::new(vec![6, 7, 8], new_params.t).unwrap();
+    let new_keys = sim::run_reshare(&keys, &old, &new, b"reshare/83", &mut rngs, None).unwrap();
+    assert_eq!(new_keys.len(), 3);
+    assert!(new_keys.iter().map(|k| k.index).eq([6, 7, 8]));
+    // The public key is unchanged.
+    assert_eq!(pubkey(&new_keys), x);
+    // The new committee presigns and signs end-to-end (non-`1..=n` ids, so
+    // presign runs over the explicit committee).
+    let mut new_rngs = sim::make_rngs(3, 84);
+    let presigs = presign::presign_with_committee(&new, &new_keys, 1, &mut new_rngs, None).unwrap();
+    let msg = b"post-reshare signature, new 2-of-3";
+    let sig = sim::run_sign(&new_params, &presigs, msg, None).unwrap();
+    assert_valid(&x, msg, &sig);
+}
+
+#[test]
+fn reshare_to_overlapping_committee_signs() {
+    // New committee ids overlap the old ones — fine, the re-sharing
+    // polynomials are fresh.
+    let params = Params::new(5, 3).unwrap();
+    let mut rngs = sim::make_rngs(5, 85);
+    let keys = sim::run_keygen(&params, b"key/85", &mut rngs).unwrap();
+    let x = pubkey(&keys);
+    let old = Committee::full(&params);
+    let new = Committee::new(vec![2, 4, 5, 6, 7], 3).unwrap();
+    let new_keys = sim::run_reshare(&keys, &old, &new, b"reshare/85", &mut rngs, None).unwrap();
+    assert_eq!(pubkey(&new_keys), x);
+    let mut new_rngs = sim::make_rngs(5, 86);
+    let presigs = presign::presign_with_committee(&new, &new_keys, 1, &mut new_rngs, None).unwrap();
+    let msg = b"post-reshare signature, overlapping committees";
+    let sig = sim::run_sign(&params, &presigs, msg, None).unwrap();
+    assert_valid(&x, msg, &sig);
+}
+
+#[test]
+fn reshare_cheating_dealer_is_blamed() {
+    let params = Params::new(5, 3).unwrap();
+    let mut rngs = sim::make_rngs(5, 87);
+    let keys = sim::run_keygen(&params, b"key/87", &mut rngs).unwrap();
+    let old = Committee::full(&params);
+    let new = Committee::new(vec![6, 7, 8, 9, 10], 3).unwrap();
+
+    // Bad sub-share: dealer 2 deals a wrong value to new member 8 — its
+    // §6.1 defense fails too, so the dealer is blamed.
+    let tamper = ReshareTamper {
+        bad_deal: Some((2, 8)),
+        ..Default::default()
+    };
+    let mut rngs_a = rngs.clone();
+    let err =
+        sim::run_reshare(&keys, &old, &new, b"reshare/87", &mut rngs_a, Some(&tamper)).unwrap_err();
+    match err {
+        Error::Abort { abort } => {
+            assert_eq!(abort.phase, Phase::Refresh);
+            assert_eq!(abort.blamed, vec![2]);
+        }
+        other => panic!("expected identifiable abort, got {other:?}"),
+    }
+
+    // Bad commitment: dealer 4's C_4 does not bind to its true old share
+    // (C_4.points[0] != EvalCom(A[x], 4)) — identifiable on public data.
+    let tamper = ReshareTamper {
+        bad_commitment: Some(4),
+        ..Default::default()
+    };
+    let err =
+        sim::run_reshare(&keys, &old, &new, b"reshare/88", &mut rngs, Some(&tamper)).unwrap_err();
+    match err {
+        Error::Abort { abort } => {
+            assert_eq!(abort.phase, Phase::Refresh);
+            assert_eq!(abort.blamed, vec![4]);
+        }
+        other => panic!("expected identifiable abort, got {other:?}"),
+    }
 }

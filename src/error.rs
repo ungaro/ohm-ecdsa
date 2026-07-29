@@ -9,6 +9,8 @@ pub enum Phase {
     Triples,
     Presign,
     Sign,
+    /// Committee maintenance (SPEC §13.4): proactive refresh / re-sharing.
+    Refresh,
 }
 
 impl core::fmt::Display for Phase {
@@ -18,6 +20,7 @@ impl core::fmt::Display for Phase {
             Phase::Triples => "triples",
             Phase::Presign => "presign",
             Phase::Sign => "sign",
+            Phase::Refresh => "refresh",
         };
         f.write_str(s)
     }

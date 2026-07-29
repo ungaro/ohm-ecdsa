@@ -32,12 +32,19 @@ triples + commit-reveal DKG. The full protocol is specified in
 * Single-use presignature store (§8.6): atomic consume, duplicate-id rejection
 * Batch generation (§7.3/§8.5): one commit-reveal per batch for triples and
   presignatures (`generate_batch`, `presign_batch`)
-* Expel-and-restart (§10.3): after a dealing-phase abort the blamed parties
-  are expelled and the instance restarts over the surviving committee —
+* Expel-and-restart (§10.3) composed with robust continuation (§10.4):
+  every presign/triples attempt drives the robust variant, so continuable
+  faults finish in-attempt (no id poisoning); only dealing-phase aborts
+  expel the blamed and restart over the surviving committee —
   keygen/triples renumber freely, presign keeps the survivors' original ids
   (`run_keygen_with_restart`, `run_presign_with_restart`,
   `run_triples_with_restart`); the aborted sid/id is poisoned, and `t` is
   never silently lowered (zero-slack refusal points at §13.4)
+* Committee maintenance (§13.4), public key unchanged: proactive refresh
+  (zero-constant re-sharing over the same committee, `run_refresh`) and
+  committee-change re-sharing to a new id set with public old-share binding
+  (`C_j.points[0] == EvalCom(A[x], j)`, `run_reshare`); `PresigStore::clear`
+  invalidates outstanding presignatures on epoch change (§8.6)
 * Explicit transport seam (§13.1/§13.2): `Envelope` per-message contract,
   sync `Transport` trait, `SimTransport` reference implementation; keygen
   delivery runs through the seam (`transport::drive_dkg`)
@@ -46,8 +53,7 @@ triples + commit-reveal DKG. The full protocol is specified in
 **Not yet** (roadmap): production transport over the seam (mTLS + echo
 broadcast + per-message signatures — the `transport` module is the
 contract, not an implementation), serde wire format, packed-Shamir
-batching (§7.4), proactive refresh and committee re-sharing (§13.4),
-audit.
+batching (§7.4), key rotation (§13.4 — re-DKG with a new `X`), audit.
 
 ## Quick start
 
@@ -55,15 +61,19 @@ audit.
 cargo test
 ```
 
-Runs 14 unit tests and 28 integration tests: end-to-end 2-of-3 and 3-of-5
+Runs 14 unit tests and 36 integration tests: end-to-end 2-of-3 and 3-of-5
 signatures verified by `k256`'s ECDSA verifier, subset signing with only
 `T` parties, cheater identification in keygen (both §6.1 complaint
 branches), triples, presign, and sign, robust signing with up to `T−1`
 cheaters, robust presign/triples continuation with correct blame (§10.4),
-expel-and-restart after dealing-phase aborts (§10.3, 3-of-6) including
-zero-slack refusal, presignature single-use enforcement, HD-tweak signing,
-batched triple/presignature generation, and keygen executed through the
-explicit transport seam (`transport::drive_dkg` over `SimTransport`).
+expel-and-restart composed with the robust path (§10.3+§10.4, 3-of-6):
+continuable faults complete in-attempt, dealing-phase aborts restart with
+id poisoning, zero-slack refusal, presignature single-use enforcement,
+HD-tweak signing, batched triple/presignature generation, committee
+maintenance (§13.4: refresh preserving `X`, presignature invalidation on
+epoch change, re-sharing to a new committee with dealer-blame fault
+injection), and keygen executed through the explicit transport seam
+(`transport::drive_dkg` over `SimTransport`).
 
 ## Layout
 
@@ -77,8 +87,9 @@ explicit transport seam (`transport::drive_dkg` over `SimTransport`).
 | `triples` | 7, 7.3, 10.4 | triple factory (joint random + degree reduction), robust reconstruction of a cheater's re-sharing polynomial, batched, `*_with_committee` variants |
 | `presign` | 8, 8.5, 10.4 | presignatures, tweak derivation, tamper hooks, robust continuation, batched, `*_with_committee` variants |
 | `sign` | 9, 10.4 | share computation, verified combine, robust combine |
-| `store` | 8.6 | single-use presignature store (atomic consume) |
+| `store` | 8.6 | single-use presignature store (atomic consume, `clear` for epoch changes) |
 | `policy` | 10.3 | `restart_committee` — expel-and-restart committee computation (never lowers `t`) |
+| `refresh` | 13.4 | committee maintenance with `X` unchanged: proactive zero-constant refresh (`refresh`) and re-sharing to a new committee with public old-share binding (`reshare`), `ReshareTamper` hooks |
 | `transport` | 4.7, 10.2, 13.1, 13.2 | transport seam: `Envelope` message contract, sync `Transport` trait, `SimTransport` reference impl, `drive_dkg` transport-driven keygen driver |
 | `sim` | 4.7, 10.3, 13.2 | reference orchestrator (keygen routes through the `transport` seam), §10.3 restart wrappers |
 
@@ -103,8 +114,8 @@ let sig = sim::run_sign(&params, &presigs[..2], b"hello threshold", None).unwrap
   **key-equivalent** (SPEC §8.6) — store and erase them like key shares.
 * Every broadcast is verified against public commitments; a wrong share
   aborts with the sender's identity (`Error::Abort`).
-* Secret-holding structs scrub on `Drop` (best effort — production needs
-  real zeroization, mlock, ideally HSMs; §13.3).
+* Secret-holding structs erase on `Drop` via `zeroize` (compiler-fenced;
+  production additionally needs mlock, ideally HSMs; §13.3).
 
 ## Patent notes
 

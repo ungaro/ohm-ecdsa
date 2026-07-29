@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use crate::dkg::DkgTamper;
 use crate::policy::restart_committee;
 use crate::presign::{self, KeyShare, PresignTamper, Presignature};
+use crate::refresh::{self, ReshareTamper};
 use crate::sign::{self, SignShare};
 use crate::store::PresigStore;
 use crate::transport::{drive_dkg, SimTransport};
@@ -110,6 +111,15 @@ pub fn run_presign_batch(
 // the remainder would drop below `2t - 1` — `t` is never silently
 // lowered; below the bound, committee re-sharing (§13.4) is required.
 //
+// The presign/triples wrappers COMPOSE the two recovery layers (SPEC
+// §10.4 C6): every attempt drives the §10.4 ROBUST variant, so faults
+// the robust layer can continue from (bad opening shares, bad nonce
+// points, bad re-sharing shares) are filtered/reconstructed in-attempt —
+// the attempt completes, its id is NOT poisoned, and the in-attempt
+// blame is accumulated into the returned list. Only aborts the robust
+// layer cannot continue (the dealing phases) cascade to the §10.3
+// restart below.
+//
 // Common conventions of the `*_with_restart` wrappers: `rngs` are CLONED
 // per attempt (the caller's streams are not advanced); `tamper` (fault
 // injection, tests) applies to the FIRST attempt only, retries run
@@ -187,11 +197,15 @@ pub fn run_keygen_with_restart(
     }
 }
 
-/// Triple generation with the §10.3 expel-and-restart policy, for faults
-/// the §10.4 robust path cannot continue (dealing-phase F1/F2 aborts and
-/// F3 bad product proofs). Triples are key-independent, so retries
-/// renumber freely as in [`run_keygen_with_restart`]. Returns the final
-/// per-party triples and the cumulative blame list in ORIGINAL ids.
+/// Triple generation with the §10.3 expel-and-restart policy COMPOSED
+/// with the §10.4 robust path: every attempt runs
+/// [`triples::generate_robust_with_committee`], so T3 share-check
+/// failures are reconstructed in-attempt (the attempt completes — no
+/// restart, the sid is NOT poisoned — and the in-attempt blame is
+/// accumulated); only uncontinuable aborts (dealing-phase F1/F2, F3 bad
+/// product proofs) expel-and-restart. Triples are key-independent, so
+/// retries renumber freely as in [`run_keygen_with_restart`]. Returns the
+/// final per-party triples and the cumulative blame list in ORIGINAL ids.
 #[allow(clippy::type_complexity)] // (records, blame) mirrors the other robust APIs
 pub fn run_triples_with_restart(
     params: &Params,
@@ -207,8 +221,25 @@ pub fn run_triples_with_restart(
         let attempt_params = Params::new(current.len(), params.t)?;
         let attempt_sid = poison_sid(sid, attempt);
         let tamp = if attempt == 0 { tamper } else { None };
-        match triples::generate_with_tamper(&attempt_params, &attempt_sid, &mut cur_rngs, tamp) {
-            Ok(triple) => return Ok((triple, blamed_all)),
+        match triples::generate_robust_with_committee(
+            &Committee::full(&attempt_params),
+            &attempt_sid,
+            &mut cur_rngs,
+            tamp,
+        ) {
+            Ok((triple, in_attempt_blamed)) => {
+                // The attempt COMPLETED via §10.4 reconstruction — no
+                // restart, the sid is not poisoned; accumulate the
+                // in-attempt blame (mapped back to original ids).
+                for &b in &in_attempt_blamed {
+                    let orig = current[b - 1];
+                    if !blamed_all.contains(&orig) {
+                        blamed_all.push(orig);
+                    }
+                }
+                blamed_all.sort_unstable();
+                return Ok((triple, blamed_all));
+            }
             Err(Error::Abort { abort }) => {
                 let blamed: Vec<PartyId> = abort.blamed.iter().map(|&b| current[b - 1]).collect();
                 for &b in &blamed {
@@ -231,18 +262,22 @@ pub fn run_triples_with_restart(
     }
 }
 
-/// Presign with the §10.3 expel-and-restart policy, for DEALING-phase
-/// aborts (the §10.4 robust continuations are handled inside
-/// [`presign::presign_robust`]; this wrapper drives the fail-fast
-/// [`presign::presign`]).
+/// Presign with the §10.3 expel-and-restart policy COMPOSED with the
+/// §10.4 robust path: every attempt runs
+/// [`presign::presign_robust_with_committee`], so §10.4-continuable
+/// faults (bad opening shares, bad nonce points) are filtered in-attempt
+/// — the attempt completes, its id is NOT poisoned (the records are valid
+/// for the non-blamed survivors), and the in-attempt blame is accumulated
+/// into the returned list. Only DEALING-phase aborts (F1–F3) cascade to
+/// the expel-and-restart below.
 ///
 /// Unlike keygen, presign P4 mixes `[x]` with fresh sharings, so the
 /// survivors keep their ORIGINAL ids (their key shares `x_j` live at
-/// those evaluation points): each attempt runs
-/// [`presign::presign_with_committee`] over the surviving id set with the
-/// survivors' key shares. The presignature id is poisoned per attempt
-/// (§10.3(2)): attempt `k` uses `first_id + k`. If expulsion would leave
-/// `n' < 2t - 1`, the abort is propagated unchanged.
+/// those evaluation points): each attempt runs over the surviving id set
+/// with the survivors' key shares. The presignature id is poisoned per
+/// RESTARTED attempt (§10.3(2)): attempt `k` uses `first_id + k`. If
+/// expulsion would leave `n' < 2t - 1`, the abort is propagated
+/// unchanged.
 ///
 /// `keys[i]`/`rngs[i]` belong to party `i + 1` (the full committee).
 /// Returns the survivors' presignatures, the cumulative blame list, and
@@ -263,8 +298,20 @@ pub fn run_presign_with_restart(
         let id = first_id + attempt; // §10.3(2): a poisoned id is never reused
         let committee = Committee::new(current.clone(), params.t)?;
         let tamp = if attempt == 0 { tamper } else { None };
-        match presign::presign_with_committee(&committee, &cur_keys, id, &mut cur_rngs, tamp) {
-            Ok(presigs) => return Ok((presigs, blamed_all, id)),
+        match presign::presign_robust_with_committee(&committee, &cur_keys, id, &mut cur_rngs, tamp)
+        {
+            Ok((presigs, in_attempt_blamed)) => {
+                // The attempt COMPLETED via §10.4 continuation — no
+                // restart, the id is not poisoned; accumulate the
+                // in-attempt blame (already in original ids).
+                for &b in &in_attempt_blamed {
+                    if !blamed_all.contains(&b) {
+                        blamed_all.push(b);
+                    }
+                }
+                blamed_all.sort_unstable();
+                return Ok((presigs, blamed_all, id));
+            }
             Err(Error::Abort { abort }) => {
                 // Blame is already in original ids (no renumbering here).
                 for &b in &abort.blamed {
@@ -287,6 +334,45 @@ pub fn run_presign_with_restart(
         }
         attempt += 1;
     }
+}
+
+// --- §13.4 committee maintenance -----------------------------------------
+
+/// Proactive refresh (SPEC §13.4): re-share the long-term key with
+/// zero-constant polynomials over the SAME committee (the committee is
+/// taken from `keys[k].index`, threshold from `params`). The public key `X`
+/// is unchanged; every share is new.
+///
+/// §13.4/§8.6: a refresh INVALIDATES every outstanding presignature. Stores
+/// are owned by the caller — this wrapper does NOT clear them; deployments
+/// MUST call [`PresigStore::clear`] on every epoch change.
+pub fn run_refresh(
+    params: &Params,
+    keys: &[KeyShare],
+    sid: &[u8],
+    rngs: &mut [StdRng],
+    tamper: Option<&DkgTamper>,
+) -> Result<Vec<KeyShare>> {
+    let committee = Committee::new(keys.iter().map(|k| k.index).collect(), params.t)?;
+    refresh::refresh(&committee, keys, sid, rngs, tamper)
+}
+
+/// Committee change (SPEC §13.4): re-share `x` from the `old` committee to
+/// the `new` one (different ids and size allowed; overlap is fine). The
+/// public key `X` is unchanged. Only the old committee deals, so the new
+/// members need no randomness (no `rngs_new`).
+///
+/// The same §13.4/§8.6 obligation as [`run_refresh`] applies: the OLD
+/// committee's presignature stores MUST be cleared by the caller.
+pub fn run_reshare(
+    old_keys: &[KeyShare],
+    old: &Committee,
+    new: &Committee,
+    sid: &[u8],
+    rngs_old: &mut [StdRng],
+    tamper: Option<&ReshareTamper>,
+) -> Result<Vec<KeyShare>> {
+    refresh::reshare(old, new, old_keys, sid, rngs_old, tamper)
 }
 
 /// Message hash as a scalar: `m = H(M) mod q` (SPEC §3).

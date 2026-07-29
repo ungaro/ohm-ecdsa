@@ -19,8 +19,8 @@ use crate::{Error, Result};
 /// (SPEC §8.6).
 ///
 /// Dropping the store drops any remaining [`Presignature`]s; their
-/// `Drop` scrubs the scalars (best-effort erase, §8.6(3) — see the
-/// documented §13.3 gap: no `zeroize` crate, no `mlock`).
+/// `Drop` erases the scalars via `zeroize` (compiler-fenced, §8.6(3) —
+/// `mlock`/HSM-backed storage remains a deployment concern, §13.3).
 #[derive(Debug)]
 pub struct PresigStore {
     public_key: AffinePoint,
@@ -62,6 +62,15 @@ impl PresigStore {
     /// Number of stored (unconsumed) presignatures.
     pub fn len(&self) -> usize {
         self.records.len()
+    }
+
+    /// Drop ALL stored presignatures (SPEC §13.4): a key-share refresh or
+    /// committee change invalidates every outstanding presignature — they
+    /// are key-equivalent (§8.6), so they must never outlive the epoch they
+    /// were created in. Dropping the records applies their `Drop`
+    /// erasure. Deployments MUST call this on every epoch change.
+    pub fn clear(&mut self) {
+        self.records.clear();
     }
 
     /// Whether the store holds no presignatures.
