@@ -23,20 +23,16 @@
 //! protocol. It has not been audited. See SPEC.md §13 for the hardening
 //! checklist (zeroization, side channels, transport, policy).
 
-pub mod dkg;
-pub mod dleq;
 mod error;
-pub mod open;
-pub mod policy;
-pub mod presign;
-pub mod refresh;
-pub mod shamir;
-pub mod sign;
-pub mod sim;
-pub mod store;
-pub mod transport;
-pub mod triples;
-pub mod vss;
+pub mod primitives;
+pub mod protocol;
+pub mod runtime;
+
+// Flat re-exports: the historical public paths (`ohm_ecdsa::shamir`,
+// `ohm_ecdsa::sim`, …) keep working unchanged after the layering.
+pub use primitives::{dleq, open, shamir, vss};
+pub use protocol::{dkg, presign, refresh, sign, triples};
+pub use runtime::{policy, sim, store, transport};
 
 pub use error::{Error, IdentifiableAbort, Phase, Result};
 pub use store::PresigStore;
