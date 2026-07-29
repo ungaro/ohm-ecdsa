@@ -9,8 +9,9 @@
 //! (SPEC §7.3): the R1 hash covers `encode(A⁽¹⁾ ‖ … ‖ A⁽ᴮ⁾)`, the reveal
 //! carries all `B` vectors, each P2P message carries `B` shares.
 //!
-//! The module is message-oriented: the [`crate::sim`] orchestrator (or a
-//! real transport) delivers every party the same message sets.
+//! The module is message-oriented: the [`crate::sim`] orchestrator (via the
+//! [`crate::transport`] seam) or a real transport delivers every party the
+//! same message sets.
 
 use std::collections::BTreeMap;
 
@@ -21,7 +22,8 @@ use rand::RngCore;
 use crate::shamir::ShamirPoly;
 use crate::vss::FeldmanCommitment;
 use crate::{
-    hash_commitment, hash_commitments, Error, IdentifiableAbort, Params, PartyId, Phase, Result,
+    hash_commitment, hash_commitments, Committee, Error, IdentifiableAbort, Params, PartyId, Phase,
+    Result,
 };
 
 /// Round-1 broadcast: hash commitment to the dealer's Feldman vector.
@@ -48,7 +50,9 @@ pub struct DkgP2P {
 
 /// Per-party DKG state.
 pub struct DkgInstance {
-    pub params: Params,
+    /// The party-id set this instance runs over (SPEC §10.3): `1..=n` by
+    /// default, the surviving original ids after an expulsion.
+    pub committee: Committee,
     pub sid: Vec<u8>,
     pub tag: &'static [u8],
     pub me: PartyId,
@@ -69,7 +73,8 @@ pub struct DkgOutput {
 }
 
 impl DkgInstance {
-    /// Start a DKG: sample the dealing polynomial and broadcast its hash.
+    /// Start a DKG over the default committee `1..=n`: sample the dealing
+    /// polynomial and broadcast its hash.
     pub fn start(
         params: Params,
         sid: &[u8],
@@ -77,11 +82,24 @@ impl DkgInstance {
         me: PartyId,
         rng: &mut impl RngCore,
     ) -> (Self, DkgBcast1) {
-        let poly = ShamirPoly::random(Scalar::random(&mut *rng), params.t, rng);
+        Self::start_committee(&Committee::full(&params), sid, tag, me, rng)
+    }
+
+    /// Start a DKG over an explicit committee (SPEC §10.3 restart): shares
+    /// are dealt at the committee's original ids.
+    pub fn start_committee(
+        committee: &Committee,
+        sid: &[u8],
+        tag: &'static [u8],
+        me: PartyId,
+        rng: &mut impl RngCore,
+    ) -> (Self, DkgBcast1) {
+        debug_assert!(committee.ids().contains(&me), "me must be a member");
+        let poly = ShamirPoly::random(Scalar::random(&mut *rng), committee.t(), rng);
         let com = FeldmanCommitment::from_poly(&poly);
         let hash = hash_commitment(sid, tag, me, &com);
         let inst = Self {
-            params,
+            committee: committee.clone(),
             sid: sid.to_vec(),
             tag,
             me,
@@ -117,8 +135,8 @@ impl DkgInstance {
             com: self.com.clone(),
         };
         let p2p = self
-            .params
-            .parties()
+            .committee
+            .ids()
             .iter()
             .map(|&j| DkgP2P {
                 from: self.me,
@@ -147,17 +165,17 @@ impl DkgInstance {
         shares_for_me: &BTreeMap<PartyId, Scalar>,
         defenses: &BTreeMap<PartyId, Scalar>,
     ) -> Result<DkgOutput> {
-        let n = self.params.n;
+        let n = self.committee.n();
         if r1.len() != n || r2.len() != n || shares_for_me.len() != n || defenses.len() != n {
             return Err(Error::InvalidParams("incomplete message sets"));
         }
         let mut share_sum = Scalar::ZERO;
         let mut coms = Vec::with_capacity(n);
-        for i in 1..=n {
+        for &i in self.committee.ids() {
             let b1 = &r1[&i];
             let b2 = &r2[&i];
             // (a) commit-reveal consistency (F1: the dealer is blamed)
-            if b2.com.points.len() != self.params.t {
+            if b2.com.points.len() != self.committee.t() {
                 return Err(Error::Abort {
                     abort: IdentifiableAbort {
                         phase,
@@ -211,7 +229,8 @@ pub struct DkgBatchP2P {
 /// commitment vectors, the reveal carries all `B` vectors, and each P2P
 /// message carries `B` shares.
 pub struct DkgBatchInstance {
-    pub params: Params,
+    /// The party-id set this instance runs over (see [`DkgInstance`]).
+    pub committee: Committee,
     pub sid: Vec<u8>,
     pub tag: &'static [u8],
     pub me: PartyId,
@@ -220,8 +239,9 @@ pub struct DkgBatchInstance {
 }
 
 impl DkgBatchInstance {
-    /// Start a batch DKG: sample `count` dealing polynomials and broadcast
-    /// one hash committing to all of them.
+    /// Start a batch DKG over the default committee `1..=n`: sample
+    /// `count` dealing polynomials and broadcast one hash committing to
+    /// all of them.
     pub fn start(
         params: Params,
         sid: &[u8],
@@ -230,13 +250,26 @@ impl DkgBatchInstance {
         count: usize,
         rng: &mut impl RngCore,
     ) -> (Self, DkgBcast1) {
+        Self::start_committee(&Committee::full(&params), sid, tag, me, count, rng)
+    }
+
+    /// Start a batch DKG over an explicit committee (SPEC §10.3 restart).
+    pub fn start_committee(
+        committee: &Committee,
+        sid: &[u8],
+        tag: &'static [u8],
+        me: PartyId,
+        count: usize,
+        rng: &mut impl RngCore,
+    ) -> (Self, DkgBcast1) {
+        debug_assert!(committee.ids().contains(&me), "me must be a member");
         let polys: Vec<ShamirPoly> = (0..count)
-            .map(|_| ShamirPoly::random(Scalar::random(&mut *rng), params.t, &mut *rng))
+            .map(|_| ShamirPoly::random(Scalar::random(&mut *rng), committee.t(), &mut *rng))
             .collect();
         let coms: Vec<FeldmanCommitment> = polys.iter().map(FeldmanCommitment::from_poly).collect();
         let hash = hash_commitments(sid, tag, me, &coms);
         let inst = Self {
-            params,
+            committee: committee.clone(),
             sid: sid.to_vec(),
             tag,
             me,
@@ -265,8 +298,8 @@ impl DkgBatchInstance {
             coms: self.coms.clone(),
         };
         let p2p = self
-            .params
-            .parties()
+            .committee
+            .ids()
             .iter()
             .map(|&j| DkgBatchP2P {
                 from: self.me,
@@ -292,7 +325,7 @@ impl DkgBatchInstance {
         shares_for_me: &BTreeMap<PartyId, Vec<Scalar>>,
         defenses: &BTreeMap<PartyId, Vec<Scalar>>,
     ) -> Result<Vec<DkgOutput>> {
-        let n = self.params.n;
+        let n = self.committee.n();
         let count = self.count();
         if r1.len() != n || r2.len() != n || shares_for_me.len() != n || defenses.len() != n {
             return Err(Error::InvalidParams("incomplete message sets"));
@@ -300,14 +333,14 @@ impl DkgBatchInstance {
         let mut share_sums = vec![Scalar::ZERO; count];
         let mut coms_per_index: Vec<Vec<FeldmanCommitment>> =
             (0..count).map(|_| Vec::with_capacity(n)).collect();
-        for i in 1..=n {
+        for &i in self.committee.ids() {
             let b1 = &r1[&i];
             let b2 = &r2[&i];
             let shares = &shares_for_me[&i];
             let defense = &defenses[&i];
             // (a) commit-reveal consistency (F1: the dealer is blamed)
             if b2.coms.len() != count
-                || b2.coms.iter().any(|c| c.points.len() != self.params.t)
+                || b2.coms.iter().any(|c| c.points.len() != self.committee.t())
                 || shares.len() != count
             {
                 return Err(Error::Abort {

@@ -23,16 +23,31 @@ triples + commit-reveal DKG. The full protocol is specified in
 * Key-dependent presignatures `([k⁻¹], [k⁻¹x], R)` (§8)
 * One-round signing with per-share verification and identifiable abort (§9–§10)
 * Additive key derivation / HD tweaks (§9.4)
-* Robust signing (§10.4): blamed shares are excluded and the signature is
-  still delivered from the remaining honest shares (`run_sign_robust`)
+* Robust continuation (§10.4): blamed parties are excluded and the honest
+  majority still delivers — online signing (`run_sign_robust`), presign
+  (`run_presign_robust`: openings via `open_robust`, `R` interpolated over
+  the valid nonce points), and triple generation
+  (`triples::generate_robust`: the cheater's committed re-sharing
+  polynomial is publicly reconstructed)
 * Single-use presignature store (§8.6): atomic consume, duplicate-id rejection
 * Batch generation (§7.3/§8.5): one commit-reveal per batch for triples and
   presignatures (`generate_batch`, `presign_batch`)
+* Expel-and-restart (§10.3): after a dealing-phase abort the blamed parties
+  are expelled and the instance restarts over the surviving committee —
+  keygen/triples renumber freely, presign keeps the survivors' original ids
+  (`run_keygen_with_restart`, `run_presign_with_restart`,
+  `run_triples_with_restart`); the aborted sid/id is poisoned, and `t` is
+  never silently lowered (zero-slack refusal points at §13.4)
+* Explicit transport seam (§13.1/§13.2): `Envelope` per-message contract,
+  sync `Transport` trait, `SimTransport` reference implementation; keygen
+  delivery runs through the seam (`transport::drive_dkg`)
 * Single-threaded reference orchestrator + fault-injection hooks
 
-**Not yet** (roadmap): async transport with echo broadcast, serde wire
-format, packed-Shamir batching (§7.4), proactive refresh (§13.4), robust
-continuation in the offline phases (§10.4), audit.
+**Not yet** (roadmap): production transport over the seam (mTLS + echo
+broadcast + per-message signatures — the `transport` module is the
+contract, not an implementation), serde wire format, packed-Shamir
+batching (§7.4), proactive refresh and committee re-sharing (§13.4),
+audit.
 
 ## Quick start
 
@@ -40,27 +55,32 @@ continuation in the offline phases (§10.4), audit.
 cargo test
 ```
 
-Runs 9 unit tests and 19 integration tests: end-to-end 2-of-3 and 3-of-5
+Runs 14 unit tests and 28 integration tests: end-to-end 2-of-3 and 3-of-5
 signatures verified by `k256`'s ECDSA verifier, subset signing with only
 `T` parties, cheater identification in keygen (both §6.1 complaint
 branches), triples, presign, and sign, robust signing with up to `T−1`
-cheaters, presignature single-use enforcement, HD-tweak signing, and
-batched triple/presignature generation.
+cheaters, robust presign/triples continuation with correct blame (§10.4),
+expel-and-restart after dealing-phase aborts (§10.3, 3-of-6) including
+zero-slack refusal, presignature single-use enforcement, HD-tweak signing,
+batched triple/presignature generation, and keygen executed through the
+explicit transport seam (`transport::drive_dkg` over `SimTransport`).
 
 ## Layout
 
 | Module | SPEC § | Contents |
 |---|---|---|
-| `shamir` | 4.1 | Shamir sharing, Lagrange interpolation |
+| `shamir` | 4.1 | Shamir sharing, Lagrange interpolation (at 0 and at arbitrary points) |
 | `vss` | 4.2 | Feldman commitments, homomorphic commitment ops |
 | `dleq` | 4.4 | Chaum–Pedersen DLEQ (triple product proofs) |
 | `open` | 4.6, 10.4 | verified-opening subprotocol (structural identifiable abort), robust variant |
-| `dkg` | 6, 6.1, 7.3 | commit-reveal DKG (message-oriented), complaint arbitration, batch VSS |
-| `triples` | 7, 7.3 | triple factory (joint random + degree reduction), batched |
-| `presign` | 8, 8.5 | presignatures, tweak derivation, tamper hooks, batched |
+| `dkg` | 6, 6.1, 7.3 | commit-reveal DKG (message-oriented), complaint arbitration, batch VSS, committee support (§10.3 restarts) |
+| `triples` | 7, 7.3, 10.4 | triple factory (joint random + degree reduction), robust reconstruction of a cheater's re-sharing polynomial, batched, `*_with_committee` variants |
+| `presign` | 8, 8.5, 10.4 | presignatures, tweak derivation, tamper hooks, robust continuation, batched, `*_with_committee` variants |
 | `sign` | 9, 10.4 | share computation, verified combine, robust combine |
 | `store` | 8.6 | single-use presignature store (atomic consume) |
-| `sim` | 4.7, 13.2 | reference orchestrator (models broadcast) |
+| `policy` | 10.3 | `restart_committee` — expel-and-restart committee computation (never lowers `t`) |
+| `transport` | 4.7, 10.2, 13.1, 13.2 | transport seam: `Envelope` message contract, sync `Transport` trait, `SimTransport` reference impl, `drive_dkg` transport-driven keygen driver |
+| `sim` | 4.7, 10.3, 13.2 | reference orchestrator (keygen routes through the `transport` seam), §10.3 restart wrappers |
 
 ## Usage
 

@@ -41,6 +41,11 @@ impl ShamirPoly {
 
 /// Lagrange coefficients for interpolation at `x = 0` over `parties`.
 pub fn lagrange_coeffs(parties: &[PartyId]) -> Vec<Scalar> {
+    lagrange_coeffs_at(&Scalar::ZERO, parties)
+}
+
+/// Lagrange coefficients for interpolation at `x` over `parties`.
+pub fn lagrange_coeffs_at(x: &Scalar, parties: &[PartyId]) -> Vec<Scalar> {
     let mut out = Vec::with_capacity(parties.len());
     for (i, &pi) in parties.iter().enumerate() {
         let xi = Scalar::from(pi as u64);
@@ -51,8 +56,8 @@ pub fn lagrange_coeffs(parties: &[PartyId]) -> Vec<Scalar> {
                 continue;
             }
             let xk = Scalar::from(pk as u64);
-            num *= xk;
-            den *= xk - xi;
+            num *= *x - xk;
+            den *= xi - xk;
         }
         let den_inv = Option::<Scalar>::from(den.invert()).expect("party indices must be distinct");
         out.push(num * den_inv);
@@ -62,8 +67,13 @@ pub fn lagrange_coeffs(parties: &[PartyId]) -> Vec<Scalar> {
 
 /// Interpolate `p(0)` from `shares` held at `parties` (same order).
 pub fn interpolate_at_zero(parties: &[PartyId], shares: &[Scalar]) -> Scalar {
+    interpolate_at(&Scalar::ZERO, parties, shares)
+}
+
+/// Interpolate `p(x)` from `shares` held at `parties` (same order).
+pub fn interpolate_at(x: &Scalar, parties: &[PartyId], shares: &[Scalar]) -> Scalar {
     debug_assert_eq!(parties.len(), shares.len());
-    let lambdas = lagrange_coeffs(parties);
+    let lambdas = lagrange_coeffs_at(x, parties);
     let mut acc = Scalar::ZERO;
     for (l, s) in lambdas.iter().zip(shares.iter()) {
         acc += *l * *s;
@@ -76,6 +86,22 @@ mod tests {
     use super::*;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+
+    #[test]
+    fn interpolate_at_arbitrary_point() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let secret = Scalar::random(&mut rng);
+        let poly = ShamirPoly::random(secret, 2, &mut rng);
+        let parties: Vec<PartyId> = vec![1, 3];
+        let shares: Vec<Scalar> = parties.iter().map(|&p| poly.eval(p)).collect();
+        // Reconstructing at another party's point reproduces its share
+        // (used by the §10.4 public reconstruction of a cheater's poly).
+        assert_eq!(
+            interpolate_at(&Scalar::from(2u64), &parties, &shares),
+            poly.eval(2)
+        );
+        assert_eq!(interpolate_at_zero(&parties, &shares), secret);
+    }
 
     #[test]
     fn share_and_reconstruct() {

@@ -10,6 +10,7 @@ use ohm_ecdsa::dkg::DkgTamper;
 use ohm_ecdsa::open::open;
 use ohm_ecdsa::presign::{KeyShare, PresignTamper};
 use ohm_ecdsa::sim;
+use ohm_ecdsa::transport::{self, SimTransport};
 use ohm_ecdsa::triples::{self, TripleShare, TripleTamper};
 use ohm_ecdsa::vss::FeldmanCommitment;
 use ohm_ecdsa::{Error, Params, PartyId, Phase, PresigStore};
@@ -78,6 +79,7 @@ fn presign_cheater_is_identified() {
     // Party 3 broadcasts a wrong nonce point R_3.
     let tamper = PresignTamper {
         bad_nonce_point: Some(3),
+        ..Default::default()
     };
     let err = sim::run_presign(&params, &keys, 1, &mut rngs, Some(&tamper)).unwrap_err();
     match err {
@@ -346,6 +348,7 @@ fn batch_presign_cheater_is_identified() {
     // Party 3 broadcasts a wrong nonce point R_3 (batch item 0).
     let tamper = PresignTamper {
         bad_nonce_point: Some(3),
+        ..Default::default()
     };
     let err =
         sim::run_presign_batch(&params, &keys, &[1, 2, 3], &mut rngs, Some(&tamper)).unwrap_err();
@@ -356,4 +359,225 @@ fn batch_presign_cheater_is_identified() {
         }
         other => panic!("expected identifiable abort, got {other:?}"),
     }
+}
+
+#[test]
+fn robust_presign_bad_open_share_completes() {
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 23);
+    let keys = sim::run_keygen(&params, b"key/23", &mut rngs).unwrap();
+    // Party 2 broadcasts a wrong opening share in the P2 v opening.
+    let tamper = PresignTamper {
+        bad_open_share: Some(2),
+        ..Default::default()
+    };
+    let (presigs, blamed) =
+        sim::run_presign_robust(&params, &keys, 1, &mut rngs, Some(&tamper)).unwrap();
+    assert_eq!(blamed, vec![2]);
+    assert_eq!(presigs.len(), 2);
+    assert!(presigs.iter().all(|p| p.index != 2));
+    let msg = b"robust presign, bad v-opening share";
+    let sig = sim::run_sign(&params, &presigs, msg, None).unwrap();
+    assert_valid(&pubkey(&keys), msg, &sig);
+}
+
+#[test]
+fn robust_presign_bad_nonce_point_completes() {
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 24);
+    let keys = sim::run_keygen(&params, b"key/24", &mut rngs).unwrap();
+    // Party 3 broadcasts a wrong nonce point R_3 (P3).
+    let tamper = PresignTamper {
+        bad_nonce_point: Some(3),
+        ..Default::default()
+    };
+    let (presigs, blamed) =
+        sim::run_presign_robust(&params, &keys, 1, &mut rngs, Some(&tamper)).unwrap();
+    assert_eq!(blamed, vec![3]);
+    assert_eq!(presigs.len(), 2);
+    assert!(presigs.iter().all(|p| p.index != 3));
+    let msg = b"robust presign, bad nonce point";
+    let sig = sim::run_sign(&params, &presigs, msg, None).unwrap();
+    assert_valid(&pubkey(&keys), msg, &sig);
+}
+
+#[test]
+fn robust_triples_bad_reshare_recovers() {
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 25);
+    // Dealer 2 re-shares a wrong share to party 3 (T2); the honest
+    // majority publicly reconstructs g_2 and continues (§10.4).
+    let tamper = TripleTamper {
+        bad_reshare: Some((2, 3)),
+        ..Default::default()
+    };
+    let (triple, blamed) =
+        triples::generate_robust(&params, b"triple/25", &mut rngs, Some(&tamper)).unwrap();
+    assert_eq!(blamed, vec![2]);
+    assert_eq!(triple.len(), 2);
+    let pubc = &triple[0].1;
+    let open_of = |pick: fn(&TripleShare) -> Scalar, com: &FeldmanCommitment| {
+        let shares: BTreeMap<PartyId, Scalar> =
+            triple.iter().map(|(s, _)| (s.index, pick(s))).collect();
+        open(params.t, com, &shares, Phase::Triples).unwrap()
+    };
+    let a = open_of(|s| s.a, &pubc.ca);
+    let b_ = open_of(|s| s.b, &pubc.cb);
+    let c = open_of(|s| s.c, &pubc.cc);
+    assert_eq!(c, a * b_);
+}
+
+#[test]
+fn robust_triples_bad_product_proof_aborts() {
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 26);
+    // F3: the dealer's C_j commits to a wrong product — reconstruction
+    // would recover a wrong-but-committed polynomial, so continuation is
+    // impossible even on the robust path.
+    let tamper = TripleTamper {
+        bad_product_proof: Some(1),
+        ..Default::default()
+    };
+    let err =
+        triples::generate_robust(&params, b"triple/26", &mut rngs, Some(&tamper)).unwrap_err();
+    match err {
+        Error::Abort { abort } => {
+            assert_eq!(abort.phase, Phase::Triples);
+            assert_eq!(abort.blamed, vec![1]);
+        }
+        other => panic!("expected identifiable abort, got {other:?}"),
+    }
+}
+
+#[test]
+fn presign_restart_expels_cheater_and_recovers() {
+    // 3-of-6: one slack, so one expulsion still leaves n′ = 5 ≥ 2t−1.
+    let params = Params::new(6, 3).unwrap();
+    let mut rngs = sim::make_rngs(6, 30);
+    let keys = sim::run_keygen(&params, b"key/30", &mut rngs).unwrap();
+    // Dealing-phase fault (F2): party 2 re-shares a wrong share in the
+    // first triple session — the fail-fast presign aborts.
+    let tamper = PresignTamper {
+        triple_tamper: Some(TripleTamper {
+            bad_reshare: Some((2, 3)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let (presigs, blamed, used_id) =
+        sim::run_presign_with_restart(&params, &keys, 41, &mut rngs, Some(&tamper)).unwrap();
+    assert_eq!(blamed, vec![2]);
+    assert_eq!(used_id, 42, "the aborted id 41 must be poisoned (§10.3(2))");
+    assert_eq!(presigs.len(), 5);
+    assert!(presigs.iter().all(|p| p.id == used_id));
+    // The survivors keep their ORIGINAL ids — the evaluation points of
+    // their long-term key shares.
+    let ids: Vec<PartyId> = presigs.iter().map(|p| p.index).collect();
+    assert_eq!(ids, vec![1, 3, 4, 5, 6]);
+    let msg = b"expel-and-restart presign, 3-of-6";
+    let sig = sim::run_sign(&params, &presigs, msg, None).unwrap();
+    assert_valid(&pubkey(&keys), msg, &sig);
+}
+
+#[test]
+fn presign_restart_refused_without_slack() {
+    // 2-of-3 (n = 2t−1, zero slack): the same dealing-phase abort leaves
+    // n′ = 2 < 2t−1, so the restart is refused and the original abort is
+    // propagated — t is never silently lowered (§13.4 territory).
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 31);
+    let keys = sim::run_keygen(&params, b"key/31", &mut rngs).unwrap();
+    let tamper = PresignTamper {
+        triple_tamper: Some(TripleTamper {
+            bad_reshare: Some((2, 3)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let err =
+        sim::run_presign_with_restart(&params, &keys, 1, &mut rngs, Some(&tamper)).unwrap_err();
+    match err {
+        Error::Abort { abort } => {
+            // The F2 fault fires inside the presign instance's triple
+            // session, so the abort carries the Triples phase.
+            assert_eq!(abort.phase, Phase::Triples);
+            assert_eq!(abort.blamed, vec![2]);
+        }
+        other => panic!("expected the original identifiable abort, got {other:?}"),
+    }
+}
+
+#[test]
+fn keygen_restart_expels_cheater_and_recovers() {
+    // 3-of-6 with a cheating dealer: the first attempt aborts blaming 2,
+    // the restart completes over the 5 survivors (renumbered 1..=5 — a
+    // fresh keygen has no long-term shares to preserve).
+    let params = Params::new(6, 3).unwrap();
+    let mut rngs = sim::make_rngs(6, 32);
+    let tamper = DkgTamper {
+        bad_deal: Some((2, 1)),
+        ..Default::default()
+    };
+    let (keys, blamed) =
+        sim::run_keygen_with_restart(&params, b"key/32", &mut rngs, Some(&tamper)).unwrap();
+    assert_eq!(blamed, vec![2]);
+    assert_eq!(keys.len(), 5);
+    assert!(keys.iter().enumerate().all(|(k, key)| key.index == k + 1));
+    // The resulting key signs end-to-end at n′ = 5, t = 3.
+    let params5 = Params::new(5, 3).unwrap();
+    let presigs = sim::run_presign(&params5, &keys, 1, &mut rngs, None).unwrap();
+    let msg = b"expel-and-restart keygen, 3-of-6";
+    let sig = sim::run_sign(&params5, &presigs, msg, None).unwrap();
+    assert_valid(&pubkey(&keys), msg, &sig);
+}
+
+#[test]
+fn triples_restart_expels_cheater_and_recovers() {
+    // 3-of-6 with an F3 fault (bad DLEQ product proof) — not continuable
+    // even on the §10.4 robust path, so the §10.3 restart handles it.
+    let params = Params::new(6, 3).unwrap();
+    let mut rngs = sim::make_rngs(6, 33);
+    let tamper = TripleTamper {
+        bad_product_proof: Some(4),
+        ..Default::default()
+    };
+    let (triple, blamed) =
+        sim::run_triples_with_restart(&params, b"triple/33", &mut rngs, Some(&tamper)).unwrap();
+    assert_eq!(blamed, vec![4]);
+    assert_eq!(triple.len(), 5);
+    // The restarted triple (over the renumbered 1..=5) is multiplicative.
+    let params5 = Params::new(5, 3).unwrap();
+    let pubc = &triple[0].1;
+    let open_of = |pick: fn(&TripleShare) -> Scalar, com: &FeldmanCommitment| {
+        let shares: BTreeMap<PartyId, Scalar> =
+            triple.iter().map(|(s, _)| (s.index, pick(s))).collect();
+        open(params5.t, com, &shares, Phase::Triples).unwrap()
+    };
+    let a = open_of(|s| s.a, &pubc.ca);
+    let b_ = open_of(|s| s.b, &pubc.cb);
+    let c = open_of(|s| s.c, &pubc.cc);
+    assert_eq!(c, a * b_);
+}
+
+#[test]
+fn keygen_via_transport_driver_signs_end_to_end() {
+    // Keygen driven explicitly through the transport seam (§13.2): the
+    // accepted sets come from SimTransport, not from sim's hand delivery.
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 77);
+    let mut transport = SimTransport::new();
+    let keys = transport::drive_dkg(
+        &params,
+        b"key/transport",
+        b"e2e/dkg-commit",
+        Phase::KeyGen,
+        &mut rngs,
+        &mut transport,
+        None,
+    )
+    .unwrap();
+    let presigs = sim::run_presign(&params, &keys, 1, &mut rngs, None).unwrap();
+    let msg = b"keygen through the transport seam, 2-of-3";
+    let sig = sim::run_sign(&params, &presigs, msg, None).unwrap();
+    assert_valid(&pubkey(&keys), msg, &sig);
 }
