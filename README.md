@@ -12,6 +12,55 @@ triples + commit-reveal DKG. The full protocol is specified in
 [`SPEC.md`](./SPEC.md), including the patent design-around analysis
 (US 11,757,657 / Sepior and KU23 / Dfns; §12).
 
+## How it works
+
+Heavy cryptography runs **offline**, in bulk, ahead of time. When a
+message arrives, signing is **one broadcast round** of local arithmetic:
+
+```mermaid
+flowchart LR
+    subgraph once["One-time setup"]
+        KG["KeyGen §6<br/>commit-reveal DKG<br/>→ key shares [x], public key X"]
+    end
+    subgraph off["Offline factories — run ahead, in bulk"]
+        TF["Triple factory §7<br/>Beaver triples<br/>(batched / packed)"]
+        PF["Presign factory §8<br/>2 triples → presignature<br/>([k⁻¹], [k⁻¹x], R, r)"]
+    end
+    subgraph on["Online — per message"]
+        SG["Sign §9<br/>ONE broadcast round"]
+        OUT["(r, s)<br/>ordinary ECDSA signature"]
+    end
+    KG --> PF
+    TF --> PF
+    PF --> SG
+    SG --> OUT
+    SG -. "any wrong share:<br/>cheater identified by<br/>point equality §10" .-> AB["blame +<br/>still deliver §10.4"]
+```
+
+A 2-of-3 wallet story (any 2 of 3 parties can sign; no single party
+learns anything alone):
+
+```mermaid
+sequenceDiagram
+    participant P as 📱 Phone
+    participant S as ☁️ Service
+    participant R as 🏦 Recovery
+    Note over P,R: Offline: presignature pool already stocked
+    P->>S: sign "send 0.1 BTC" with presig #42
+    S->>P: OK — go (one round)
+    Note over P: s₁ = m·u₁ + r·z₁  (local math)
+    Note over S: s₂ = m·u₂ + r·z₂  (local math)
+    P->>S: s₁
+    S->>P: s₂
+    Note over P,S: each share verified against public<br/>commitments → s = λ₁s₁ + λ₂s₂ → (r, s)<br/>presig #42 consumed — never reusable
+    Note over R: not needed — any 2 of 3 suffice.<br/>Lost phone? recover with R + S.
+```
+
+If either party broadcasts a wrong share, point-equality against the
+public Feldman commitments fails and names the cheater — no proof
+systems, no trusted hardware. Full diagrams per phase:
+[`SPEC.md`](./SPEC.md) §5, §6, §8, §9.
+
 ## Why this is useful
 
 The two practical honest-majority threshold-ECDSA protocols are
