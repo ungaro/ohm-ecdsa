@@ -1,0 +1,222 @@
+% OHM-ECDSA whitepaper — IACR ePrint draft
+% Self-contained: standard article class, no external class files needed.
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{stmaryrd}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xurl}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{conjecture}{Security Statement}
+\theoremstyle{remark}
+\newtheorem*{remark}{Remark}
+
+% Notation
+\newcommand{\Fq}{\mathbb{F}_q}
+\newcommand{\GG}{\mathbb{G}}
+\newcommand{\share}[1]{[#1]}
+\newcommand{\oshare}[1]{\llbracket #1 \rrbracket}
+\newcommand{\EvalCom}{\mathrm{EvalCom}}
+\newcommand{\sid}{\mathrm{sid}}
+
+\title{\textbf{OHM-ECDSA: Open Honest-Majority Threshold ECDSA\\from Public-Domain Components}}
+\author{ungaro\thanks{Project page, reference implementation, and full specification: \url{https://github.com/ungaro/ohm-ecdsa}.}}
+\date{Draft v0.2 --- \today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present OHM-ECDSA, a threshold signing protocol for ECDSA over secp256k1 (and generic prime-order groups) in the honest-majority setting ($n \geq 2T{-}1$, up to $T{-}1$ malicious parties), assembled exclusively from public-domain building blocks published between 1989 and 2007 --- Shamir sharing, Feldman VSS, commit-then-reveal Pedersen DKG, Beaver triples, and Chaum--Pedersen DLEQ proofs --- together with openly published presignature algebra (Groth--Shoup 2021, Katz 2023). The online signing phase is a single broadcast round. Every broadcast value is verified against public Feldman commitments by pure point equality, giving identifiable abort at every step with \emph{unconditional} detection --- no zero-knowledge range proofs, no homomorphic encryption, no oblivious transfer, no class groups; no NIZK proofs are needed for any share opening (the only proofs in the protocol are classical Chaum--Pedersen DLEQ proofs in triple generation). The construction is designed to practice no element of US Patent 11,757,657 (Sepior/Blockdaemon, covering DJNPO20) and to differ materially from the KU23 key-independent presignature pipeline (Dfns); we give an element-by-element claim chart and publish this work as defensive prior art. We provide a complete reference implementation (Rust), a companion networking crate running the full protocol between OS processes over TCP with signed messages and echo broadcast, and measurements: one-round online signing at 0.28\,ms local compute (0.7\,ms over a real mesh, RTT-bound at $\sim$2 link delays under WAN simulation), offline presignature generation at 5--10\,ms per unit, and 1.4--1.8$\times$ throughput gains from packed (Franklin--Yung) sharing. Unlike the encumbered protocols, OHM-ECDSA additionally identifies cheaters unconditionally and optionally guarantees output delivery.
+\end{abstract}
+
+\paragraph{Keywords.} threshold signatures, ECDSA, honest majority, identifiable abort, Beaver triples, Feldman VSS, patent design-around.
+
+\section{Introduction}
+
+\subsection{The patent situation}
+
+Threshold ECDSA deployments fall into two regimes. The dishonest-majority regime (GG18/GG20, DKLs, CGGMP) tolerates $T{-}1$ corruptions out of $T$ signers at the cost of heavy machinery --- Paillier-based multiplicative-to-additive conversion, range proofs, or OT --- much of it patent-encumbered. The honest-majority regime ($n \geq 2T{-}1$), the natural model for key-management networks where a fixed vetted committee shares keys on behalf of clients, replaces that machinery with information-theoretic arithmetic MPC; the concept is thirty-year-old public art (Gennaro--Jarecki--Krawczyk--Rabin, 1996).
+
+Two modern refinements made honest-majority threshold ECDSA practical --- and both are encumbered. DJNPO20 (``Fast Threshold ECDSA with Honest Majority'') ``appears covered by US Patent 11,757,657 assigned to Sepior ApS'' (Katz, NIST MPTS 2023); Sepior has since been renamed Blockdaemon. KU23 (``Honest-Majority Threshold ECDSA with Batch Generation of Key-Independent Presignatures'') is described by its authors' employer Dfns as ``this patented protocol.''
+
+There is an irony here that motivates this work. ECDSA itself exists because Schnorr signatures were patented (US 4,995,082): NIST standardized DSA/ECDSA as the unencumbered workaround, and the workaround outlived the patent (expired 2008) to become the world's signature scheme. A signature scheme born as a patent design-around now has its threshold evolution patented --- including claim elements built from the 1989--1996 public literature that the patent's own background cites.
+
+\subsection{Contributions}
+
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{An open construction (Section~\ref{sec:construction}).} A complete honest-majority threshold ECDSA protocol --- key generation, triple factory, presignature factory, one-round online signing --- using only public-domain components, engineered so that the claim elements of US 11,757,657 simply never occur: the inverse $\share{k^{-1}}$ is \emph{dealt directly} as a random sharing rather than computed by the patented masked-product inversion $\share{a}\cdot w^{-1}$; all products use Beaver triples with verified masked openings rather than the claimed zero-sharing blinding; and correctness is ensured by point equality against public Feldman commitments rather than the claimed honest-share-counting procedure.
+\item \textbf{Unconditional identifiability (Section~\ref{sec:abort}).} Because every check is a point equality against a public commitment --- which has exactly one passing scalar per position --- every deviation is detected with probability~1 and attributed to its sender. Neither DJNPO20 nor KU23 identifies cheaters; both detect aborts without blame. OHM-ECDSA additionally offers optional robustness (guaranteed output delivery) at no extra offline cost.
+\item \textbf{A security statement and proof skeleton (Section~\ref{sec:security}).} We state the intended theorem and give a game-based proof outline with the two remaining gaps precisely identified (rushing-adversary DKG extraction; the Feldman-hiding hybrid).
+\item \textbf{A patent design-around analysis (Section~\ref{sec:patent}).} An element-by-element claim chart against the verbatim granted text of US 11,757,657 claim~1, a distinction from KU23, and a prior-art wall. This document is itself a defensive publication.
+\item \textbf{A complete implementation and evaluation (Section~\ref{sec:impl}).} A dependency-pure Rust reference implementation of every protocol feature, plus a companion networking crate executing the full protocol between separate OS processes over TCP with per-message signatures and echo broadcast --- with blame tokens verifiable offline by a third party.
+\end{enumerate}
+
+\subsection{Related work}
+
+GJKR96 established robust threshold DSS with identifiable abort in the honest-majority setting; GJKR07 fixed the rushing attack on Pedersen DKG via commit-then-reveal. Beaver (1991) gave multiplication triples; Chaum--Pedersen (1992) the DLEQ proof; Franklin--Yung (1992) packed sharing; Bar-Ilan--Beaver (1989) constant-round arithmetic MPC with inverses. DJNPO20 and KU23 are the encumbered modern refinements discussed above. Groth--Shoup (2021) formalized ECDSA with presignatures and additive key derivation --- our presignature layout and HD-tweak compatibility follow that model. Katz (NIST MPTS 2023) sketched the direct generation of $\share{k^{-1}}$ as a design-around for US 11,757,657; we adopt and complete that approach. cait-sith (NEAR, Apache-2.0) is an independent sibling implementation with key-independent presignatures but without identifiable abort. Robustness in threshold ECDSA requires an honest majority (Gagol et al., NDSS 2024) --- matching our setting.
+
+\section{Preliminaries}\label{sec:prelim}
+
+\paragraph{Setting.} $n$ servers $P_1,\dots,P_n$, threshold $T$, $n \geq 2T{-}1$; a static malicious adversary controlling up to $T{-}1$ servers; authenticated point-to-point channels and echo broadcast (the sender sends to all, receivers echo, and a value is accepted on a majority of consistent echoes --- giving consistency and validity under honest majority). Parties are evaluation points $1..n$; point $0$ is reserved for the secret. $\GG$ is a prime-order group (secp256k1) of order $q$ with generator $G$; $\Fq$ is its scalar field.
+
+\paragraph{Components (all 1989--2007).} Shamir sharing $\share{v}$ (degree $T{-}1$; party $j$ holds $p(j)$); Feldman commitments $A\share{v} = (a_0 G, \dots, a_{T-1} G)$ with share verification $v_j \cdot G == \sum_\ell j^\ell \cdot A_\ell := \EvalCom(A\share{v}, j)$; commit-then-reveal dealing (anti-rushing); Beaver triples $(\share{\alpha}, \share{\beta}, \share{\gamma})$ with $\gamma = \alpha\beta$, and the masked-opening multiplication: open $\delta = x - \alpha$, $\varepsilon = y - \beta$, then $\share{xy} = \share{\gamma} + \delta\share{\beta} + \varepsilon\share{\alpha} + \delta\varepsilon$; Chaum--Pedersen DLEQ proofs for product commitments. $H$ hashes to a scalar (ROM); $F(R)$ is the ECDSA $x$-coordinate extraction. A sharing together with its commitment is written $\oshare{v}$ (``openable'').
+
+\paragraph{Verified opening.} $\mathrm{Open}(\oshare{v}, S)$: parties broadcast shares; each receiver checks point equality against $A\share{v}$ and interpolates from the first $T$ valid shares; any failing sender is blamed. All openings in OHM-ECDSA go through $\mathrm{Open}$ --- identifiable abort is structural, not an add-on.
+
+\section{The Construction}\label{sec:construction}
+
+\subsection{Key generation (commit-reveal Pedersen DKG)}
+
+Three rounds. \textbf{R1:} each $P_i$ commits $h_i = H(\sid \,\|\, i \,\|\, A_i)$ to its Feldman commitment vector. \textbf{R2:} each reveals $A_i$ and delivers shares over the authenticated channel. \textbf{R3:} hash and share checks; failures trigger a public complaint round in which the dealer's defense share decides dealer-vs-accuser blame. Output: $x_j = \sum_i s_{i,j}$, $A\share{x} = \sum_i A_i$, $X = \sum_i A_{i,0}$; the secret $x$ exists nowhere. Commit-reveal is what makes the joint key uniform against a rushing adversary --- and nonce uniformity is security-critical for ECDSA: any bias in $k$ across signatures is exploitable by lattice key-recovery attacks.
+
+\subsection{Triple factory}
+
+Jointly generate random $\oshare{\alpha}, \oshare{\beta}$ (two ephemeral commit-reveal VSS instances), then compute $\share{\gamma} = \share{\alpha\beta}$ by local products plus \emph{verifiable degree reduction}: each $P_j$ re-shares its product $\alpha_j\beta_j$ with a fresh degree-$(T{-}1)$ polynomial $g_j$ and broadcasts $\mathrm{FeldCommit}(g_j)$ together with one DLEQ proof that $g_j(0) = \alpha_j\beta_j$ against the committed shares; the result combines with Lagrange weights: $\share{\gamma} = \sum_j \lambda_j \share{g_j}$. Correctness follows since $n \geq 2T{-}1$ points determine the degree-$(2T{-}2)$ product polynomial at 0. Batching (one commit-reveal covering the whole batch, constant rounds in $B$) and packed generation (Franklin--Yung: $B$ secrets in one degree-$(T{+}B{-}2)$ polynomial, one product proof per party, $O(n^2)$ traffic for $B$ triples, requiring $n \geq 2T + 2B - 3$) are implemented variants.
+
+\subsection{Presignatures (key-dependent)}\label{sec:presign}
+
+Per presignature: deal $\oshare{u}$ and $\oshare{a}$ jointly; \textbf{$u$ \emph{is} $k^{-1}$ by definition} --- the inverse is generated directly, never computed (the Katz design-around). Open the Beaver product $v = a \cdot u$; set $\oshare{k} := v^{-1}\oshare{a}$, so $k = u^{-1}$ consistently. Nonce point: each party broadcasts $R_j = k_j \cdot G$, checked by $R_j == \EvalCom(A\share{k}, j)$ --- point equality, no proofs; $R = \sum_j \lambda_j R_j$, $r = F(R)$. Bind to the key with a second triple: open $\delta' = u - \alpha'$, $\varepsilon' = x - \beta'$ (the key masked by fresh uniform $\beta'$), then $\oshare{z} = \oshare{\gamma'} + \delta'\oshare{\beta'} + \varepsilon'\oshare{\alpha'} + \delta'\varepsilon' = \share{k^{-1}x}$. Store $(\mathrm{id}, r, R, \share{u}, \share{z})$ --- single-use and key-equivalent ($T$ shares of one record reveal $x$); the reference store enforces atomic consume.
+
+\subsection{Signing (one round)}\label{sec:sign}
+
+Each party computes $s_j = m \cdot u_j + r \cdot z_j$ locally and broadcasts it; every share is verified against $m \cdot A\share{u} + r \cdot A\share{z}$ by point equality (blame on mismatch); interpolate $s = \sum_{j \in S} \lambda_j^S s_j$ from the first $T$ valid shares; ECDSA-verify as defense in depth; normalize low-$s$; consume the id. Online cost per party: two scalar multiplications and share verification --- sub-millisecond. Correctness is immediate: $s = m u + r z = k^{-1}(m + r x)$.
+
+\subsection{Extensions (implemented)}\label{sec:extensions}
+
+\begin{itemize}[leftmargin=1.6em]
+\item \textbf{Robustness (guaranteed output delivery).} Bad shares are filtered and blamed; the honest majority finishes from the publicly committed values --- online (filter-and-interpolate), offline openings (same), and triples (public reconstruction of the cheater's committed re-sharing polynomial --- exclusion alone is impossible since $n - f$ can fall below the $2T{-}1$ product points needed).
+\item \textbf{Expel-and-restart.} Dealing-phase faults: blamed parties are removed and the instance restarts over the survivors if $n' \geq 2T{-}1$ (never lowering $T$); the aborted presignature id is poisoned. At minimal committees ($n = 2T{-}1$) expulsion forces re-sharing, which the next item provides.
+\item \textbf{Committee maintenance.} Proactive refresh (zero-constant re-sharing; $X$ unchanged; shares from different epochs do not combine) and committee change (re-sharing to a new committee with public old-share binding $C_j[0] == \EvalCom(A\share{x}, j)$).
+\item \textbf{HD key derivation.} For public tweak $\tau$: $z'_j = z_j + \tau \cdot u_j$, $X' = X + \tau \cdot G$ --- local, non-interactive, per the Groth--Shoup model. One presignature pool serves an entire BIP32-style tree.
+\item \textbf{Key-independent mode (optional).} Pool records omit $\share{z}$; the binding moves online (two rounds, one triple --- never degree-$(2T{-}2)$ local products, which are the patented machinery). One pool serves any key; unbound records are not key-equivalent. Patent posture in Section~\ref{sec:patent}.
+\end{itemize}
+
+\section{Identifiable Abort}\label{sec:abort}
+
+Every broadcast value is one of: a hash that must match a later reveal, a share that must satisfy point equality against a public commitment, a DLEQ proof that must verify, or the final signature that must ECDSA-verify. Two facts make attribution unconditional rather than cryptographic:
+
+\begin{proposition}[Unconditional detection]\label{prop:detection}
+A Feldman commitment vector $A\share{v} = (A_0,\dots,A_{T-1})$ fixes each coefficient's point, and scalars map injectively to points. Hence the check $v_j \cdot G == \EvalCom(A\share{v}, j)$ has \emph{exactly one} passing scalar per position $j$: a wrong share fails with probability~1, with no computational assumption. (Contrast Pedersen-style two-generator commitments, where binding is computational; here only \emph{hiding} is computational.)
+\end{proposition}
+
+\begin{proposition}[Binding attribution]
+Each dealer is tied to its commitment vector by the R1 hash commit (binding of $H$ in the ROM) and each message by its sender's signature; the complaint defense is publicly verifiable point equality. Blame evidence (the offending signed message plus the public commitment, a ``blame token'') is therefore verifiable offline by any third party.
+\end{proposition}
+
+All abort decisions depend only on public verification outcomes, and every opened value is one-time-padded by a fresh uniform mask --- so aborts leak nothing about $x$, $u$, $z$, or future presignatures. Contrast US 11,757,657's correctness procedure, which checks consistency \emph{among} shares and, in its own three-party example, ``can not determine which of the parties is dishonest.''
+
+\section{Security Statement and Proof Skeleton}\label{sec:security}
+
+\begin{conjecture}\label{conj:main}
+In the random-oracle model, under ECDLP in $\GG$, OHM-ECDSA securely realizes the threshold-ECDSA functionality $\mathcal{F}_{\mathrm{TECDSA}}$ against a static malicious adversary corrupting at most $T{-}1$ of $n \geq 2T{-}1$ servers, with identifiable abort --- conditioned on the presignature-consumption invariant (single-use, key-bound, securely erased).
+\end{conjecture}
+
+\paragraph{Claims.}
+\textbf{C1 (correctness).} Honest execution outputs $(r,s)$ with $s = k^{-1}(H(M) + rx)$: the invariant chain $v = a u \Rightarrow k = u^{-1}$, $z = u x$, $s = m u + r z$, each step linearity given verified openings.
+\textbf{C2 (privacy).} The adversary's view is simulatable from $X$, public presignature data, and legitimately issued signatures (simulator below).
+\textbf{C3 (soundness/identifiability).} Unconditional, by Proposition~\ref{prop:detection}.
+\textbf{C4 (nonce uniformity).} Commit-reveal plus at least one honest dealer makes every joint secret uniform even against rushing adversaries; inversion is a bijection on $\Fq^*$, so uniform $u \Rightarrow$ uniform $k = u^{-1}$; the $v = 0$ restart rejects a $1/q$ fraction and does not bias $u$.
+\textbf{C5 (unforgeability).} A forgery with fewer than $T$ signing queries for that message reduces to ECDSA unforgeability in the Groth--Shoup presignature model.
+\textbf{C6 (robustness, optional).} After blaming $f \leq T{-}1$ cheaters, $n - f \geq T$ honest parties finish from publicly committed values.
+
+\paragraph{Proof skeleton (game-based).}
+\textbf{G0 (real).} Forgery is the only live winning condition: soundness-break and framing are impossible outright by C3.
+\textbf{G1 (program the DKG).} The simulator programs the commit-reveal so the joint public key is the challenge $X$ (\emph{gap L1}: extraction against a rushing adversary --- the GJKR caveat; requires an extractable commitment or RO rewinding).
+\textbf{G2 (program every joint VSS)} likewise; fresh $\sid$s keep instances independent.
+\textbf{G3 (simulate DLEQ proofs)} via RO programming, $O(q_H^2/q)$ total.
+\textbf{G4 (program the openings)} using:
+
+\begin{lemma}[Freedom counting, sketch]\label{lem:freedom}
+For each degree-$(T{-}1)$ sharing, the adversary's $T{-}1$ shares plus one prescribed value (an opening, or $X$ at point $0$) leave exactly one consistent honest contribution; commitment vectors are programmed in the exponent to match. Hence the simulation of every masked opening is exact (statistical), not computational.
+\end{lemma}
+
+\noindent The only computational residue is Feldman \emph{hiding} of never-opened values (\emph{gap L2}: an ECDLP/OMDL hybrid, or AGM following Groth--Shoup).
+\textbf{G5 (sign from the oracle).} Sign queries are answered via the Groth--Shoup presignature-model oracle; honest $s_j$ are computed by Lagrange through $(0, s)$ and the adversary's shares, consistent with $A\share{s} = m A\share{u} + r A\share{z}$ by construction.
+\textbf{Extraction.} A forgery in the final game is a model forgery:
+\[
+\mathrm{Adv}_{\mathrm{OHM}}(\mathcal{A}) \;\leq\; \mathrm{Adv}_{\mathrm{GS\text{-}EUF}}(\mathcal{F}) \;+\; O(q_H^2/q) \;+\; \varepsilon_{L1} \;+\; \varepsilon_{L2}.
+\]
+Closing L1/L2 and a rigorous composition statement are the remaining work toward a full proof.
+
+\section{Patent Design-Around}\label{sec:patent}
+
+\paragraph{US 11,757,657 (Sepior $\to$ Blockdaemon).} The granted claim~1 is a conjunctive combination (quoted verbatim and mapped element-by-element in the specification): $\share{w} = \share{a}\share{k}$; $R = g^k$ ensured correct ``from at least $t{+}1$ shares originating from honest parties''; authenticator $W = R^a$ with its own check; $g^w == W$; and signing via $\share{k^{-1}} = \share{a}\cdot w^{-1}$, $\share{x k^{-1}}$, and $\share{s} = m w^{-1}\share{a} + r w^{-1}\share{a}\share{x} + \share{d}$ with $\share{d}$ a random sharing of zero. Element by element: OHM-ECDSA has \textbf{no $\share{w}$, no $W$, no authenticator}; deals $\share{u} = \share{k^{-1}}$ \textbf{directly} (no inversion protocol); computes all products with \textbf{Beaver triples} over degree-$(T{-}1)$ sharings (\textbf{no zero-sharings} anywhere); and ensures correctness by \textbf{point equality against public commitments} --- a different mechanism with a stronger result (attribution vs.\ mere detection). Shared elements (the ECDSA final algebra, share-exponentiation for $R$, abort-and-restart, one-round reveal) are the patent's own admitted prior art or unclaimed generic steps. Under the doctrine of equivalents, the inversion and correctness functions are performed in substantially different ways, with (for correctness) a substantially different result. Dependent claims 2--10 fail for the same reasons or read on admitted prior art.
+
+\paragraph{KU23 (Dfns).} KU23's contribution --- and patent --- is \emph{batch generation of key-independent presignatures} via a coordinator-assisted pipeline. OHM-ECDSA is key-dependent by design (the P4 phase binds $\share{z} = \share{k^{-1}x}$ at generation time), which is precisely what keeps it clear. The optional key-independent mode (Section~\ref{sec:extensions}) follows earlier public art --- DJNPO20's presignature is key-independent (2020); cait-sith shipped key-independent preprocessing (2022) --- and implements no element of KU23's pipeline (no coordinator, no KU23 packing); it is opt-in and flagged for FTO review. Dfns has publicly stated intent to lift the KU23 patent via LF Decentralized Trust.
+
+\paragraph{Prior-art wall.} Bar-Ilan--Beaver 1989; Beaver 1991; Pedersen 1991; Franklin--Yung 1992; Chaum--Pedersen 1992; GJKR 1996; GJKR 2007; Groth--Shoup 2021; cait-sith 2022; Katz MPTS 2023. This paper, timestamped publicly, is itself prior art against later patents on the construction.
+
+\begin{remark}
+This section is engineering analysis, not legal advice. Obtain a freedom-to-operate opinion for commercial deployment.
+\end{remark}
+
+\section{Implementation and Evaluation}\label{sec:impl}
+
+\subsection{Implementation}
+
+Two Rust crates. The \textbf{core} (\texttt{ohm-ecdsa}, ${\sim}5{,}400$ LoC) is dependency-pure (\texttt{k256}, \texttt{sha2}, \texttt{thiserror}, \texttt{rand}, \texttt{zeroize}), MSRV 1.75, no unsafe, and implements every feature of Section~\ref{sec:construction}: DKG with public complaint arbitration, triple factory (single/batch/packed), presignatures (key-dependent, batched, packed, key-independent pools), one-round signing, robustness, expel-and-restart, refresh/re-sharing, single-use stores, HD tweaks, signed envelopes with offline-verifiable blame tokens, and a canonical wire format. The \textbf{node crate} (\texttt{ohm-ecdsa-node}) runs the full protocol between separate OS processes --- strict key separation by construction --- over full-mesh TCP with per-message ECDSA-signed envelopes and echo broadcast, with durable crash-safe single-use stores, transcript archiving, an offline blame-token auditor, and optional mTLS with committee certificate pinning. The test suite comprises 127 tests (unit, integration, process-level with real child processes, and example smoke tests), deterministic throughout.
+
+\subsection{Measurements}
+
+Single-threaded reference driver (Apple M4 Max, medians): KeyGen 0.97\,ms; triple 3.2\,ms; presign 9.7\,ms; \textbf{online sign 0.28\,ms} (2-of-3). Packed (Franklin--Yung) generation vs.\ per-item batching: \textbf{1.43$\times$} (2-of-5, $B{=}2$) to \textbf{1.83$\times$} (3-of-9, $B{=}3$) on triples, growing with $n$ and $B$ as the accounting predicts (dealing drops from $2B$ polynomials to 2; product proofs from $B{\cdot}n$ to $n$). Over the real TCP mesh (per-party processes): keygen 1.8\,ms and sign \textbf{0.7\,ms} on localhost; under a 50\,ms/link WAN simulation, sign 113\,ms $\approx$ 2 link delays and keygen 337\,ms $\approx$ 6+ --- confirming that online latency is round-trip-bound, not compute-bound, with one round online.
+
+\subsection{Comparison with DJNPO20 and KU23}
+
+Machine-independent rows (timings quoted from the papers under different hardware and network conditions --- context, not a shootout):
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+ & DJNPO20 & KU23 & OHM-ECDSA \\
+\midrule
+Online rounds & 1 & non-interactive$^{\dagger}$ & 1 \\
+Identifiable abort & no & no & \textbf{yes, unconditional} \\
+Guaranteed delivery & no$^{\ddagger}$ & no & \textbf{yes (optional)} \\
+Presignatures & key-independent & key-independent, batched & key-dependent$^{\S}$ \\
+Reported presig cost & 34\,ms (AWS LAN) & 1.3\,ms amortized$^{\P}$ & 9.7\,ms; 5.2\,ms packed \\
+Reported online cost & 19.9\,ms e2e & $\approx$80\,\textmu s local + net & 0.28\,ms local; 0.7\,ms mesh \\
+Coordinator & none & semi-honest, required & none \\
+Assumptions & ECDLP & ECDLP + GGM + coord. & ECDLP + ROM \\
+Patent status & US 11,757,657 & patented per Dfns & none; prior-art published \\
+\bottomrule
+\end{tabular}
+\caption{Feature and performance comparison. $^{\dagger}$plus a semi-honest coordinator. $^{\ddagger}$optional fairness extension. $^{\S}$with opt-in key-independent pools. $^{\P}$at batch size 10{,}000 with a coordinator; 680\,ms unbatched at 50\,ms delay.}
+\label{tab:comparison}
+\end{table}
+
+KU23's 1.3\,ms/presig is the amortization of key-independent batching at $m = 10{,}000$ behind a coordinator --- a different feature set. DJNPO20's 19.9\,ms ``sign'' includes client round-trip and database; the machine-independent comparison is one online round each. OHM-ECDSA's differentiators are accountability properties the encumbered protocols do not offer at any speed: unconditional cheater identification and optional guaranteed delivery, with no coordinator.
+
+\section{Limitations and Future Work}
+
+Section~\ref{sec:security} is a proof \emph{skeleton} --- closing gaps L1 (rushing-adversary DKG extraction) and L2 (the hiding hybrid), plus a rigorous composition statement, is the main open theoretical work and a prerequisite to production use, alongside independent implementation review. Security is claimed against static corruptions only. The node crate is a reference transport, not production infrastructure (reconnection, clean shutdown, DoS hardening remain). PRSS-based randomness was analyzed and deliberately deferred: PRSS outputs carry no Feldman commitments, conflicting with unconditional identifiability. A UC restatement and proactive/adaptive security are further work.
+
+\begin{thebibliography}{15}\small
+\bibitem{beaver91} D. Beaver, \emph{Efficient Multiparty Protocols Using Circuit Randomization}, CRYPTO 1991.
+\bibitem{bib89} J. Bar-Ilan, D. Beaver, \emph{Non-Cryptographic Fault-Tolerant Computing in Constant Number of Rounds of Interaction}, PODC 1989.
+\bibitem{cp92} D. Chaum, T.~P. Pedersen, \emph{Wallet Databases with Observers}, CRYPTO 1992.
+\bibitem{djnpo} I. Damg\aa rd, T.~P. Jakobsen, J.~B. Nielsen, J.~I. Pagter, M.~B. \O stergaard, \emph{Fast Threshold ECDSA with Honest Majority}, IACR ePrint 2020/501 (DJNPO20).
+\bibitem{fy92} M. Franklin, M. Yung, \emph{Communication Complexity of Secure Computation}, STOC 1992.
+\bibitem{real} A. Gagol et al., \emph{Real Threshold ECDSA}, NDSS 2024.
+\bibitem{gjkr96} R. Gennaro, S. Jarecki, H. Krawczyk, T. Rabin, \emph{Robust Threshold DSS Signatures}, EUROCRYPT 1996 (GJKR96).
+\bibitem{gjkr07} R. Gennaro, S. Jarecki, H. Krawczyk, T. Rabin, \emph{Secure Distributed Key Generation for Discrete-Log Based Cryptosystems}, J. Cryptology 20(1), 2007 (GJKR07).
+\bibitem{gs21} J. Groth, V. Shoup, \emph{On the security of ECDSA with additive key derivation and presignatures}, IACR ePrint 2021/1330.
+\bibitem{uspat} T.~P. Jakobsen, I.~B. Damg\aa rd, M.~B. \O stergaard, J.~B. Nielsen, \emph{Method for providing a digital signature to a message}, US Patent 11,757,657 B2 (granted 2023; Sepior ApS $\to$ Blockdaemon ApS).
+\bibitem{katz23} J. Katz, \emph{Threshold ECDSA: advances and open problems}, NIST MPTS 2023.
+\bibitem{ku23} J. Katz, A. Urban, \emph{Honest-Majority Threshold ECDSA with Batch Generation of Key-Independent Presignatures}, IACR ePrint 2024/2011 (KU23).
+\bibitem{cait} NEAR, \emph{cait-sith} --- threshold ECDSA with Beaver triples and presignatures (Apache-2.0), 2022--2023. \url{https://github.com/near/cait-sith}.
+\bibitem{ped91} T.~P. Pedersen, \emph{Non-Interactive and Information-Theoretic Secure Verifiable Secret Sharing}, CRYPTO 1991.
+\bibitem{schnorr} C.~P. Schnorr, \emph{Method for identifying subscribers and for generating and verifying electronic signatures in a data exchange system}, US Patent 4,995,082 (1991; expired 2008).
+\end{thebibliography}
+
+\end{document}
