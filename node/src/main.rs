@@ -20,7 +20,9 @@
 //!   the joint key, the signature, and any blame. `--cheat-node K
 //!   --cheat C` drives child K into a cheater; `--seeded` falls back to
 //!   the M2 seeded-sign demo; `--tls` (M3c) generates per-party certs
-//!   and runs the arc over mTLS.
+//!   and runs the arc over mTLS; `--ki` (§8.7) runs the key-independent
+//!   arc: keygen → KEY-FREE pool record → 2-round online KI sign under
+//!   the key the processes' own keygen produced.
 //! * `m1-demo [port_base]` — the original M1 orchestrator demo (one
 //!   process, all keys, `drive_dkg_signed` over `MeshTransport`).
 //! * `auditor TOKEN_FILE COMMITTEE_FILE` — the M3b offline evidence
@@ -74,11 +76,11 @@ fn main() -> ExitCode {
                  ohm-ecdsa-node m1-demo [PORT_BASE]\n  \
                  ohm-ecdsa-node setup --dir DIR [--presigs K] [--seed S] [--tls]\n  \
                  ohm-ecdsa-node node --seed FILE --committee FILE --bind ADDR \\\n    \
-                 [--rendezvous | --peers id@host:port,...] [--delay-ms D] [--seeded] \\\n    \
+                 [--rendezvous | --peers id@host:port,...] [--delay-ms D] [--seeded] [--ki] \\\n    \
                  [--round-timeout-secs S] [--cheat C] [--presig-id K] [--message MSG] \\\n    \
                  [--data-dir DIR] [--tls CERT KEY --pinned DIR]\n  \
                  ohm-ecdsa-node spawn-demo [--dir DIR] [--delay-ms D] [--seeded] [--persist] \\\n    \
-                 [--tls] [--cheat-node K --cheat C]\n  \
+                 [--tls] [--ki] [--cheat-node K --cheat C]\n  \
                  ohm-ecdsa-node auditor TOKEN_FILE COMMITTEE_FILE\n  \
                  cheats: bad-deal:V | false-accuse:D | bad-sign-share | \\\n    \
                  bad-product-proof | bad-reshare:V | bad-nonce-point | bad-open-share"
@@ -230,6 +232,7 @@ fn node_mode(args: &[String]) -> ExitCode {
     };
     let rendezvous = has_flag(&mut args, "--rendezvous");
     let seeded = has_flag(&mut args, "--seeded");
+    let ki = has_flag(&mut args, "--ki");
     let peers_arg = flag_value(&mut args, "--peers");
     let delay_ms: u64 = flag_value(&mut args, "--delay-ms")
         .and_then(|v| v.parse().ok())
@@ -418,6 +421,46 @@ fn node_mode(args: &[String]) -> ExitCode {
             .as_bytes()
             .to_vec();
 
+        // §8.7 KI mode: produce a KEY-FREE pool record (P1–P3 only — no
+        // key involved), then bind it to the fresh key ONLINE with the
+        // 2-round KI sign. The pool is in-memory (§8.7 storage
+        // relaxation); `--data-dir`'s durable store stays per-key and is
+        // not used for pool records.
+        if ki {
+            let phase_start = Instant::now();
+            let ps_sid = session_id(GENESIS, &x_bytes, Some(presig_id), b"presign-ki");
+            match node.presign_ki_pooled(&ps_sid, presig_id, &mut rng, cheat) {
+                Ok(r) => {
+                    println!("PRESIG {} {}", presig_id, hex(&r.to_bytes()));
+                    eprintln!(
+                        "[node {me}] KI pool record produced in {:?}",
+                        phase_start.elapsed()
+                    );
+                }
+                Err(Error::Abort { abort }) => {
+                    println!("BLAME {} {}", abort.phase, ids_str(&abort.blamed));
+                    eprintln!("[node {me}] KI presign aborted: {}", abort.detail);
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("[node {me}] KI presign failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            let sign_sid = session_id(GENESIS, &x_bytes, Some(presig_id), b"sign-ki");
+            return finish_sign_ki(
+                &node,
+                me,
+                &sign_sid,
+                presig_id,
+                &share,
+                &message,
+                &mut rng,
+                cheat,
+                Instant::now(),
+            );
+        }
+
         // M3b (§8.6): with `--data-dir`, open the durable presignature
         // store bound to the FRESH key this keygen just produced; the
         // presign driver persists every record it produces and the sign
@@ -550,6 +593,44 @@ fn finish_sign(
     }
 }
 
+/// The KI sign phase's outcome handling (§8.7): the pool record is
+/// ATOMICALLY CONSUMED from the node's in-memory key-free pool (§8.6(1))
+/// and bound to `key` online in the 2-round KI sign; print the signature
+/// / blame lines and the process exit code.
+#[allow(clippy::too_many_arguments)] // the KI sign phase's full context
+fn finish_sign_ki(
+    node: &PartyNode,
+    me: PartyId,
+    sign_sid: &[u8],
+    presig_id: u64,
+    key: &ohm_ecdsa::presign::KeyShare,
+    message: &[u8],
+    rng: &mut impl rand::RngCore,
+    cheat: Option<Cheat>,
+    started: Instant,
+) -> ExitCode {
+    match node.sign_ki_pooled(sign_sid, presig_id, key, message, rng, cheat) {
+        Ok(sig) => {
+            let (r, s) = sig.split_bytes();
+            println!("SIG {} {}", hex(&r), hex(&s));
+            eprintln!(
+                "[node {me}] KI signature delivered in {:?}",
+                started.elapsed()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(Error::Abort { abort }) => {
+            println!("BLAME {} {}", abort.phase, ids_str(&abort.blamed));
+            eprintln!("[node {me}] KI signing aborted: {}", abort.detail);
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("[node {me}] KI signing failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn ids_str(ids: &[PartyId]) -> String {
     ids.iter()
         .map(|i| i.to_string())
@@ -624,12 +705,17 @@ fn spawn_demo(args: &[String]) -> ExitCode {
     let seeded = has_flag(&mut args, "--seeded");
     let persist = has_flag(&mut args, "--persist");
     let with_tls = has_flag(&mut args, "--tls");
+    let ki = has_flag(&mut args, "--ki");
 
     if seeded {
         println!("== ohm-ecdsa-node M2/M3a demo (SEEDED fallback): 2-of-3 keygen + sign across 3 OS processes ==");
     } else if with_tls {
         println!(
             "== ohm-ecdsa-node M3c demo: 2-of-3 keygen → presign → sign across 3 OS processes over mTLS =="
+        );
+    } else if ki {
+        println!(
+            "== ohm-ecdsa-node §8.7 KI demo: 2-of-3 keygen → KEY-FREE pool record → 2-round KI sign across 3 OS processes =="
         );
     } else {
         println!(
@@ -655,6 +741,11 @@ fn spawn_demo(args: &[String]) -> ExitCode {
     }
     if !seeded {
         println!("  full arc: each process presigns under the key its OWN keygen produced");
+    }
+    if ki {
+        println!(
+            "  KI mode (§8.7): the presignature is a KEY-FREE pool record; the key binds ONLINE in 2 rounds"
+        );
     }
     if let (Some(k), Some(c)) = (cheat_node, cheat) {
         println!("  fault injection: node {k} runs with --cheat {c:?}");
@@ -689,6 +780,9 @@ fn spawn_demo(args: &[String]) -> ExitCode {
             .arg(delay_ms.to_string());
         if seeded {
             cmd.arg("--seeded");
+        }
+        if ki {
+            cmd.arg("--ki");
         }
         if persist {
             cmd.arg("--data-dir").arg(dir.join(format!("node-{i}")));

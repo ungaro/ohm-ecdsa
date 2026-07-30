@@ -43,6 +43,16 @@
 //!   `m·A[u] + r·A[z]` by point equality, and interpolates from the first
 //!   `t` valid shares (the §10.4 robust path: bad shares are blamed and
 //!   excluded, the signature is still delivered).
+//! * [`PartyNode::presign_ki`] / [`PartyNode::sign_ki`] — the OPTIONAL
+//!   key-independent mode (§8.7): pool production is P1–P3 of
+//!   [`PartyNode::presign`] verbatim with P4 omitted (the record is
+//!   key-free and NOT key-equivalent); signing binds the record to a key
+//!   ONLINE in two broadcast rounds — R1 generates a fresh triple and
+//!   opens δ = ⟦u⟧−⟦α⟧, ε = ⟦x⟧−⟦β⟧ (fail-fast point-equality checks),
+//!   R2 broadcasts `s_j = m·u_j + r·z_j` verified against
+//!   `m·A[u] + r·A[z]`. Pool records live in a per-node IN-MEMORY
+//!   key-free pool (§8.7 storage relaxation; the M3b durable store stays
+//!   per-key — a durable key-free pool file is follow-up).
 //!
 //! With M3a the demo's full arc — keygen → presign → sign — runs under
 //! the key the node's OWN keygen produced; the ceremony-seeded
@@ -74,9 +84,10 @@ use rand::RngCore;
 use ohm_ecdsa::dkg::{DkgBcast2, DkgInstance, DkgP2P};
 use ohm_ecdsa::dleq::{self, DleqProof};
 use ohm_ecdsa::open::open;
-use ohm_ecdsa::presign::{KeyShare, Presignature};
+use ohm_ecdsa::presign::{KeyShare, KiPresignature, Presignature};
 use ohm_ecdsa::shamir::{lagrange_coeffs, ShamirPoly};
 use ohm_ecdsa::sign::{self, SignShare};
+use ohm_ecdsa::store::KiPool;
 use ohm_ecdsa::transport::{Decode, DkgMessage, Encode, Envelope, SignedEnvelope};
 use ohm_ecdsa::triples::{TriplePublic, TripleShare};
 use ohm_ecdsa::vss::FeldmanCommitment;
@@ -122,6 +133,12 @@ pub const PS_ROUND_Z: u8 = 4;
 
 /// Online signing is one broadcast round (SPEC §9).
 pub const SIGN_ROUND_SHARE: u8 = 1;
+
+/// KI online signing (SPEC §8.7, within `Phase::Sign`, one sid per
+/// signature): the R1 δ/ε opening shares ride round 1.
+pub const KI_ROUND_OPEN: u8 = 1;
+/// The R2 signature shares ride round 2.
+pub const KI_ROUND_SHARE: u8 = 2;
 
 /// A triple T2 deal broadcast (§7.2): the sender's re-sharing commitment
 /// and its ONE DLEQ product proof binding `g_j(0)` to `α_j·β_j`.
@@ -517,6 +534,13 @@ pub struct PartyNode {
     store: Mutex<Option<DiskPresigStore>>,
     /// M3b: the transcript + blame-token archive (§4.7, §10.2, §A.4).
     archive: Mutex<Option<Archive>>,
+    /// §8.7: the IN-MEMORY key-free KI pool. Pool records carry no
+    /// key-equivalent material (§8.7 storage relaxation), so an in-memory
+    /// pool suffices — single-use stays mandatory and is enforced by the
+    /// core [`KiPool`]'s atomic consume. The durable M3b store above is
+    /// per-key and does NOT hold pool records (a durable key-free pool
+    /// file is follow-up; a restart simply loses unspent records).
+    ki_pool: Mutex<KiPool>,
 }
 
 impl PartyNode {
@@ -576,6 +600,7 @@ impl PartyNode {
             timeout: round_timeout,
             store: Mutex::new(None),
             archive: Mutex::new(None),
+            ki_pool: Mutex::new(KiPool::new()),
         })
     }
 
@@ -1323,13 +1348,76 @@ impl PartyNode {
         rng: &mut impl RngCore,
         cheat: Option<Cheat>,
     ) -> Result<Presignature> {
+        let t = self.params.t;
+        let phase = Phase::Presign;
+
+        // P1–P3 (shared verbatim with the §8.7 KI pool production,
+        // [`Self::presign_ki`]): ⟦u⟧ (:= k⁻¹), ⟦a⟧, the Beaver openings
+        // and the nonce-point round.
+        let (u_j, u_com, r_scalar, big_r) = self.presign_p1_p3(sid, &mut *rng, cheat)?;
+
+        // P4's Beaver triple — the §8.7 KI mode moves exactly this
+        // triple session online (K1).
+        let (t2, pub2) = self.triple(&[sid, b"/t2"].concat(), &mut *rng, None)?;
+        let neg = -Scalar::ONE;
+
+        // P4: z = u·x via triple 2 — ε′ masks this node's OWN long-term
+        // key share (the output of its own keygen), binding the
+        // presignature to the key; ⟦z⟧ assembled from the openings.
+        let d2_com = u_com.add(&pub2.ca.scale(&neg));
+        let e2_com = key.com.add(&pub2.cb.scale(&neg));
+        self.broadcast(
+            sid,
+            phase,
+            PS_ROUND_Z,
+            NodePayload::BeaverOpen {
+                first: u_j - t2.a,
+                second: key.share - t2.b,
+            },
+        );
+        let (d2s, e2s) = self.collect_beaver_opens(sid, phase, PS_ROUND_Z)?;
+        let d2v = self.open_noted(t, &d2_com, &d2s, phase)?;
+        let e2v = self.open_noted(t, &e2_com, &e2s, phase)?;
+        let z_com = pub2
+            .cc
+            .clone()
+            .add(&pub2.cb.scale(&d2v))
+            .add(&pub2.ca.scale(&e2v))
+            .add_const(&(d2v * e2v));
+        let z_j = t2.c + d2v * t2.b + e2v * t2.a + d2v * e2v;
+
+        Ok(Presignature {
+            id,
+            index: self.me,
+            r: r_scalar,
+            big_r,
+            u_share: u_j,
+            z_share: z_j,
+            u_com,
+            z_com,
+        })
+    }
+
+    /// §8 P1–P3 over the wire, verbatim (SPEC §8), shared by
+    /// [`Self::presign`] and the §8.7 KI pool production
+    /// ([`Self::presign_ki`]): ONE Beaver triple session, the ⟦u⟧
+    /// (:= k⁻¹) and ⟦a⟧ joint random sharings, the δ/ε and `v = a·u`
+    /// openings, and the nonce-point round (`R_j` checked against
+    /// `EvalCom(A[k], j)` — F5 ⇒ blame the sender). Returns this node's
+    /// `u`-share and commitment plus the public nonce `(r, R)`.
+    fn presign_p1_p3(
+        &self,
+        sid: &[u8],
+        rng: &mut impl RngCore,
+        cheat: Option<Cheat>,
+    ) -> Result<(Scalar, FeldmanCommitment, Scalar, AffinePoint)> {
         let n = self.params.n;
         let t = self.params.t;
         let phase = Phase::Presign;
 
-        // Two fresh triples (SPEC §7). The dealing cheats
-        // (BadProductProof / BadReshare / FalseAccuse) target the FIRST
-        // triple session, as in the core's `PresignTamper`.
+        // One fresh triple (SPEC §7) for the `v = a·u` opening. The
+        // dealing cheats (BadProductProof / BadReshare / FalseAccuse)
+        // target this session, as in the core's `PresignTamper`.
         let triple_cheat = cheat.filter(|c| {
             matches!(
                 c,
@@ -1337,7 +1425,6 @@ impl PartyNode {
             )
         });
         let (t1, pub1) = self.triple(&[sid, b"/t1"].concat(), &mut *rng, triple_cheat)?;
-        let (t2, pub2) = self.triple(&[sid, b"/t2"].concat(), &mut *rng, None)?;
 
         // P1: ephemeral joint randomness [u] (:= k⁻¹) and [a].
         let u_out = self.joint_vss(
@@ -1436,42 +1523,203 @@ impl PartyNode {
             // Retry with a fresh presignature id (caller policy).
             return Err(Error::ZeroValue("r = 0".into()));
         }
+        Ok((u_j, u_com, r_scalar, big_r))
+    }
 
-        // P4: z = u·x via triple 2 — ε′ masks this node's OWN long-term
-        // key share (the output of its own keygen), binding the
-        // presignature to the key; ⟦z⟧ assembled from the openings.
-        let d2_com = u_com.add(&pub2.ca.scale(&neg));
-        let e2_com = key.com.add(&pub2.cb.scale(&neg));
+    /// Per-node KEY-INDEPENDENT pool production (SPEC §8.7 — optional
+    /// mode): P1–P3 of [`Self::presign`] verbatim (⟦u⟧ := k⁻¹,
+    /// Beaver-derived ⟦k⟧, the nonce-point round with F5 blame) with P4
+    /// OMITTED — no key is involved at generation time, and the record
+    /// consumes ONE triple (P4's triple moves online, [`Self::sign_ki`]).
+    /// The record is key-free and NOT key-equivalent (`t` pool shares
+    /// reveal nothing about any long-term key); it binds to a key only at
+    /// signing time. Still strictly SINGLE-USE (§8.6(1) — nonce reuse is
+    /// fatal under ANY key). `v = 0` / `r = 0` return
+    /// [`Error::ZeroValue`]: retry with a fresh id. Returns this node's
+    /// [`KiPresignature`] — it never leaves the node.
+    pub fn presign_ki(
+        &self,
+        sid: &[u8],
+        id: u64,
+        rng: &mut impl RngCore,
+        cheat: Option<Cheat>,
+    ) -> Result<KiPresignature> {
+        let (u_j, u_com, r, big_r) = self.presign_p1_p3(sid, rng, cheat)?;
+        Ok(KiPresignature {
+            id,
+            index: self.me,
+            r,
+            big_r,
+            u_share: u_j,
+            u_com,
+        })
+    }
+
+    /// [`Self::presign_ki`] plus insertion into this node's in-memory
+    /// key-free pool (§8.7; duplicate ids rejected, §8.6(1)). Returns the
+    /// record's public nonce `r` — the shares stay inside the pool.
+    pub fn presign_ki_pooled(
+        &self,
+        sid: &[u8],
+        id: u64,
+        rng: &mut impl RngCore,
+        cheat: Option<Cheat>,
+    ) -> Result<Scalar> {
+        let record = self.presign_ki(sid, id, rng, cheat)?;
+        let r = record.r;
+        self.ki_pool
+            .lock()
+            .expect("mesh mutex poisoned")
+            .insert(record)?;
+        Ok(r)
+    }
+
+    /// Per-node KI online signing (SPEC §8.7, Protocol 8.7.1): TWO
+    /// broadcast rounds binding the pool record to `key` online. R1
+    /// generates a FRESH triple ([`Self::triple`]) and opens δ = ⟦u⟧−⟦α⟧,
+    /// ε = ⟦x⟧−⟦β⟧ — exactly the §8 P4 masking, run online; every share
+    /// is point-checked against `A[u]−A[α]` / `A[x]−A[β]` (fail-fast
+    /// identifiable abort). R2 computes ⟦z⟧ locally
+    /// ([`sign::ki_z_share`]) and broadcasts `s_j = m·u_j + r·z_j`,
+    /// verified against `m·A[u] + r·A[z]` by [`sign::combine_ki`]
+    /// (fail-fast — the §10.4 robust continuation stays in the core's
+    /// sim), low-`s` normalized. Cheats: `BadOpenShare` corrupts this
+    /// node's R1 δ-share, `BadSignShare` its R2 share; the dealing cheats
+    /// forward to the R1 triple session.
+    pub fn sign_ki(
+        &self,
+        sid: &[u8],
+        presig: &KiPresignature,
+        key: &KeyShare,
+        msg: &[u8],
+        rng: &mut impl RngCore,
+        cheat: Option<Cheat>,
+    ) -> Result<Signature> {
+        let t = self.params.t;
+        let phase = Phase::Sign;
+        let m = ohm_ecdsa::sim::message_scalar(msg);
+
+        // R1 (SPEC §8.7 K1): a fresh Beaver triple, then the verified δ/ε
+        // openings. The dealing cheats target the triple session (same
+        // filter as the presign driver).
+        let triple_cheat = cheat.filter(|c| {
+            matches!(
+                c,
+                Cheat::BadProductProof | Cheat::BadReshare { .. } | Cheat::FalseAccuse { .. }
+            )
+        });
+        let (t_share, t_pub) = self.triple(&[sid, b"/triple"].concat(), &mut *rng, triple_cheat)?;
+        let neg = -Scalar::ONE;
+        let delta_com = presig.u_com.add(&t_pub.ca.scale(&neg));
+        let eps_com = key.com.add(&t_pub.cb.scale(&neg));
+        let mut delta_j = presig.u_share - t_share.a;
+        if cheat == Some(Cheat::BadOpenShare) {
+            delta_j += Scalar::ONE; // malicious: wrong R1 opening share
+        }
         self.broadcast(
             sid,
             phase,
-            PS_ROUND_Z,
+            KI_ROUND_OPEN,
             NodePayload::BeaverOpen {
-                first: u_j - t2.a,
-                second: key.share - t2.b,
+                first: delta_j,
+                second: key.share - t_share.b,
             },
         );
-        let (d2s, e2s) = self.collect_beaver_opens(sid, phase, PS_ROUND_Z)?;
-        let d2v = self.open_noted(t, &d2_com, &d2s, phase)?;
-        let e2v = self.open_noted(t, &e2_com, &e2s, phase)?;
-        let z_com = pub2
-            .cc
-            .clone()
-            .add(&pub2.cb.scale(&d2v))
-            .add(&pub2.ca.scale(&e2v))
-            .add_const(&(d2v * e2v));
-        let z_j = t2.c + d2v * t2.b + e2v * t2.a + d2v * e2v;
+        let (deltas, epsilons) = self.collect_beaver_opens(sid, phase, KI_ROUND_OPEN)?;
+        let delta = self.open_noted(t, &delta_com, &deltas, phase)?;
+        let eps = self.open_noted(t, &eps_com, &epsilons, phase)?;
 
-        Ok(Presignature {
-            id,
-            index: self.me,
-            r: r_scalar,
-            big_r,
-            u_share: u_j,
-            z_share: z_j,
-            u_com,
-            z_com,
-        })
+        // R2 (SPEC §8.7 K2): local z-share + sign share, verified
+        // combine against m·A[u] + r·A[z].
+        let z_com = sign::ki_z_com(&t_pub, &delta, &eps);
+        let z_j = sign::ki_z_share(&t_share, &delta, &eps);
+        let mut share = sign::sign_share_ki(presig, &z_j, &m);
+        if cheat == Some(Cheat::BadSignShare) {
+            share.s += Scalar::ONE; // malicious: wrong R2 signature share
+        }
+        self.broadcast(
+            sid,
+            phase,
+            KI_ROUND_SHARE,
+            NodePayload::SignShare {
+                presig: presig.id,
+                s: share.s,
+            },
+        );
+        let set = self.accepted_broadcasts(sid, phase, KI_ROUND_SHARE);
+        let mut shares = Vec::with_capacity(set.len());
+        // The signed share envelopes, kept for the §10.2/§A.4 sign-share
+        // blame evidence (M3b) — same token shape as the §9 driver.
+        let mut share_env_of: BTreeMap<PartyId, SignedEnvelope<NodePayload>> = BTreeMap::new();
+        for (f, se) in set {
+            match &se.envelope.payload {
+                NodePayload::SignShare { presig: pid, s } if *pid == presig.id => {
+                    shares.push(SignShare { from: f, s: *s });
+                    share_env_of.insert(f, se);
+                }
+                NodePayload::SignShare { .. } => {
+                    eprintln!(
+                        "[node {}] dropped sign share for the wrong presignature id from {f}",
+                        self.me
+                    );
+                }
+                _ => return Err(abort(phase, vec![f], "malformed sign broadcast".into())),
+            }
+        }
+        // Fail-fast verified combine (§8.7): a bad share aborts blaming
+        // its sender — with the F6 sign-share token archived per blamed
+        // sender (M3b), exactly as in the §9 driver.
+        let (r, s) = match sign::combine_ki(&self.params, presig, &z_com, &m, &shares) {
+            Ok(rs) => rs,
+            Err(e) => {
+                if let Error::Abort { abort } = &e {
+                    for &f in &abort.blamed {
+                        if let Some(se) = share_env_of.get(&f) {
+                            let single = IdentifiableAbort {
+                                phase,
+                                blamed: vec![f],
+                                detail: abort.detail.clone(),
+                            };
+                            self.note(
+                                &single,
+                                Some(BlameEvidence::SignShare {
+                                    abort: single.clone(),
+                                    envelope: se.clone(),
+                                    message: msg.to_vec(),
+                                    r: presig.r,
+                                    u_com: presig.u_com.clone(),
+                                    z_com: z_com.clone(),
+                                }),
+                            );
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        };
+        let sig = Signature::from_scalars(r, s)?;
+        Ok(sig.normalize_s().unwrap_or(sig))
+    }
+
+    /// [`Self::sign_ki`] with the pool record ATOMICALLY CONSUMED from
+    /// this node's in-memory key-free pool first (§8.6(1) transactional
+    /// delete): an unknown or consumed id surfaces the core pool's error
+    /// and no share is broadcast.
+    pub fn sign_ki_pooled(
+        &self,
+        sid: &[u8],
+        id: u64,
+        key: &KeyShare,
+        msg: &[u8],
+        rng: &mut impl RngCore,
+        cheat: Option<Cheat>,
+    ) -> Result<Signature> {
+        let record = self
+            .ki_pool
+            .lock()
+            .expect("mesh mutex poisoned")
+            .consume(id)?;
+        self.sign_ki(sid, &record, key, msg, rng, cheat)
     }
 
     /// Core `open` with M3b abort archiving (`token: none` — the

@@ -178,7 +178,8 @@ echo broadcast and signed envelopes (see `node/README.md`): the M2/M3a
 per-party demo — three OS processes each holding only its own key, the
 full arc keygen → presign → sign under the key their own keygen
 produced, `cargo run -p ohm-ecdsa-node -- spawn-demo` (M3c: `--tls`
-runs the same arc over committee-pinned mTLS) — and the original
+runs the same arc over committee-pinned mTLS; §8.7: `--ki` runs keygen →
+KEY-FREE pool record → 2-round online KI sign) — and the original
 M1 orchestrator demo (`-- m1-demo`). A mesh latency benchmark lives at
 `cargo run --release -p ohm-ecdsa-node --example mesh_perf`.
 
@@ -346,6 +347,12 @@ sets, issuers, auditors.
   the TLS peer identity matches the expected `PartyId`); plain TCP
   remains the localhost default, `setup --tls` / `spawn-demo --tls`
   generate per-party self-signed certs (rcgen)
+* §8.7 KI mode over the wire (`node/src/party.rs`): per-node
+  key-independent pool production (P1–P3 verbatim, P4 omitted — the
+  record is key-free) and the 2-round online KI sign (R1 fresh triple +
+  verified δ/ε openings, R2 verified shares); one in-memory key-free
+  pool signs under ANY key the committee owns (`spawn-demo --ki`;
+  thread-level proof: one pool, two different keys)
 
 **Not yet** (roadmap): production-hardened transport beyond M3c
 (reconnection, clean shutdown, DoS hardening — the `transport` module
@@ -355,6 +362,7 @@ is the contract), key rotation
 ## Documentation map
 
 * Visual walkthrough (Alice/Bob sequence diagrams) → `docs/diagrams.md`
+* Paper draft (ePrint-style) → `docs/paper/OHM-ECDSA.md`
 * Protocol design, notation, diagrams → [`SPEC.md`](./SPEC.md) §1–§10
 * Security claims, proof obligations, and the game-based proof skeleton → SPEC §11 (esp. §11.4)
 * Patent design-around analysis → SPEC §12
@@ -390,7 +398,7 @@ crate root (`ohm_ecdsa::shamir`, `ohm_ecdsa::sim`, …).
 | `runtime/transport` | 4.7, 10.2, 13.1, 13.2 | transport seam: `Envelope` message contract, sync `Transport` trait, `SimTransport` reference impl, `drive_dkg` transport-driven keygen driver, signed envelopes (`SignedEnvelope`/`SigningTransport`), offline-verifiable `BlameToken`, `drive_dkg_signed` |
 | `runtime/transport` | 4.7, 10.2, 13.1, 13.2 | transport seam: `Envelope` message contract, sync `Transport` trait, `SimTransport` reference impl, `drive_dkg` transport-driven keygen driver, canonical `Encode`/`Decode` wire format, signed envelopes (`SignedEnvelope`/`SigningTransport`), offline-verifiable `BlameToken`, `drive_dkg_signed` |
 | `runtime/sim` | 4.7, 10.3, 13.2 | reference orchestrator (keygen routes through the `transport` seam), §10.3 restart wrappers |
-| `node/` (crate `ohm-ecdsa-node`) | 4.7, 10.2, 13.1, 13.2 | transport companion: full-mesh real TCP, signed envelopes verified on receipt, echo broadcast; M1 `MeshTransport` orchestrator driver; M2 `PartyNode` per-party drivers (keygen with §6.1 wire complaints, §9/§10.4 signing, process separation, `mesh_perf` benchmark); M3a per-node offline factory (§7.2 triples + §8 presign over the wire — the demo signs under its own keygen's key); M3b durable stores + transcript/blame archive + auditor; M3c optional committee-pinned mTLS (`node/src/tls.rs`) |
+| `node/` (crate `ohm-ecdsa-node`) | 4.7, 10.2, 13.1, 13.2, 8.7 | transport companion: full-mesh real TCP, signed envelopes verified on receipt, echo broadcast; M1 `MeshTransport` orchestrator driver; M2 `PartyNode` per-party drivers (keygen with §6.1 wire complaints, §9/§10.4 signing, process separation, `mesh_perf` benchmark); M3a per-node offline factory (§7.2 triples + §8 presign over the wire — the demo signs under its own keygen's key); M3b durable stores + transcript/blame archive + auditor; M3c optional committee-pinned mTLS (`node/src/tls.rs`); §8.7 KI mode over the wire (`presign_ki` + 2-round `sign_ki`, in-memory key-free pool, `--ki` demo) |
 
 Contributions: keep `cargo fmt && cargo clippy --workspace --all-targets &&
 cargo test --workspace` green; follow `AGENTS.md`.

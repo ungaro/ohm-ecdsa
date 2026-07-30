@@ -80,6 +80,19 @@
 //!   `spawn-demo --tls` generates per-party self-signed certs with
 //!   rcgen). Real deployments substitute their own PKI (§13.1).
 //!
+//! §8.7 KI mode (OPTIONAL key-independent pool — [`party`]):
+//!
+//! * [`PartyNode::presign_ki`] runs P1–P3 of the per-node presign
+//!   verbatim with P4 omitted — a KEY-FREE pool record (`t` shares
+//!   reveal no key; still strictly single-use);
+//! * [`PartyNode::sign_ki`] binds a pool record to a key ONLINE in two
+//!   broadcast rounds (R1 fresh triple + verified δ/ε openings, R2
+//!   verified `s_j` shares — fail-fast blame, same posture as the other
+//!   wire drivers);
+//! * pool records live in a per-node in-memory key-free pool
+//!   (`presign_ki_pooled` / `sign_ki_pooled`); the M3b durable store
+//!   stays per-key. `node --ki` / `spawn-demo --ki` run the arc.
+//!
 //! M2/M3a/M3b/M3c are still NOT: robust continuation at the wire
 //! level, clean thread shutdown, or any production hardening (SPEC
 //! §13.1/§13.6 — this is unaudited research code, do not secure real

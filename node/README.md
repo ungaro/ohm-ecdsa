@@ -40,6 +40,15 @@ mTLS layer). Milestones:
   streams) with certificates **pinned to the committee** — no PKI, no
   system roots. Plain TCP remains the default for localhost dev; any
   non-localhost deployment MUST run TLS (see below).
+* **§8.7 KI mode over the wire** — the OPTIONAL key-independent
+  presignature pool (`PartyNode::presign_ki` / `sign_ki`): pool
+  production is P1–P3 of the per-node presign verbatim with P4 omitted
+  (the record is KEY-FREE — not key-equivalent); signing binds the record
+  to a key ONLINE in two broadcast rounds (R1 fresh triple + verified
+  δ/ε openings, R2 verified `s_j` shares). One pool serves any key the
+  committee owns — including keys generated after the pool was filled.
+  Records live in a per-node in-memory key-free pool (`KiPool`); the M3b
+  durable store stays per-key. `spawn-demo --ki` runs the arc.
 
 ## What M2/M3a is
 
@@ -104,6 +113,36 @@ mTLS layer). Milestones:
   the round timeout fires — then the PARTIAL set is returned, logged
   loudly, and the drivers fail closed ("incomplete message sets"). Same
   policy as M1; timeout values are a deployment concern (SPEC §13.1).
+
+## What the §8.7 KI mode adds (key-independent pool over the wire)
+
+The default presignatures are KEY-DEPENDENT: every long-term key needs
+its own factory inventory. The optional §8.7 mode runs a **commodity
+pool** over the same mesh:
+
+* **Pool production** (`PartyNode::presign_ki`) is P1–P3 of the per-node
+  presign driver verbatim — one triple session, the ⟦u⟧/⟦a⟧ joint
+  sharings, the `v = a·u` opening, the nonce-point round with F5 blame —
+  with **P4 omitted**: no key is involved at generation time, and the
+  record `(id, R, r, [u], A[u])` is NOT key-equivalent (`t` pool shares
+  reveal nothing about any key, §8.7 storage relaxation). It is still
+  strictly single-use (§8.6(1)).
+* **Online binding** (`PartyNode::sign_ki`) is TWO broadcast rounds: R1
+  generates a FRESH triple over the wire and opens δ = ⟦u⟧−⟦α⟧,
+  ε = ⟦x⟧−⟦β⟧ (β masks the long-term key — exactly the §8 P4 masking,
+  moved online; every share point-checked, fail-fast blame); R2 computes
+  ⟦z⟧ locally and broadcasts `s_j = m·u_j + r·z_j`, verified against
+  `m·A[u] + r·A[z]`, low-`s`. The price vs the default mode: one extra
+  online round and one extra triple per signature.
+* **Storage**: pool records live in a per-node IN-MEMORY key-free pool
+  (the core's `KiPool`, atomic consume) — `presign_ki_pooled` /
+  `sign_ki_pooled` mirror the M3b `*_stored` wrappers. The durable M3b
+  store is per-key by design (§8.6(4)) and does NOT hold pool records; a
+  durable key-free pool file is follow-up (a restart simply loses unspent
+  records — safe, not a nonce-reuse risk).
+* One pool serves ANY key: `node/tests/party_ki.rs` proves two records
+  of one pool signing under two DIFFERENT keys from two independent
+  keygens, each signature verifying under its own X.
 
 ## What M3b adds (persistence + evidence)
 
@@ -223,6 +262,7 @@ cargo run -p ohm-ecdsa-node -- spawn-demo --seeded  # M2 fallback: sign with cer
 cargo run -p ohm-ecdsa-node -- spawn-demo --delay-ms 50   # simulated WAN links
 cargo run -p ohm-ecdsa-node -- spawn-demo --persist # M3b: durable stores + transcript/blame archive
 cargo run -p ohm-ecdsa-node -- spawn-demo --tls     # M3c: the full arc over mTLS (rcgen certs, committee-pinned)
+cargo run -p ohm-ecdsa-node -- spawn-demo --ki      # §8.7: keygen → KEY-FREE pool record → 2-round KI sign
 cargo run -p ohm-ecdsa-node -- spawn-demo --tls --persist --cheat-node 2 --cheat bad-sign-share
 cargo run -p ohm-ecdsa-node -- spawn-demo --persist --cheat-node 2 --cheat bad-deal:1 --dir /tmp/ohm-demo
 cargo run -p ohm-ecdsa-node -- auditor /tmp/ohm-demo/node-1/archive/blame-keygen-2.tok \
@@ -296,8 +336,16 @@ cargo test -p ohm-ecdsa-node
   opening share are named in presign; the full arc keygen → presign →
   sign signs under the key the nodes' own keygen produced (valid low-`s`
   signature, all nodes agree).
-* `node/tests/process_demo.rs` (M2/M3a/M3b/M3c, 12 tests, REAL CHILD
-  PROCESSES via `spawn-demo`): honest full arc across 3 processes; a
+* `node/tests/party_ki.rs` (§8.7, 3 tests, thread-level with strict
+  per-node key separation): the KI full arc signs under the nodes' own
+  key (with pool single-use enforced — a consumed id cannot sign twice);
+  ONE key-free pool signs for TWO different keys from two independent
+  keygens (each signature verifies under its own X and not the other);
+  a bad R1 opening share is blamed by every node in `Phase::Sign`.
+* `node/tests/process_demo.rs` (M2/M3a/M3b/M3c/§8.7, 13 tests, REAL CHILD
+  PROCESSES via `spawn-demo`): honest full arc across 3 processes; the
+  `--ki` KI arc (keygen → KEY-FREE pool record → 2-round KI sign, all
+  processes agreeing on X and a verifying signature); a
   sign-share cheater named by the other two processes with the signature
   still delivered; a DKG cheater and a false accuser each named by all
   three processes (full arc and `--seeded` fallback); a bad DLEQ proof
@@ -306,7 +354,12 @@ cargo test -p ohm-ecdsa-node
   process; the `--persist` full arc leaving fsync'd consume tombstones
   and decodable transcripts; a `bad-deal` token file verified by the
   `auditor` subcommand (exit 0, `VERDICT: VALID`) and a tampered copy
-  rejected; the `--tls` full arc over mTLS (M3c).
+  rejected; the `--tls` full arc over mTLS (M3c). These tests are
+  serialized within their binary (a static `Mutex`, documented in the
+  file) and run under a 300 s watchdog: each spawns 3 child processes
+  whose localhost rounds starve when the whole workspace suite runs in
+  parallel — the previous per-test parallelism + 180 s watchdog was
+  flaky under load (load, not a protocol hang).
 * `node/tests/persist.rs` (M3b, 9 tests): the durable store survives
   drop/reopen, a consumed id stays consumed across a simulated crash,
   duplicate inserts are rejected (live and consumed ids, on reopen),
@@ -335,8 +388,8 @@ cargo test -p ohm-ecdsa-node
 | `src/mesh.rs` | `Node<M>`: listener + full-mesh connections + reader threads, first-echo rule, verified-only mailbox, self-echo loopback (M2 per-node acceptor), config-driven send delay (benchmarks), optional M3c mTLS wrapping (`bind_tls`) |
 | `src/tls.rs` | M3c: `CommitteeTls` (own cert/key + the pinned committee cert set), committee-pinned TLS 1.3 client/server configs and blocking handshakes (rustls + ring), rcgen cert generation for tests/demos, the PEM file layout (`party-<id>.crt.pem` / `.key.pem`) |
 | `src/transport.rs` | `MeshTransport` (M1): echo-broadcast acceptor + the core `Transport` trait impl over `DkgMessage` |
-| `src/party.rs` | `PartyNode` + `NodePayload` (M2/M3a): per-node keygen driver with §6.1 complaints/defenses on the wire (factored as `joint_vss` + the wire complaint subprotocol), per-node §7.2 triple and §8 presign drivers (the M3a offline factory), per-node §9/§10.4 sign driver, per-node echo-broadcast acceptor, `Cheat` fault injection; M3b store/archive wiring (`presign_stored`, `sign_stored`, `store_offer`); M3c `bind_with_tls` |
+| `src/party.rs` | `PartyNode` + `NodePayload` (M2/M3a): per-node keygen driver with §6.1 complaints/defenses on the wire (factored as `joint_vss` + the wire complaint subprotocol), per-node §7.2 triple and §8 presign drivers (the M3a offline factory), per-node §9/§10.4 sign driver, per-node §8.7 KI drivers (`presign_ki` — P1–P3 verbatim, P4 omitted — and the 2-round `sign_ki`, plus the in-memory key-free pool wrappers `presign_ki_pooled` / `sign_ki_pooled`), per-node echo-broadcast acceptor, `Cheat` fault injection; M3b store/archive wiring (`presign_stored`, `sign_stored`, `store_offer`); M3c `bind_with_tls` |
 | `src/persist.rs` | M3b: `DiskPresigStore` (§8.6 durable single-use store, write-tmp-rename + fsync, consume tombstone fsync'd before the record is handed out), `Archive` (§4.7 accepted-envelope transcript + `aborts.log`), `BlameEvidence` token files (F2 dealt-share, F6 sign-share; other classes `token: none`), `audit_token` offline verifier (§A.4) |
 | `src/seed.rs` | the ceremony + seed/committee files (the `--seeded` fallback for presignature distribution; transport keys come from the seed files in both modes) |
-| `src/main.rs` | `node` / `setup` / `spawn-demo` / `auditor` / `m1-demo` subcommands (`--tls` on `setup`/`node`/`spawn-demo` for M3c) |
+| `src/main.rs` | `node` / `setup` / `spawn-demo` / `auditor` / `m1-demo` subcommands (`--tls` on `setup`/`node`/`spawn-demo` for M3c, `--ki` on `node`/`spawn-demo` for the §8.7 KI arc) |
 | `examples/mesh_perf.rs` | the latency benchmark described above |

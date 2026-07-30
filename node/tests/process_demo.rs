@@ -9,13 +9,29 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use ohm_ecdsa_node::persist::read_transcript;
 
 const BIN: &str = env!("CARGO_BIN_EXE_ohm-ecdsa-node");
-const DEMO_TIMEOUT: Duration = Duration::from_secs(180);
+/// Watchdog per `spawn-demo` run. Generous on purpose: under a parallel
+/// full-workspace test run each demo spawns 3 real OS processes whose
+/// localhost rounds compete for CPU with every other test binary — a
+/// tight timeout here fails the test for load, not for a real hang.
+const DEMO_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Serialization for the process-level tests. Every test in this binary
+/// spawns 3 child `node` processes (plus their mesh threads); running all
+/// of them concurrently under an already-loaded parallel workspace suite
+/// starves the echo-broadcast rounds and trips the watchdog. A plain
+/// static `Mutex` serializes ONLY within this test binary — which is the
+/// dominant contention source, since the process-spawning tests all live
+/// here. Cross-binary parallelism (thread-level tests in the other test
+/// binaries) does not spawn OS processes and stays cheap; no new
+/// dependency (no `serial_test`, no file locks) is needed for it.
+static DEMO_LOCK: Mutex<()> = Mutex::new(());
 
 /// A fresh empty temp directory for one test.
 fn tmpdir(name: &str) -> PathBuf {
@@ -32,8 +48,10 @@ fn tmpdir(name: &str) -> PathBuf {
 }
 
 /// Run `spawn-demo` with extra args; returns its stdout. Panics (after
-/// killing the child) if the demo hangs.
+/// killing the child) if the demo hangs. Serialized across this binary's
+/// tests (see `DEMO_LOCK`).
 fn run_spawn_demo(extra: &[&str]) -> String {
+    let _serial = DEMO_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut child = Command::new(BIN)
         .arg("spawn-demo")
         .args(extra)
@@ -102,6 +120,33 @@ fn process_demo_tls_full_arc() {
     let out = run_spawn_demo(&["--tls"]);
     assert!(
         out.contains("mTLS (M3c): TLS 1.3, per-party self-signed certs pinned to the committee"),
+        "stdout:\n{out}"
+    );
+    assert!(
+        out.contains("RESULT keygen: all 3 processes agree on X"),
+        "stdout:\n{out}"
+    );
+    assert!(
+        out.contains("RESULT presign: all 3 processes agree on PRESIG"),
+        "stdout:\n{out}"
+    );
+    assert!(
+        out.contains("RESULT sign: all 3 processes agree; signature verifies under X: true"),
+        "stdout:\n{out}"
+    );
+    assert!(out.contains("RESULT demo: SUCCESS"), "stdout:\n{out}");
+    assert!(!out.contains("BLAME"), "stdout:\n{out}");
+}
+
+#[test]
+fn process_demo_ki_full_arc() {
+    // §8.7 KI mode across 3 child processes: keygen → KEY-FREE pool
+    // record (P1–P3 only) → 2-round online KI sign, bound to the key the
+    // processes' OWN keygen produced. All processes agree on X, on the
+    // pool record's public nonce, and on a signature that verifies.
+    let out = run_spawn_demo(&["--ki"]);
+    assert!(
+        out.contains("KEY-FREE pool record → 2-round KI sign"),
         "stdout:\n{out}"
     );
     assert!(
