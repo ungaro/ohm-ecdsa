@@ -37,7 +37,7 @@ pub use protocol::{dkg, presign, refresh, sign, triples};
 pub use runtime::{policy, sim, store, transport};
 
 pub use error::{Error, IdentifiableAbort, Phase, Result};
-pub use store::PresigStore;
+pub use store::{KiPool, PresigStore};
 
 /// Party identifier: parties are numbered `1..=n`.
 pub type PartyId = usize;
@@ -133,7 +133,11 @@ impl Committee {
 }
 
 /// Domain-separation tags for hashing / Fiat–Shamir transcripts.
-pub(crate) mod tags {
+///
+/// Public so per-party drivers outside this crate (the node crate's M2/M3a
+/// per-node drivers) bind their commit-reveal and DLEQ transcripts to the
+/// same versioned tags the core's reference orchestrator uses.
+pub mod tags {
     pub const DKG_COMMIT: &[u8] = b"OHM-ECDSA/v0.1/dkg-commit";
     pub const DKG_BATCH_COMMIT: &[u8] = b"OHM-ECDSA/v0.1/dkg-batch-commit";
     pub const DKG_PACKED_COMMIT: &[u8] = b"OHM-ECDSA/v0.1/dkg-packed-commit";
@@ -184,8 +188,11 @@ pub(crate) fn hash_commitments(
 }
 
 /// Reduce a 32-byte digest to a scalar (mod q).
+///
+/// Public so per-party drivers outside this crate (the node crate's M3a
+/// per-node presign driver) derive `r = F(R)` exactly as the core does.
 #[allow(deprecated)] // generic-array 0.14 from_slice; fine for a 32-byte fixed input
-pub(crate) fn scalar_from_digest(digest: &[u8]) -> Scalar {
+pub fn scalar_from_digest(digest: &[u8]) -> Scalar {
     use k256::elliptic_curve::ops::Reduce;
     use k256::{FieldBytes, U256};
     <Scalar as Reduce<U256>>::reduce_bytes(&FieldBytes::from_slice(digest))

@@ -1,15 +1,15 @@
-//! M2 demo seed files — the documented presignature-distribution
-//! shortcut (SPEC §8.6, §13.1).
+//! M2 demo seed files — transport keys, plus the ceremony that remains
+//! as the `--seeded` presignature-distribution fallback (SPEC §8.6,
+//! §13.1).
 //!
-//! Per-node presign through the mesh is M3. For M2 demos and tests,
-//! presignatures are produced by a PRIOR ORCHESTRATED RUN — a "ceremony":
-//! one process runs the core's reference orchestrator (sim keygen +
+//! With M3a the default demo presigns through the mesh under the key its
+//! own keygen produced (`party::PartyNode::presign`). The ceremony is
+//! kept as a FALLBACK (`--seeded`): a PRIOR ORCHESTRATED RUN — one
+//! process runs the core's reference orchestrator (sim keygen +
 //! presign) and writes one seed file per party plus one public committee
-//! file. This is a demo stand-in for a deployment's presignature
-//! distribution channel; it is exactly the "seed each node with its own
-//! presig record from a prior orchestrated run" shortcut, and it is NOT
-//! how production presignatures must be produced (that is the M3 per-node
-//! presign driver).
+//! file. In BOTH modes the per-party transport secret keys come from
+//! these seed files (the demo's §13.1 deployment-PKI stand-in); only the
+//! key share and presignature records are fallback material.
 //!
 //! Key separation is by construction: a [`PartySeed`] file contains only
 //! ONE party's material (its transport secret key, its key share of the

@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use k256::AffinePoint;
 
-use crate::presign::Presignature;
+use crate::presign::{KiPresignature, Presignature};
 use crate::{Error, Result};
 
 /// Per-party presignature store bound to exactly one long-term key
@@ -74,6 +74,61 @@ impl PresigStore {
     }
 
     /// Whether the store holds no presignatures.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Whether `id` is present and unconsumed.
+    pub fn contains(&self, id: u64) -> bool {
+        self.records.contains_key(&id)
+    }
+}
+
+/// Key-free pool of KEY-INDEPENDENT presignature records (SPEC §8.7).
+///
+/// The pool-level counterpart of [`PresigStore`] for records that are not
+/// yet bound to any key: the same §8.6(1) single-use discipline — atomic
+/// consume, duplicate-id rejection — WITHOUT the one-key binding (binding
+/// happens online, when a record is consumed for a specific key; see
+/// [`crate::sim::run_sign_ki_pooled`]). Because KI records carry no
+/// key-equivalent material, a §13.4 epoch change does NOT invalidate the
+/// pool (there is no `clear` mandate). Dropping the pool drops any
+/// remaining records; their `Drop` erases the scalars via `zeroize`.
+#[derive(Debug, Default)]
+pub struct KiPool {
+    records: BTreeMap<u64, KiPresignature>,
+}
+
+impl KiPool {
+    /// Create an empty key-free pool.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a record; rejects a duplicate id (nonce-reuse guard,
+    /// §8.6(1)).
+    pub fn insert(&mut self, record: KiPresignature) -> Result<()> {
+        if self.records.contains_key(&record.id) {
+            return Err(Error::PresigStore("duplicate presignature id"));
+        }
+        self.records.insert(record.id, record);
+        Ok(())
+    }
+
+    /// Atomically remove and return the record for `id` — exactly once
+    /// (§8.6(1): transactional delete).
+    pub fn consume(&mut self, id: u64) -> Result<KiPresignature> {
+        self.records
+            .remove(&id)
+            .ok_or(Error::PresigStore("unknown or consumed presignature id"))
+    }
+
+    /// Number of stored (unconsumed) records.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Whether the pool holds no records.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
