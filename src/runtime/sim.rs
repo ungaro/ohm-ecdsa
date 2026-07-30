@@ -10,6 +10,8 @@
 //! logic unchanged. The `*_with_restart` wrappers implement the §10.3
 //! expel-and-restart policy after an identifiable abort.
 
+use std::collections::BTreeMap;
+
 use k256::ecdsa::Signature;
 use k256::Scalar;
 use rand::rngs::StdRng;
@@ -17,11 +19,12 @@ use rand::SeedableRng;
 use sha2::{Digest, Sha256};
 
 use crate::dkg::DkgTamper;
+use crate::open::open;
 use crate::policy::restart_committee;
-use crate::presign::{self, KeyShare, PresignTamper, Presignature};
+use crate::presign::{self, KeyShare, KiPresignature, PresignTamper, Presignature};
 use crate::refresh::{self, ReshareTamper};
-use crate::sign::{self, SignShare};
-use crate::store::PresigStore;
+use crate::sign::{self, KiSignTamper, SignShare};
+use crate::store::{KiPool, PresigStore};
 use crate::transport::{drive_dkg, SimTransport};
 use crate::triples::{self, TriplePublic, TripleShare, TripleTamper};
 use crate::{scalar_from_digest, tags, Committee, Error, Params, PartyId, Phase, Result};
@@ -495,4 +498,121 @@ pub fn run_sign_robust(
     let ((r, s), blamed) = sign::combine_robust(params, &presigs[0], &m, &shares)?;
     let sig = Signature::from_scalars(r, s)?;
     Ok((sig.normalize_s().unwrap_or(sig), blamed))
+}
+
+/// Online signing with a KEY-INDEPENDENT pool record (SPEC §8.7): the
+/// 2-round protocol that moves §8 P4 online.
+///
+/// * R1: a FRESH Beaver triple (generated here via
+///   [`triples::generate`]) masks the product `u·x`: every party
+///   broadcasts its shares of `δ = ⟦u⟧−⟦α⟧` and `ε = ⟦x⟧−⟦β⟧`, opened
+///   through [`open`] — a bad share is an identifiable abort blaming the
+///   sender (β masks the key exactly as in P4 today; `u·x` is never
+///   computed directly, SPEC §12).
+/// * R2: each party locally computes `z_j` ([`sign::ki_z_share`]) and
+///   broadcasts `s_j = m·u_j + r·z_j` ([`sign::sign_share_ki`]);
+///   [`sign::combine_ki`] verifies every share against `m·A[u] + r·A[z]`
+///   (blame on mismatch) and interpolates from the first `t` valid.
+///
+/// ECDSA verification and low-`s` normalization are the caller's/crate's
+/// usual (`Signature::from_scalars` + `normalize_s` here). Fail-fast
+/// only: §10.4 robust continuation for the KI rounds is not implemented
+/// (the record id stays consumed — poisoned — after an abort, as in
+/// §10.3(2)). `keys[i]` must belong to `presigs[i].index` (positionally).
+pub fn run_sign_ki(
+    params: &Params,
+    keys: &[KeyShare],
+    presigs: &[KiPresignature],
+    msg: &[u8],
+    rngs: &mut [StdRng],
+    tamper: Option<&KiSignTamper>,
+) -> Result<Signature> {
+    if keys.len() != presigs.len()
+        || keys
+            .iter()
+            .zip(presigs.iter())
+            .any(|(k, p)| k.index != p.index)
+    {
+        return Err(Error::InvalidParams(
+            "keys/presigs must match positionally (keys[i].index == presigs[i].index)",
+        ));
+    }
+    let m = message_scalar(msg);
+    let t = params.t;
+    let sid = [
+        b"ohm-ecdsa/sign-ki/".as_slice(),
+        &presigs[0].id.to_be_bytes(),
+    ]
+    .concat();
+
+    // R1: fresh triple (SPEC §7) + verified openings δ = ⟦u⟧−⟦α⟧,
+    // ε = ⟦x⟧−⟦β⟧ — exactly the §8 P4 masking, run online.
+    let triple = triples::generate(params, &sid, rngs)?;
+    let pub_t = &triple[0].1;
+    let neg = -Scalar::ONE;
+    let delta_com = presigs[0].u_com.add(&pub_t.ca.scale(&neg));
+    let eps_com = keys[0].com.add(&pub_t.cb.scale(&neg));
+    let mut deltas: BTreeMap<PartyId, Scalar> = presigs
+        .iter()
+        .enumerate()
+        .map(|(k, p)| (p.index, p.u_share - triple[k].0.a))
+        .collect();
+    let epsilons: BTreeMap<PartyId, Scalar> = keys
+        .iter()
+        .enumerate()
+        .map(|(k, key)| (key.index, key.share - triple[k].0.b))
+        .collect();
+    if let Some(tamp) = tamper {
+        if let Some(j) = tamp.bad_open_share {
+            if let Some(s) = deltas.get_mut(&j) {
+                *s += Scalar::ONE; // malicious: wrong R1 opening share
+            }
+        }
+    }
+    let delta = open(t, &delta_com, &deltas, Phase::Sign)?;
+    let eps = open(t, &eps_com, &epsilons, Phase::Sign)?;
+
+    // R2: local z-shares + sign shares, verified combine against
+    // m·A[u] + r·A[z].
+    let z_com = sign::ki_z_com(pub_t, &delta, &eps);
+    let mut shares: Vec<SignShare> = presigs
+        .iter()
+        .enumerate()
+        .map(|(k, p)| sign::sign_share_ki(p, &sign::ki_z_share(&triple[k].0, &delta, &eps), &m))
+        .collect();
+    if let Some(tamp) = tamper {
+        if let Some((party, fake)) = tamp.bad_sign_share {
+            for sh in shares.iter_mut() {
+                if sh.from == party {
+                    sh.s = fake;
+                }
+            }
+        }
+    }
+    let (r, s) = sign::combine_ki(params, &presigs[0], &z_com, &m, &shares)?;
+    let sig = Signature::from_scalars(r, s)?;
+    Ok(sig.normalize_s().unwrap_or(sig))
+}
+
+/// KI online signing through per-party key-free pools (SPEC §8.7, §8.6).
+///
+/// Each participating party's pool atomically consumes `id` (§8.6(1))
+/// before its share is computed; signing then proceeds as in
+/// [`run_sign_ki`], binding the record to `keys` online. As with
+/// [`run_sign_stored`]: if any pool fails to consume, no signature is
+/// produced and already-consumed records stay consumed.
+pub fn run_sign_ki_pooled(
+    params: &Params,
+    keys: &[KeyShare],
+    pools: &mut [KiPool],
+    id: u64,
+    msg: &[u8],
+    rngs: &mut [StdRng],
+    tamper: Option<&KiSignTamper>,
+) -> Result<Signature> {
+    let mut presigs = Vec::with_capacity(pools.len());
+    for pool in pools.iter_mut() {
+        presigs.push(pool.consume(id)?);
+    }
+    run_sign_ki(params, keys, &presigs, msg, rngs, tamper)
 }

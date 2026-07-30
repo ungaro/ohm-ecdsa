@@ -24,6 +24,12 @@
 //! explicit party-id set (the surviving original ids of a §10.3 restart)
 //! instead of the default `1..=n`; per-party arrays (`keys`, `rngs`,
 //! outputs) are positional in the id list.
+//!
+//! [`presign_ki`] is the optional KEY-INDEPENDENT mode (SPEC §8.7): P1–P3
+//! verbatim and NO P4, so the pool record `(id, R, r, [u] = [k⁻¹], A[u])`
+//! is not bound to any key — the key binding moves online, into the
+//! 2-round signing protocol (see [`crate::sign`] and
+//! [`crate::sim::run_sign_ki`]).
 
 use std::collections::BTreeMap;
 
@@ -76,6 +82,36 @@ impl Presignature {
     pub fn apply_tweak(&mut self, tau: &Scalar) {
         self.z_share += *tau * self.u_share;
         self.z_com = self.z_com.add(&self.u_com.scale(tau));
+    }
+}
+
+/// One party's KEY-INDEPENDENT presignature record (SPEC §8.7 — optional
+/// mode): `([u] = [k⁻¹], R, r)` with NO P4 key binding at generation
+/// time.
+///
+/// Unlike [`Presignature`], this record is NOT key-equivalent: `t` pool
+/// shares reveal nothing about any long-term key (there is no `[z]`
+/// binding a key yet), so the §8.6 storage rules relax for pool records.
+/// It is still strictly SINGLE-USE (§8.6(1) — nonce reuse is fatal under
+/// ANY key) and binds to a key only at signing time, where the online
+/// 2-round protocol ([`crate::sim::run_sign_ki`]) forms `[z] = [u·x]`
+/// with a fresh Beaver triple — exactly the §8 P4 construction, moved
+/// online.
+#[derive(Debug)]
+pub struct KiPresignature {
+    pub id: u64,
+    pub index: PartyId,
+    pub r: Scalar,
+    pub big_r: AffinePoint,
+    /// Share of `u = k⁻¹`.
+    pub u_share: Scalar,
+    pub u_com: FeldmanCommitment,
+}
+
+impl Drop for KiPresignature {
+    fn drop(&mut self) {
+        // Compiler-fenced erasure via `zeroize`, as in `Presignature`.
+        self.u_share.zeroize();
     }
 }
 
@@ -330,6 +366,168 @@ pub fn presign_with_committee(
                 u_com: u_com.clone(),
                 z_com: z_com.clone(),
             }
+        })
+        .collect();
+    Ok(presigs)
+}
+
+/// Run the KEY-INDEPENDENT presign protocol for one record id (SPEC
+/// §8.7): P1–P3 of §8 verbatim — the ⟦u⟧/⟦a⟧ joint VSS, the
+/// Beaver-derived ⟦k⟧, and the nonce-point round with per-share point
+/// checks and blame — and NO P4. The record binds to a key online, at
+/// signing time ([`crate::sim::run_sign_ki`]).
+///
+/// P1–P3 never touch the long-term key, so no key shares are taken: the
+/// committee and RNGs suffice. One Beaver triple (for the P2 `v` opening)
+/// is consumed per record; P4's triple moves online (signing round R1).
+/// `rngs[i]` belongs to party `i + 1`. Returns one [`KiPresignature`] per
+/// party.
+pub fn presign_ki(
+    params: &Params,
+    id: u64,
+    rngs: &mut [StdRng],
+    tamper: Option<&PresignTamper>,
+) -> Result<Vec<KiPresignature>> {
+    presign_ki_with_committee(&Committee::full(params), id, rngs, tamper)
+}
+
+/// [`presign_ki`] over an explicit committee (SPEC §10.3 restart):
+/// `rngs[k]` belongs to `committee.ids()[k]` (positionally). Tamper hooks
+/// name ids.
+pub fn presign_ki_with_committee(
+    committee: &Committee,
+    id: u64,
+    rngs: &mut [StdRng],
+    tamper: Option<&PresignTamper>,
+) -> Result<Vec<KiPresignature>> {
+    if rngs.len() < committee.n() {
+        return Err(Error::InvalidParams("rngs must cover the committee"));
+    }
+    let ids = committee.ids();
+    let n = ids.len();
+    let t = committee.t();
+    let sid = format!("ohm-ecdsa/presign-ki/{id}").into_bytes();
+
+    // One fresh triple (SPEC §7) for the P2 v-opening; P4's triple is
+    // online in this mode. The `triple_tamper` fault-injection hook
+    // (tests) targets this session's dealing phase.
+    let t_tamper = tamper.and_then(|tamp| tamp.triple_tamper);
+    let t1 = triples::generate_with_committee(
+        committee,
+        &[sid.as_slice(), b"/t1"].concat(),
+        rngs,
+        t_tamper.as_ref(),
+    )?;
+    let pub1 = &t1[0].1;
+
+    // P1: ephemeral joint randomness [u] (:= k⁻¹) and [a].
+    let u_out = triples::joint_random(
+        committee,
+        &[sid.as_slice(), b"/u"].concat(),
+        rngs,
+        Phase::Presign,
+    )?;
+    let a_out = triples::joint_random(
+        committee,
+        &[sid.as_slice(), b"/a"].concat(),
+        rngs,
+        Phase::Presign,
+    )?;
+    let u_shares: Vec<Scalar> = u_out.iter().map(|o| o.share).collect();
+    let a_shares: Vec<Scalar> = a_out.iter().map(|o| o.share).collect();
+    let u_com = u_out[0].com.clone();
+    let a_com = a_out[0].com.clone();
+
+    // P2: open δ = u − α, ε = a − β; form and open v = a·u via the triple.
+    let neg = -Scalar::ONE;
+    let delta_com = u_com.add(&pub1.ca.scale(&neg));
+    let eps_com = a_com.add(&pub1.cb.scale(&neg));
+    let deltas: BTreeMap<PartyId, Scalar> = ids
+        .iter()
+        .enumerate()
+        .map(|(k, &j)| (j, u_shares[k] - t1[k].0.a))
+        .collect();
+    let epsilons: BTreeMap<PartyId, Scalar> = ids
+        .iter()
+        .enumerate()
+        .map(|(k, &j)| (j, a_shares[k] - t1[k].0.b))
+        .collect();
+    let delta = open(t, &delta_com, &deltas, Phase::Presign)?;
+    let eps = open(t, &eps_com, &epsilons, Phase::Presign)?;
+
+    let v_com = pub1
+        .cc
+        .clone()
+        .add(&pub1.cb.scale(&delta))
+        .add(&pub1.ca.scale(&eps))
+        .add_const(&(delta * eps));
+    let mut v_shares: BTreeMap<PartyId, Scalar> = ids
+        .iter()
+        .enumerate()
+        .map(|(k, &j)| {
+            (
+                j,
+                t1[k].0.c + delta * t1[k].0.b + eps * t1[k].0.a + delta * eps,
+            )
+        })
+        .collect();
+    if let Some(tamp) = tamper {
+        if let Some(j) = tamp.bad_open_share {
+            if let Some(s) = v_shares.get_mut(&j) {
+                *s += Scalar::ONE; // malicious: wrong opening share
+            }
+        }
+    }
+    let v = open(t, &v_com, &v_shares, Phase::Presign)?;
+    if v == Scalar::ZERO {
+        return Err(Error::ZeroValue("v = 0".into())); // restart with fresh randomness
+    }
+    let v_inv =
+        Option::<Scalar>::from(v.invert()).ok_or_else(|| Error::ZeroValue("v = 0".into()))?;
+
+    // P3: [k] = v⁻¹·[a]; nonce point R with per-share point checks.
+    let k_com = a_com.scale(&v_inv);
+    let mut r_points = Vec::with_capacity(n);
+    for (k, &j) in ids.iter().enumerate() {
+        let k_share = v_inv * a_shares[k];
+        let mut r_j = ProjectivePoint::GENERATOR * k_share;
+        if let Some(tamp) = tamper {
+            if tamp.bad_nonce_point == Some(j) {
+                r_j += ProjectivePoint::GENERATOR; // malicious: wrong point
+            }
+        }
+        if r_j != k_com.eval_at(j) {
+            return Err(Error::Abort {
+                abort: IdentifiableAbort {
+                    phase: Phase::Presign,
+                    blamed: vec![j],
+                    detail: "invalid nonce point R_j".into(),
+                },
+            });
+        }
+        r_points.push(r_j);
+    }
+    let lambdas = lagrange_coeffs(ids);
+    let mut big_r_proj = ProjectivePoint::IDENTITY;
+    for (l, rp) in lambdas.iter().zip(r_points.iter()) {
+        big_r_proj += *rp * l;
+    }
+    let big_r = big_r_proj.to_affine();
+    let r_encoded = big_r.to_encoded_point(false);
+    let r_scalar = scalar_from_digest(r_encoded.x().expect("uncompressed point has x"));
+    if r_scalar == Scalar::ZERO {
+        return Err(Error::ZeroValue("r = 0".into()));
+    }
+
+    // NO P4: the record stays key-free; `z = u·x` is formed online.
+    let presigs = (0..n)
+        .map(|k| KiPresignature {
+            id,
+            index: ids[k],
+            r: r_scalar,
+            big_r,
+            u_share: u_shares[k],
+            u_com: u_com.clone(),
         })
         .collect();
     Ok(presigs)

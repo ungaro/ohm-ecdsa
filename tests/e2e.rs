@@ -11,11 +11,12 @@ use ohm_ecdsa::open::open;
 use ohm_ecdsa::presign::{self, KeyShare, PresignTamper};
 use ohm_ecdsa::refresh::ReshareTamper;
 use ohm_ecdsa::shamir::{interpolate_at, slot_point};
+use ohm_ecdsa::sign::KiSignTamper;
 use ohm_ecdsa::sim;
 use ohm_ecdsa::transport::{self, SimTransport};
 use ohm_ecdsa::triples::{self, TripleShare, TripleTamper};
 use ohm_ecdsa::vss::FeldmanCommitment;
-use ohm_ecdsa::{Committee, Error, Params, PartyId, Phase, PresigStore};
+use ohm_ecdsa::{Committee, Error, KiPool, Params, PartyId, Phase, PresigStore};
 
 fn pubkey(keys: &[KeyShare]) -> ProjectivePoint {
     keys[0].com.points[0]
@@ -982,6 +983,104 @@ fn reshare_cheating_dealer_is_blamed() {
         Error::Abort { abort } => {
             assert_eq!(abort.phase, Phase::Refresh);
             assert_eq!(abort.blamed, vec![4]);
+        }
+        other => panic!("expected identifiable abort, got {other:?}"),
+    }
+}
+
+// --- Key-independent presignatures (SPEC §8.7) ------------------------------
+
+#[test]
+fn ki_pool_signs_for_two_different_keys() {
+    // THE headline property: ONE key-free pool serves ANY key.
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 90);
+    let keys_a = sim::run_keygen(&params, b"key/90a", &mut rngs).unwrap();
+    let keys_b = sim::run_keygen(&params, b"key/90b", &mut rngs).unwrap();
+    assert_ne!(pubkey(&keys_a), pubkey(&keys_b));
+
+    // Two pool records per party, generated with NO key material.
+    let ki1 = presign::presign_ki(&params, 1, &mut rngs, None).unwrap();
+    let ki2 = presign::presign_ki(&params, 2, &mut rngs, None).unwrap();
+
+    // Record 1 binds to key A online (2-round signing), verifies under X_A.
+    let msg_a = b"KI pool record under key A";
+    let sig_a = sim::run_sign_ki(&params, &keys_a, &ki1, msg_a, &mut rngs, None).unwrap();
+    assert_valid(&pubkey(&keys_a), msg_a, &sig_a);
+
+    // Record 2 of the SAME pool binds to the independent key B.
+    let msg_b = b"same KI pool, under key B";
+    let sig_b = sim::run_sign_ki(&params, &keys_b, &ki2, msg_b, &mut rngs, None).unwrap();
+    assert_valid(&pubkey(&keys_b), msg_b, &sig_b);
+}
+
+#[test]
+fn ki_sign_single_use_enforced() {
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 91);
+    let keys = sim::run_keygen(&params, b"key/91", &mut rngs).unwrap();
+    let ki = presign::presign_ki(&params, 1, &mut rngs, None).unwrap();
+
+    // Per-party key-free pools; duplicate-id insert is rejected (§8.6(1)).
+    let mut pools: Vec<KiPool> = ki
+        .into_iter()
+        .map(|rec| {
+            let mut pool = KiPool::new();
+            pool.insert(rec).unwrap();
+            pool
+        })
+        .collect();
+    let dup = presign::presign_ki(&params, 1, &mut rngs, None).unwrap();
+    assert!(matches!(
+        pools[0].insert(dup.into_iter().next().unwrap()),
+        Err(Error::PresigStore(_))
+    ));
+
+    // First sign consumes id 1 in every pool and verifies under X.
+    let msg = b"KI single-use signature";
+    let sig = sim::run_sign_ki_pooled(&params, &keys, &mut pools, 1, msg, &mut rngs, None).unwrap();
+    assert_valid(&pubkey(&keys), msg, &sig);
+
+    // The same id can never be consumed again (nonce-reuse guard).
+    assert!(pools.iter().all(|p| !p.contains(1)));
+    let err =
+        sim::run_sign_ki_pooled(&params, &keys, &mut pools, 1, msg, &mut rngs, None).unwrap_err();
+    assert!(matches!(err, Error::PresigStore(_)));
+}
+
+#[test]
+fn ki_sign_cheater_is_identified() {
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 92);
+    let keys = sim::run_keygen(&params, b"key/92", &mut rngs).unwrap();
+
+    // R1: party 2 broadcasts a wrong opening share (δ = ⟦u⟧−⟦α⟧).
+    let ki = presign::presign_ki(&params, 1, &mut rngs, None).unwrap();
+    let tamper = KiSignTamper {
+        bad_open_share: Some(2),
+        ..Default::default()
+    };
+    let mut rngs_a = rngs.clone();
+    let err = sim::run_sign_ki(&params, &keys, &ki, b"m", &mut rngs_a, Some(&tamper)).unwrap_err();
+    match err {
+        Error::Abort { abort } => {
+            assert_eq!(abort.phase, Phase::Sign);
+            assert_eq!(abort.blamed, vec![2]);
+        }
+        other => panic!("expected identifiable abort, got {other:?}"),
+    }
+
+    // R2: party 3 broadcasts a garbage signature share.
+    let ki = presign::presign_ki(&params, 2, &mut rngs, None).unwrap();
+    let tamper = KiSignTamper {
+        bad_sign_share: Some((3, Scalar::from(0xdeadu64))),
+        ..Default::default()
+    };
+    let err = sim::run_sign_ki(&params, &keys, &ki, b"m", &mut rngs, Some(&tamper)).unwrap_err();
+    match err {
+        Error::Abort { abort } => {
+            assert_eq!(abort.phase, Phase::Sign);
+            assert_eq!(abort.blamed, vec![3]);
         }
         other => panic!("expected identifiable abort, got {other:?}"),
     }

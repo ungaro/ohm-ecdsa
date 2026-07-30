@@ -392,6 +392,27 @@ Exactly like triple batching (§7.3): one commit-reveal covers all `B` ephemeral
 3. **Secure erase** on consume, expiry, or committee refresh.
 4. **No cross-key use.** A record bound to `x` in P4 MUST NOT be used with a different key. (This is what keeps the design out of KU23 territory, §12.3.)
 
+### 8.7 Key-independent mode (optional)
+
+**Motivation.** Key-dependent presignatures scale as `O(keys)`: every key needs its own factory inventory. Wallet-as-a-service and KMS-network deployments instead want a **commodity pool**: one key-independent inventory filled off-peak, spendable by any key — including keys that do not exist yet — at signing time (burst absorption, just-in-time account provisioning, issuer operations with per-SPV keys). The price is one extra online round and one extra triple per signature; the default key-dependent mode with its 1-round online phase remains the recommended configuration for committee custody.
+
+**Pool record.** `ρ⁰ = (id, R, r, [u], A[u])` — phases P1–P3 of §8 verbatim (`u = k⁻¹` dealt directly, `[k]` derived, nonce point round); **P4 is omitted**. No key is involved at generation time.
+
+**Protocol 8.7.1 — KI-Sign(M, id, key `x`).** Two broadcast rounds:
+
+| Round | Action |
+|---|---|
+| K1 | Each `P_j` broadcasts `δ_j = u_j − α_j` and `ε_j = x_j − β_j` from a fresh triple `(⟦α⟧,⟦β⟧,⟦γ⟧)`; `β` masks the long-term key — exactly the P4 masking, moved online. Each share is verified against `A[u]−A[α]` and `A[x]−A[β]` by point equality; mismatch ⇒ blame (§10). |
+| K2 | Each party locally computes `⟦z⟧ := ⟦γ⟧ + δ·⟦β⟧ + ε·⟦α⟧ + δε` (so `⟦z⟧ = [k⁻¹x]` for *this* key) and `s_j = m·u_j + r·z_j`, and broadcasts `s_j`; shares are verified against `m·A[u] + r·A[z]`; interpolate from the first `T` valid shares, ECDSA-verify, low-`s`, consume id. |
+
+Identifiable abort is preserved end-to-end: every opening and share is point-checked against public commitments.
+
+**Storage relaxation.** `T` shares of a pool record `(u, R, r)` reveal **no key** — pool records are NOT key-equivalent (contrast §8.6(2)); the key-share-grade storage duty applies only after binding. **Single-use remains mandatory**: consuming the same `k` with two different messages exposes whichever key signed both.
+
+**Construction constraint.** The online binding MUST use a Beaver triple as above. Computing `u_j·x_j` locally (degree-`2T−2` products) would require zero-sharing blinding to open safely — that combination is the machinery claimed by US 11,757,657 (§12.2, element E9) and is deliberately avoided.
+
+**Patent posture.** Key-independence per se is public art: DJNPO20's presignature binds no key (2020 [^djnpo]) and cait-sith shipped key-independent preprocessing in 2022 [^cait] — both before KU23's priority date. What Dfns claims as patented is KU23's **batch generation pipeline** (coordinator-assisted, packed presignature production) [^ku23][^dfns], which this mode does not implement: pool generation uses the ordinary §7/§8 commit-reveal machinery with binding simply deferred. The mode is nonetheless **yellow-flag**: opt-in, documented, and subject to FTO review for commercial multi-key use (§12.6); Dfns's stated intent to lift the KU23 patent via LF Decentralized Trust [^dfns] would turn the flag green.
+
 ---
 
 ## 9. Sign (Online Phase)
@@ -605,6 +626,8 @@ KU23's stated contribution is **batch generation of key-independent presignature
 
 OHM-ECDSA differs on the core architectural point: presignatures are **key-dependent** — each record binds the long-term key in phase P4 by computing `[z] = [k⁻¹x]` at generation time, in the Groth–Shoup presignature model [^gs21]. There is no key-independent pool, no later binding step, and no coordinator pipeline; batching (§8.5) is per-key commit-reveal amortization only. Deployment rule §8.6(4) (no cross-key use) keeps implementations on this side of the line.
 
+**Key-independence itself is public art.** DJNPO20's presignature `(R, [k⁻¹], [e], [d])` binds no key (2020) [^djnpo]; cait-sith shipped key-independent preprocessing in 2022 [^cait] — both before KU23's priority. OHM-ECDSA's optional key-independent mode (§8.7) follows that lineage using the ordinary commit-reveal and Beaver-triple machinery of §7–§8 with binding deferred to signing time; it implements no element of KU23's batch *pipeline* (no coordinator-assisted generation, no KU23 packing), which is where Dfns's patent actually sits. The mode is opt-in and yellow-flag pending Dfns's stated patent-lifting [^dfns].
+
 ### 12.4 Dishonest-majority patent families — not practiced
 
 The Paillier/MtA two-party and multi-party families (Unbound→Coinbase lineage; GG18/GG20 constructions [^gg20]; OT-based DKLs [^dkls]; CGGMP [^cggmp]) claim machinery OHM-ECDSA simply does not contain: no homomorphic encryption, no MtA conversion, no OT, no range proofs, no dishonest-majority signing.
@@ -640,13 +663,13 @@ This document is itself a defensive publication: once timestamped publicly, it i
 
 ### 13.1 Transport checklist (beyond the reference driver)
 
-* Mutually authenticated channels (mTLS) with per-message signatures over `(sid, phase, round, payload)` for non-repudiation (§10.2).
+* Mutually authenticated channels (mTLS) with per-message signatures over `(sid, phase, round, payload)` for non-repudiation (§10.2). The reference node (`ohm-ecdsa-node`) implements this as an OPTIONAL layer: TLS 1.3 with certificates pinned to the committee (no PKI — a development stand-in for a deployment's own PKI), envelope signatures always on; the §13.6 disclaimers apply unchanged.
 * Echo broadcast as specified in §4.7; persist accepted-message sets for blame evidence.
 * Session ids: `sid = H(genesis ‖ key-id ‖ presig-id ‖ protocol-tag)`; never reuse a presig id for a key (§8.6).
 
 ### 13.2 From the reference orchestrator to production
 
-`src/sim.rs` models broadcast by delivering identical message sets; per-party logic in `dkg.rs`, `triples.rs`, `presign.rs`, `sign.rs` is already message-oriented (`Bcast`/`P2P` structs keyed by sender). A production node wraps these in an async runtime with the transport of §13.1. Keep the deterministic RNG seeds out of production: use OS CSPRNG per party. The companion crate `ohm-ecdsa-node` (`node/`) walks this path: M1 is a localhost-scale orchestrator over real TCP with §4.7 echo broadcast and §10.2 signed envelopes; M2 adds per-party node drivers — each party its own OS process holding only its own key, keygen with the §6.1 complaint subprotocol carried on the wire, and per-node §9/§10.4 online signing (presignatures seeded from a prior orchestrated run; per-node presign, TLS, and persistence remain open, §13.1), and the §13.6 disclaimers apply unchanged.
+`src/sim.rs` models broadcast by delivering identical message sets; per-party logic in `dkg.rs`, `triples.rs`, `presign.rs`, `sign.rs` is already message-oriented (`Bcast`/`P2P` structs keyed by sender). A production node wraps these in an async runtime with the transport of §13.1. Keep the deterministic RNG seeds out of production: use OS CSPRNG per party. The companion crate `ohm-ecdsa-node` (`node/`) walks this path: M1 is a localhost-scale orchestrator over real TCP with §4.7 echo broadcast and §10.2 signed envelopes; M2 adds per-party node drivers — each party its own OS process holding only its own key, keygen with the §6.1 complaint subprotocol carried on the wire, and per-node §9/§10.4 online signing; M3a closes the offline gap — per-node triple generation (§7.2) and presign (§8) over the same wire machinery, so the demo's full arc keygen → presign → sign runs under the key its own keygen produced (fail-fast openings; ceremony-seeded presignatures remain as a fallback); M3b adds durability and evidence — a crash-safe single-use presignature store per node (§8.6, fsync'd consume tombstones), an append-only accepted-envelope transcript (§4.7), and blame-token archiving with an offline auditor (§A.4); M3c adds the optional §13.1 mTLS layer (committee-pinned certificates, envelope signatures unchanged) — while robust driver-level continuation remains open, and the §13.6 disclaimers apply unchanged.
 
 ### 13.3 Hardening checklist (reference implementation status)
 

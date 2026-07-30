@@ -174,11 +174,12 @@ let sig = sim::run_sign(&params, &presigs[..2], b"hello threshold", None).unwrap
 | `epoch_refresh` | §13.4 refresh + re-share to a new committee, X unchanged | `cargo run --example epoch_refresh` |
 
 The companion crate ships networked demos over localhost real TCP with
-echo broadcast and signed envelopes (see `node/README.md`): the M2
-per-party demo — three OS processes each holding only its own key,
-keygen with §6.1 complaints on the wire plus online signing,
-`cargo run -p ohm-ecdsa-node -- spawn-demo` — and the original M1
-orchestrator demo (`-- m1-demo`). A mesh latency benchmark lives at
+echo broadcast and signed envelopes (see `node/README.md`): the M2/M3a
+per-party demo — three OS processes each holding only its own key, the
+full arc keygen → presign → sign under the key their own keygen
+produced, `cargo run -p ohm-ecdsa-node -- spawn-demo` (M3c: `--tls`
+runs the same arc over committee-pinned mTLS) — and the original
+M1 orchestrator demo (`-- m1-demo`). A mesh latency benchmark lives at
 `cargo run --release -p ohm-ecdsa-node --example mesh_perf`.
 
 ## Choosing parameters (T, n, B)
@@ -209,7 +210,7 @@ that are machine-independent (sources and timing context:
 | Online signing | 1 round | non-interactive, needs semi-honest coordinator | 1 round |
 | Identifiable abort | ✗ (given up for speed) | ✗ (detects, can't blame) | ✓ — unconditional |
 | Guaranteed delivery | ✗ | ✗ | ✓ (optional, §10.4) |
-| Presignatures | key-independent | key-independent, batched | key-dependent (by design, §12.3) |
+| Presignatures | key-independent | key-independent, batched | key-dependent by default (§12.3); optional key-independent pools (§8.7) |
 | Reported presig cost | 34 ms (AWS, LAN) | 1.3 ms amortized at batch 10,000 | 9.7 ms; 5.2 ms packed |
 | Reported online cost | 19.9 ms end-to-end | ≈80 µs local + network | 0.28 ms local |
 | Assumptions | ECDLP | ECDLP + GGM + coordinator | ECDLP + ROM |
@@ -231,6 +232,15 @@ above) changes what teams can build and operate themselves:
   construction (still get an FTO opinion for commercial use — §12.6).
   Same dynamic that made GG18-class open code explode the wallet
   ecosystem, but for the honest-majority regime.
+* **Multi-key signing at scale (WaaS / KMS networks).** One MPC
+  infrastructure, thousands to millions of customer keys. Two built-in
+  answers: HD tweaks (§9.4) already let one presignature pool serve an
+  entire key *tree* at one-round online cost; and the optional
+  key-independent pool (§8.7) makes presignatures a commodity buffer any
+  key can draw from — filled off-peak, spent during the burst — at the
+  price of a second online round. Bonus property: unbound pool records
+  are *not* key-equivalent, so the buffer needs lighter protection than
+  key shares.
 * **On-chain multisig replacement.** The output is an ordinary ECDSA
   signature under an ordinary key: the threshold policy is invisible
   on-chain — no multisig contract to deploy or audit, lower fees, policy
@@ -293,13 +303,16 @@ sets, issuers, auditors.
   batch + aggregate DLEQ verification), packed (§7.4 Franklin–Yung)
 * Key-dependent presignatures (§8), batched (§8.5) and packed; additive
   HD tweaks (§9.4)
+* Optional key-independent presignature pools (§8.7): one pool serves any
+  key — the key binding moves online (2-round signing, one Beaver triple,
+  same per-share identifiable abort)
 * One-round signing with per-share identifiable abort (§9–§10)
 * Robust continuation (§10.4) in sign, presign, and triples: blame the
   cheater and still deliver
 * Expel-and-restart (§10.3) composed with robust continuation; aborted
   ids poisoned; `T` never silently lowered
 * Single-use presignature store (§8.6): atomic consume, duplicate-id
-  rejection
+  rejection; key-free pool for key-independent records (§8.7)
 * Committee maintenance (§13.4): proactive refresh and committee-change
   re-sharing, public key unchanged
 * Explicit transport seam (§13.1/§13.2) + single-threaded reference
@@ -312,12 +325,31 @@ sets, issuers, auditors.
   its own key and runs as its own OS process; per-node keygen with the
   §6.1 complaint subprotocol on the wire (consistent blame at every
   node), per-node §9/§10.4 online signing (wrong shares blamed, signature
-  still delivered); presignatures seeded from a prior orchestrated run
-  (per-node presign is M3); `spawn-demo` + `mesh_perf` latency benchmark
+  still delivered); `spawn-demo` + `mesh_perf` latency benchmark
+* M3a per-node offline factory over the wire (`node/src/party.rs`):
+  per-node triple generation (§7.2 — two ephemeral commit-reveal VSS
+  instances, DLEQ product proofs, §6.1 complaints on the re-shares) and
+  per-node presign (§8 — fail-fast verified openings, nonce-point
+  checks); the demo's full arc keygen → presign → sign runs under the key
+  each process's OWN keygen produced (ceremony-seeded presignatures
+  remain as a `--seeded` fallback)
+* M3b persistence + evidence (`node/src/persist.rs`): durable
+  crash-safe single-use presignature stores (§8.6 — fsync'd consume
+  tombstone before the record is handed out), an append-only transcript
+  of accepted signed envelopes (§4.7), blame-token files for the fault
+  classes with wire evidence (§10.2 — F2 dealt shares, F6 sign shares),
+  and an offline `auditor` subcommand (§A.4); all in the canonical wire
+  format, std only
+* M3c optional mTLS (`node/src/tls.rs`): every mesh connection can be
+  wrapped in mutually-authenticated TLS 1.3 (rustls, blocking streams)
+  with certificates pinned to the committee (no PKI, no system roots —
+  the TLS peer identity matches the expected `PartyId`); plain TCP
+  remains the localhost default, `setup --tls` / `spawn-demo --tls`
+  generate per-party self-signed certs (rcgen)
 
-**Not yet** (roadmap): production-hardened transport (M3: TLS/mTLS,
-persistence of accepted-message sets, per-node presign over the mesh —
-the `transport` module is the contract), key rotation
+**Not yet** (roadmap): production-hardened transport beyond M3c
+(reconnection, clean shutdown, DoS hardening — the `transport` module
+is the contract), key rotation
 (§13.4 — re-DKG with a new `X`), audit.
 
 ## Documentation map
@@ -358,7 +390,7 @@ crate root (`ohm_ecdsa::shamir`, `ohm_ecdsa::sim`, …).
 | `runtime/transport` | 4.7, 10.2, 13.1, 13.2 | transport seam: `Envelope` message contract, sync `Transport` trait, `SimTransport` reference impl, `drive_dkg` transport-driven keygen driver, signed envelopes (`SignedEnvelope`/`SigningTransport`), offline-verifiable `BlameToken`, `drive_dkg_signed` |
 | `runtime/transport` | 4.7, 10.2, 13.1, 13.2 | transport seam: `Envelope` message contract, sync `Transport` trait, `SimTransport` reference impl, `drive_dkg` transport-driven keygen driver, canonical `Encode`/`Decode` wire format, signed envelopes (`SignedEnvelope`/`SigningTransport`), offline-verifiable `BlameToken`, `drive_dkg_signed` |
 | `runtime/sim` | 4.7, 10.3, 13.2 | reference orchestrator (keygen routes through the `transport` seam), §10.3 restart wrappers |
-| `node/` (crate `ohm-ecdsa-node`) | 4.7, 10.2, 13.1, 13.2 | transport companion: full-mesh real TCP, signed envelopes verified on receipt, echo broadcast; M1 `MeshTransport` orchestrator driver; M2 `PartyNode` per-party drivers (keygen with §6.1 wire complaints, §9/§10.4 signing, process separation, `mesh_perf` benchmark) |
+| `node/` (crate `ohm-ecdsa-node`) | 4.7, 10.2, 13.1, 13.2 | transport companion: full-mesh real TCP, signed envelopes verified on receipt, echo broadcast; M1 `MeshTransport` orchestrator driver; M2 `PartyNode` per-party drivers (keygen with §6.1 wire complaints, §9/§10.4 signing, process separation, `mesh_perf` benchmark); M3a per-node offline factory (§7.2 triples + §8 presign over the wire — the demo signs under its own keygen's key); M3b durable stores + transcript/blame archive + auditor; M3c optional committee-pinned mTLS (`node/src/tls.rs`) |
 
 Contributions: keep `cargo fmt && cargo clippy --workspace --all-targets &&
 cargo test --workspace` green; follow `AGENTS.md`.
