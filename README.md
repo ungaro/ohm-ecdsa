@@ -59,6 +59,13 @@ say *which* party cheated. Then publish everything, timestamped, so the
 next one can't be patented either (§12.5). Apache-2.0, with its express
 patent grant.
 
+We acknowledge the inspiration of **Chelsea H. Komlo**'s call at the
+Stanford Science of Blockchain 2026 conference (lightning talks):
+[*"patenting cryptography is bad and holds the entire field back, as
+we've seen with Schnorr/ECDSA. Don't patent
+math."*](https://x.com/chelseakomlo/status/2081889904309702805)
+OHM-ECDSA is one answer to that call.
+
 ## How it works
 
 Heavy cryptography runs **offline**, in bulk, ahead of time. When a
