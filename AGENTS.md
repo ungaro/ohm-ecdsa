@@ -20,7 +20,33 @@ durable presignature stores, transcript + blame-token archiving, offline
 auditor, M3c optional committee-pinned mTLS via rustls/rcgen, §8.7 KI
 mode over the wire — per-node key-free pool production (`presign_ki`,
 P1–P3 verbatim, P4 omitted) and the 2-round online KI sign (`sign_ki`),
-with an in-memory key-free pool per node).
+with an in-memory key-free pool per node, H2 network resilience —
+reconnection with backoff + journal re-sync, clean shutdown, IO
+timeouts, DoS guards with `MeshMetrics` counters, multiple concurrent
+sessions demultiplexed by sid with the `--factory` demo).
+H4 robust continuation + expel-and-restart over the wire
+(`node/src/party.rs`, SPEC §10.4 + §10.3, OPT-IN — the default drivers
+stay fail-fast): §10.4-robust drivers (`presign_robust` — openings
+filtered-and-continued via the core's `open_robust` with consistent
+blame; `triple_robust` — T3 re-share faults publicly reconstruct the
+cheater's committed re-sharing polynomial via two added broadcast
+rounds, `ReshareRequests` carrying the dealer's own signed envelope as
+self-authenticating evidence + `ReshareSupply`; `sign_ki_robust`) and
+the §10.3 expel-and-restart wrappers (`keygen_with_restart` /
+`presign_with_restart` — the core's `policy::restart_committee`
+computed deterministically at every node, poisoned sid/id per §10.3(2),
+survivors' ORIGINAL ids preserved, zero-slack refusal — `t` never
+lowered; `sign_over` / `sign_stored_over` sign over the post-restart
+committee; `node --restart` / `spawn-demo --restart`).
+H3 distributed committee ceremony (`node/src/ceremony.rs`) is the
+standard setup path: per-party `init` on each party's OWN machine
+(own transport keypair + M3c cert; SECRET `party-<id>.identity`,
+PUBLIC `party-<id>.pub`), out-of-band bundle exchange with hex
+fingerprints, and a PUBLIC `assemble` writing the unchanged
+`committee.hex` format (committee `x` = identity point: no ceremony
+key, `--seeded` impossible with `--identity`); nodes fail closed at
+startup when their own key/cert does not match the registry/pins.
+The one-process `setup`/`spawn-demo` ceremony is DEMO-ONLY.
 
 Protocol properties:
 
@@ -67,16 +93,16 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
 
 - `cargo build` / `cargo build --workspace` — build the library and the
   node crate.
-- `cargo test -p ohm-ecdsa` — runs 29 unit tests (inline `#[cfg(test)]`
+- `cargo test -p ohm-ecdsa` — runs 30 unit tests (inline `#[cfg(test)]`
   modules in `src/lib.rs`, `src/primitives/{shamir,vss,open,dleq}.rs`,
   `src/protocol/{dkg,triples}.rs`, `src/runtime/{policy,transport}.rs` —
   including the `wire_*` canonical `Encode`→`Decode` roundtrip and
   malformed-input tests),
   45 integration tests in `tests/e2e.rs`, and 5 example smoke tests in
   `tests/examples.rs` (each narrative example is run via `cargo run
-  --example` and checked for its guarantee lines). All 79 pass at the
+  --example` and checked for its guarantee lines). All 80 pass at the
   time of writing.
-- `cargo test -p ohm-ecdsa-node` — 48 tests: 3 M1 tests in
+- `cargo test -p ohm-ecdsa-node` — 74 tests: 3 M1 tests in
   `node/tests/mesh_keygen.rs` (3 nodes on localhost ephemeral ports:
   keygen over `MeshTransport` reconstructs the joint key, a cheating
   dealer is blamed with a verifying `BlameToken`, forged/unknown-sender/
@@ -90,8 +116,8 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
   bad DLEQ proof / bad re-share via wire complaints / false accusation
   each named consistently, bad nonce point and bad opening share named
   in presign, full arc keygen→presign→sign under the nodes' own key),
-  13 M2/M3a/M3b/M3c/§8.7 process-level tests in `node/tests/process_demo.rs`
-  (real child processes via `spawn-demo` — serialized within the test
+  19 M2/M3a/M3b/M3c/§8.7/H2/H3/H4 process-level tests in `node/tests/process_demo.rs`
+  (real child processes — 16 via `spawn-demo`, serialized within the test
   binary by a static `Mutex` and run under a 300 s watchdog, because 3
   child processes per test starve under a parallel full-workspace run:
   honest full arc, the `--ki` KI arc (keygen → KEY-FREE pool record →
@@ -104,7 +130,43 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
   `BLAME presign`, `--persist` full arc leaving fsync'd consume
   tombstones and decodable transcripts, a `bad-deal` token file
   verified by the `auditor` subcommand and a tampered copy rejected,
-  the `--tls` full arc over mTLS),
+  the `--tls` full arc over mTLS, the `--factory 2` H2 demo — a
+  background presignature factory per process overlapping 3 online
+  signatures, factory progress asserted, every signature verifying,
+  the `--restart` H4 demos — a bad opening share named by every process
+  while the presign and signature still COMPLETE (blame + continued
+  service), and a dealing-phase cheat REFUSED at zero slack (consistent
+  abort, `t` never lowered);
+  plus 3 H3 distributed-ceremony tests — three separate `init` runs +
+  a public `assemble` booting a full-arc committee from per-party
+  identity files (X agreement + a signature verifying under the fresh
+  key), `assemble` rejecting a duplicate party id, and tampered `.pub`
+  bundles — swapped certificate, swapped transport key — failing the
+  node closed at startup),
+  10 H4 thread-level tests in `node/tests/party_robust.rs` (strict
+  per-node key separation: robust sign — bad `s_j` filtered and blamed
+  `[2]` at every node, the SAME valid low-`s` signature delivered, the
+  archived F6 token verifying offline at every node; robust presign —
+  bad `v` opening share and bad nonce point each completing with
+  consistent blame and records that sign and verify; robust triples —
+  a bad re-share publicly reconstructed via the request/supply rounds
+  (the victim's recovered c-share verifies against A[γ], `c == a·b`,
+  dealer blamed consistently), a fabricated reconstruction request
+  blaming the requester; §10.3 restart — 3-of-6 keygen and presign
+  dealing cheaters restarting over the 5 survivors' ORIGINAL ids (the
+  presign id poisoned to `first_id + 1`), completing and signing over
+  the final committee; zero-slack refusal in 2-of-3; robust KI sign —
+  bad R2 share and bad R1 opening share each blamed with the KI
+  signature delivered),
+  6 H2 thread-level tests in `node/tests/resilience.rs` (reconnection
+  after a dropped outgoing connection — journal re-sync completes the
+  in-flight keygen with `reconnects >= 1`, a silent peer failing its
+  round loudly on the round timeout with no parked threads, clean
+  shutdown idle and mid-session with all threads joined, the listener
+  accept-rate window counting a raw poke flood, garbage frames dropped
+  while the honest keygen completes, and concurrent sessions — a
+  background factory keeping 2 presigs pooled per node while signing 3
+  messages, signatures verifying under the fresh key),
   3 §8.7 KI-over-wire thread-level tests in `node/tests/party_ki.rs`
   (strict per-node key separation: the KI full arc signs under the
   nodes' own key with pool single-use enforced, ONE key-free pool signs
@@ -124,9 +186,14 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
   plaintext fallback — and a plaintext peer dropped by a TLS listener
   that still completes keygen afterwards), and 3 M3c unit tests in
   `node/src/tls.rs` (pinning verifiers accept exactly the pinned cert
-  and reject any other; inconsistent own/pinned material rejected).
+  and reject any other; inconsistent own/pinned material rejected),
+  and 4 H3 unit tests in `node/src/ceremony.rs` (identity/pub
+  roundtrip with the secret key matching the bundle's verifying key,
+  fingerprint sensitivity to id/key/cert but not the addr hint,
+  `assemble` committee-shape validation — duplicate ids, id gaps, bad
+  threshold — and mixed-TLS-posture rejection).
 - `cargo run -p ohm-ecdsa-node -- spawn-demo [--cheat-node K --cheat C]
-  [--seeded] [--persist] [--tls] [--ki] [--delay-ms D]` — M3a demo: 3 child
+  [--seeded] [--persist] [--tls] [--ki] [--factory N] [--restart] [--delay-ms D]` — M3a demo: 3 child
   processes, each holding only its own seed; the FULL ARC keygen →
   presign → sign, all under the key the processes' own keygen produced;
   prints per-process logs with per-phase timings, the joint key, the
@@ -140,11 +207,26 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
   take `--tls CERT KEY --pinned DIR`, and `setup --tls` writes the
   per-party cert files for manual runs; `--ki` (§8.7) runs the
   key-independent arc: keygen → KEY-FREE pool record (P1–P3, no P4) →
-  2-round online KI sign under the fresh key).
+  2-round online KI sign under the fresh key; `--factory N` (H2) runs
+  the concurrent-sessions demo: a background factory thread keeps N
+  presignatures in a pool while the main thread signs 3 messages,
+  ending with a clean `PartyNode::shutdown`; `--restart` (H4) runs the
+  arc on the §10.4-robust + §10.3-restart drivers — a continuable
+  cheater is named AND the arc completes, a dealing-phase cheater is
+  expelled and the session re-runs over the survivors (refused at zero
+  slack — 2-of-3 refuses, `t` never lowered).
   `cargo run -p ohm-ecdsa-node -- auditor TOKEN_FILE COMMITTEE_FILE` is
   the M3b offline §A.4 evidence check (exit 0 = VALID).
   `cargo run -p ohm-ecdsa-node -- m1-demo [-- PORT_BASE]` is the original
   M1 orchestrator demo.
+  `cargo run -p ohm-ecdsa-node -- init --id N --dir D [--addr H:P]
+  [--tls]` (H3) is the per-party ceremony step (own keypair + cert on
+  its own machine; prints the bundle FINGERPRINT);
+  `cargo run -p ohm-ecdsa-node -- assemble --committee D --inputs
+  PUB,... [--t T]` (H3) is the PUBLIC assembly step (validates the
+  bundles, writes `committee.hex` + the pinned cert set, prints all
+  fingerprints); `node --identity FILE` boots from an H3 identity
+  (`--seed` stays for the DEMO-ONLY one-process ceremony).
 - `cargo run --release -p ohm-ecdsa-node --example mesh_perf` — M2
   latency benchmark over the real mesh: keygen and online-sign wall time
   for 2-of-3 and 3-of-5, localhost and with per-link artificial delay.
@@ -191,13 +273,13 @@ re-exports too:
 | `protocol/dkg.rs` | 6, 6.1, 7.3, 7.4 | Commit-reveal Pedersen DKG, message-oriented (`DkgInstance` with `start`/`start_committee`/`start_with_secret` (fixed-secret deals for §13.4)/`reveal`/`finalize`/`defend`, `DkgBcast1`/`DkgBcast2`/`DkgP2P`); §6.1 complaint resolution (`resolve_complaint`), `DkgTamper` fault-injection hook; `DkgBatchInstance` deals `B` polynomials in ONE commit-reveal session (batch VSS, §7.3: R1 hash covers the concatenation of all `B` vectors, P2P carries `B` shares) at ANY uniform degree — `start_committee_with_degree` (random degree-`d` packed sharings, §7.4.2 PT1) and `start_with_polys` (explicit polys with constrained slot values, e.g. the §7.4.3 P4 constant-pack key re-sharing). Instances run over a `Committee` — an explicit, possibly non-contiguous id set for §10.3 restarts |
 | `protocol/triples.rs` | 7, 7.3, 7.4, 10.4 | Beaver triple factory with verifiable degree reduction (`generate`, `generate_with_tamper`), `TripleTamper` fault-injection hook; `generate_robust` (§10.4) publicly reconstructs a cheating dealer's committed re-sharing polynomial from the `≥ t` valid shares and continues (excluding a dealer is impossible: `γ` needs `2t−1` product points); bad DLEQ product proofs still abort; `generate_batch` is structurally per-batch (§7.3): one commit-reveal for all `2B` secrets, one re-sharing pass carrying all `B` vectors + `B` DLEQ proofs per party; T3 verifies each prover's `B` proofs AGGREGATELY via `dleq::verify_batch` (§7.3 optional optimization — identical accept/reject to individual verification, per-proof fallback keeps F3 per-triple blame; `generate_batch_with_tamper` + `TripleTamper::bad_product_proof_at` fault-inject one indexed batch proof). `generate_packed` (§7.4.2, Protocol 7.2′ — Franklin–Yung) produces `B` triples from ONE pair of degree-`d` packed sharings (`d = t + B − 2`, slots `e_b = -(b)`; requires `n ≥ 2t + 2B − 3`, §7.4.1, else `Error::InvalidParams`): PT1 deals `⟦α⟧_pack`/`⟦β⟧_pack` in one commit-reveal (`joint_random_packed`), PT2 re-shares each party's ONE local product with a CONSTANT-PACK polynomial (value `h_j = α_j·β_j` at every slot) plus ONE DLEQ proof, PT3 adds a slot-binding check (`EvalCom(C_j, e_b) == C_j.points[0]`, dealer blamed) before the per-slot Lagrange recombination — outputs are constant-pack `⟦γ_b⟧` (value at every slot, so packed Beaver consumption opens consistently at `e_b`); per the crate convention `TripleShare.a`/`.b` hold the party's packed-share scalar (same for every slot). `joint_deal` deals explicit per-party polys in one commit-reveal and returns the revealed commitments for public slot-binding checks. `*_with_committee` variants run over an explicit id set |
 | `protocol/presign.rs` | 8, 8.5, 8.7, 10.4, 7.4.3 | Key-dependent presignatures; `KeyShare` (alias of `DkgOutput`), `Presignature`, `PresignTamper` fault-injection hooks (`bad_nonce_point`, `bad_open_share`, `triple_tamper` — forwarded to the first triple session's dealing phase); `presign_robust` (§10.4) runs openings through `open_robust`, filters and blames bad `R_j` (interpolating `R` over the valid senders), expels blamed parties, and returns records for the survivors plus the blame list; `presign_batch` generates `B` records per session (§8.5). `presign_packed` (§7.4.3) consumes packed triples (two `generate_packed` sessions of `B` slots) and deals `⟦u⟧_pack`/`⟦a⟧_pack` plus each party's constant-pack re-sharing of `λ_j·x_j` in ONE commit-reveal (dealt polys publicly bound to `A[x]` by slot-point `EvalCom` equality — the key must enter P4 as a constant packed vector because `⟦x⟧`'s degree-`(t−1)` polynomial evaluates to `p_x(e_b) ≠ x` at slots `b ≥ 1`); openings interpolate at the slot points with quorum `d + 1 = t + B − 1`; output records are degree-`d` sharings. `presign_ki` (§8.7, optional KEY-INDEPENDENT mode) runs P1–P3 verbatim with NO P4 — takes no key shares (P1–P3 never touch `x`), consumes ONE triple (P4's triple moves online) — and outputs `KiPresignature { id, index, r, big_r, u_share, u_com }` (NOT key-equivalent: `t` pool shares reveal no key; still strictly single-use; binds to a key only at signing time). `*_with_committee` variants run over an explicit id set (`keys[k]`/`rngs[k]` positional in `ids`, `keys[k].index` checked) |
-| `protocol/sign.rs` | 9, 10.4, 7.4.3, 8.7 | `sign_share` (local) + `combine` (verified interpolation, low-`s` handled by caller); `combine_robust` filters and blames bad shares and still interpolates; `combine_at` (§7.4.3) interpolates at an explicit point with an explicit quorum — packed presignatures combine at the record's slot point with quorum `t + B − 1` (per-share point-equality verification unchanged). KI online signing (§8.7): `ki_z_share`/`ki_z_com` (party `j`'s `z`-share and the public `A[z]` from a fresh triple and the opened R1 masks — EXACTLY the §8 P4 formula run online; `u·x` is never computed directly, §12), `sign_share_ki` (`s_j = m·u_j + r·z_j`), `combine_ki` (verified against `m·A[u] + r·A[z]`, same blame semantics as `combine`), `KiSignTamper` fault-injection hooks (`bad_open_share`, `bad_sign_share`) |
+| `protocol/sign.rs` | 9, 10.4, 7.4.3, 8.7 | `sign_share` (local) + `combine` (verified interpolation, low-`s` handled by caller); `combine_robust` filters and blames bad shares and still interpolates; `combine_at` (§7.4.3) interpolates at an explicit point with an explicit quorum — packed presignatures combine at the record's slot point with quorum `t + B − 1` (per-share point-equality verification unchanged). KI online signing (§8.7): `ki_z_share`/`ki_z_com` (party `j`'s `z`-share and the public `A[z]` from a fresh triple and the opened R1 masks — EXACTLY the §8 P4 formula run online; `u·x` is never computed directly, §12), `sign_share_ki` (`s_j = m·u_j + r·z_j`), `combine_ki` (verified against `m·A[u] + r·A[z]`, same blame semantics as `combine`), `combine_ki_robust` (the §10.4 filter-and-continue variant, H4 — the node crate's `sign_ki_robust` drives it), `KiSignTamper` fault-injection hooks (`bad_open_share`, `bad_sign_share`) |
 | `protocol/refresh.rs` | 13.4 | Committee maintenance, `X` unchanged: `refresh` — proactive zero-constant re-sharing over the same committee (dealt via `DkgInstance::start_with_secret`; per-dealer zero-constant check on the revealed vectors; new shares `x'_j = x_j + Σ_i z_i(j)`); `reshare` — re-sharing to a NEW committee (each old party deals `x_j` over the new id set; public binding check `C_j.points[0] == EvalCom(A[x], j)`; new shares `x'_m = Σ_j λ_j^S · p_j(m)`, new commitment `A'[x] = Σ_j λ_j^S · C_j`); `ReshareTamper` fault-injection hooks (`bad_deal`, `bad_commitment`). Both assert `A'[x].points[0] == X`; both mandate `PresigStore::clear` on epoch change (§8.6) |
 | `runtime/store.rs` | 8.6, 8.7 | `PresigStore`: per-party single-use presignature store bound to one key (atomic `consume`, duplicate-id rejection, `clear` for the §13.4 epoch-change invalidation); `KiPool` (§8.7): KEY-FREE pool for key-independent records — same §8.6(1) single-use discipline (atomic consume, duplicate-id rejection) without the one-key binding, and NO epoch-change `clear` mandate (KI records carry no key-equivalent material) |
 | `runtime/policy.rs` | 10.3 | `restart_committee`: expel-and-restart committee computation — removes blamed ids, refuses (never lowers `t`) when the remainder would drop below `2t−1` (below the bound, use §13.4 re-sharing — `protocol/refresh.rs`) |
 | `runtime/transport.rs` | 4.7, 10.2, 13.1, 13.2 | The explicit transport seam: `Envelope<M>` (exactly the per-message fields a production transport signs — sid/phase/round/from/to/payload), object-safe sync `Transport<M>` trait modeling the LOGICAL rounds (§2.2), `DkgMessage` payload enum, `SimTransport` reference in-process impl (delivers identical accepted sets — echo-broadcast consistency), `drive_dkg` transport-driven DKG driver. §10.2/§13.1 signing: `Encode`/`Decode` (THE canonical wire format: length-prefixed, no serde — implemented for `DkgMessage`, the DKG bcast/p2p structs, `FeldmanCommitment`, the scalar/point/`Signature` primitives, and `Envelope`/`SignedEnvelope` themselves; other message types implement it as needed), `SignedEnvelope<M>` (sender ECDSA signature over the canonical encoding, domain-separated under `tags::TRANSPORT_SIGN`), `SigningTransport` (wraps any `Transport<SignedEnvelope<M>>` — signs on send, verifies accepted sets against the party key registry, a forged/tampered envelope is `Error::Abort` blaming the claimed sender), `BlameToken` (§A.4 evidence: abort + offending signed share envelope + dealer commitment; `verify(party_keys)` is the auditor's offline check), `drive_dkg_signed` (returns `SignedDriveError { error, token }` — `drive_dkg` stays the unsigned entry point for `sim::run_keygen*`); triples/presign orchestration still drives DKG instances internally (incremental pattern in the `transport` module docs) |
 | `runtime/sim.rs` | 4.7, 10.3, 13.2, 7.4.3 | Single-threaded reference orchestrator: `run_keygen` / `run_keygen_with_tamper` (message delivery routes through `transport::SimTransport` + `transport::drive_dkg`), `run_presign` / `run_presign_robust` / `run_presign_batch` / `run_presign_packed` (§7.4.3), `run_sign` / `run_sign_stored` / `run_sign_robust` / `run_sign_packed` (§7.4.3 — slot-point interpolation, quorum `t + B − 1`), `run_sign_ki` / `run_sign_ki_pooled` (§8.7 — the 2-round online flow: R1 generates a FRESH triple and opens `δ = ⟦u⟧−⟦α⟧`, `ε = ⟦x⟧−⟦β⟧` through `open::open`; R2 computes `z_j` locally and broadcasts `s_j`, verified via `sign::combine_ki`; fail-fast only — no §10.4 robust variant), §10.3 expel-and-restart wrappers `run_keygen_with_restart` / `run_presign_with_restart` / `run_triples_with_restart` (poisoned sid/id per retry; blame in original ids; keygen/triples retries renumber, presign retries keep original ids; the presign/triples wrappers drive the §10.4 ROBUST variants per attempt, so continuable faults complete in-attempt without poisoning — only dealing-phase aborts cascade to restart), §13.4 wrappers `run_refresh` / `run_reshare` (caller must clear presignature stores on epoch change), `make_rngs` (deterministic `StdRng` seeds — tests only) |
-| `node/` (crate `ohm-ecdsa-node`) | 4.7, 10.2, 13.1, 13.2 | Transport companion (localhost scale, `std::net` blocking threads, NO async runtime — rustls since M3c, tokio never): `src/wire.rs` (length-prefixed framing of the core's canonical `Encode`/`Decode` format; `WireMessage<M>` = original signed envelope or echoer-signed §4.7 echo, generic over the payload; `verify` against the party key registry), `src/mesh.rs` (`Node<M>`: listener + full-mesh connections + reader threads; first-echo-per-slot rule; unknown sender/bad signature/misrouted p2p dropped + logged; self-echo loopback for the M2 per-node acceptor; config-driven send delay for benchmarks; `bind_tls` wraps every connection in M3c mTLS — same frames inside the TLS stream), `src/tls.rs` (M3c, SPEC §13.1: OPTIONAL mTLS with certificates PINNED to the committee — `CommitteeTls` own cert/key + pinned per-party cert set, TLS 1.3 only, rustls ring provider, blocking `StreamOwned` over `TcpStream`; outgoing handshakes accept ONLY the expected peer's pinned cert (TLS identity == PartyId), incoming accept any pinned committee cert and are attributed to the matching party; NO PKI/system roots, NO plaintext fallback; rcgen self-signed certs are the dev/test stand-in for a deployment PKI; `setup --tls` / `spawn-demo --tls` / `node --tls CERT KEY --pinned DIR`; envelope signatures stay ON regardless), `src/transport.rs` (`MeshTransport` — M1 — implementing the core `Transport<SignedEnvelope<DkgMessage>>`: echo-broadcast acceptor — accept on `⌈(n+1)/2⌉` echoes from parties OTHER than the sender, dedup by `(sid, phase, round, from)`; blocking round collection with a generous timeout that returns the partial set and lets the DKG fail closed), `src/party.rs` (M2/M3a: `PartyNode` — holds ONLY its own transport key/id and runs only its own logic; per-node keygen §6 with the §6.1 complaint subprotocol on the wire — signed `Complaints`/`Defenses` broadcast rounds adjudicated identically at every node, factored as `joint_vss` + a shared wire `complaint_round` helper — per-node §7.2 triple driver (T1 two `joint_vss` instances, T2 `FeldCommit(g_j)` + ONE DLEQ product proof broadcast + P2P re-shares, T3 proof checks ⇒ F3 blame and re-share checks ⇒ wire §6.1 complaints, Lagrange combine), per-node §8 presign driver (two triple sessions + ⟦u⟧/⟦a⟧ `joint_vss`, fail-fast point-equality openings δ/ε/v/δ′/ε′ and nonce-point `R_j == EvalCom(A[k], j)` checks ⇒ F5 blame, `v=0`/`r=0` ⇒ `Error::ZeroValue` retry-with-fresh-id; §10.4 robust continuation deliberately stays in the core's sim), and per-node §9/§10.4 signing: broadcast `sign_share`, point-equality verification, robust combine, low-s; §8.7 KI mode over the wire — `presign_ki` (P1–P3 of the presign driver verbatim via the shared `presign_p1_p3` helper, P4 omitted — the record is key-free and NOT key-equivalent), the 2-round `sign_ki` (R1 fresh per-node triple + fail-fast verified δ/ε openings, R2 `s_j` verified by core `combine_ki`, low-s; F6 sign-share tokens archived as in §9), and the in-memory key-free pool wrappers `presign_ki_pooled` / `sign_ki_pooled` (core `KiPool`, atomic consume — the M3b durable store stays per-key); `NodePayload` wire enum; `Cheat` fault injection — `BadDeal`/`FalseAccuse` (VSS), `BadProductProof`/`BadReshare` (triples), `BadNoncePoint`/`BadOpenShare` (presign), `BadSignShare`), `src/seed.rs` (the ceremony writing per-party SECRET seed files + a PUBLIC committee file — the `--seeded` fallback for presignature distribution; transport keys come from the seed files in both modes), `src/main.rs` (`node`/`setup`/`spawn-demo` process separation + `m1-demo` + the M3b `auditor`; spawn-demo runs the FULL ARC keygen→presign→sign under the fresh key by default, `--persist` gives each child a per-node `--data-dir`, `--tls` runs the arc over M3c mTLS), `src/persist.rs` (M3b: `DiskPresigStore` — the §8.6 durable single-use presignature store, write-tmp-rename + fsync per insert, the consume tombstone fsync'd BEFORE the record is handed out so a kill/restart can never sign twice with the same presignature; `Archive` — the §4.7 accepted-envelope transcript + `aborts.log`; `BlameEvidence` token files for the fault classes with wire evidence — F2 dealt shares, F6 sign shares; other classes logged `token: none`; `audit_token` — the §A.4 offline verifier reusing the core's `BlameToken::verify` where the shape fits), `examples/mesh_perf.rs` (latency benchmark). M1 is the reference-orchestration pattern (one process holds all transport keys); M2/M3a enforce key separation by construction. M3c (optional mTLS) is done; remaining hardening (reconnection, clean shutdown, DoS) is open |
+| `node/` (crate `ohm-ecdsa-node`) | 4.7, 10.2, 13.1, 13.2 | Transport companion (localhost scale, `std::net` blocking threads, NO async runtime — rustls since M3c, tokio never): `src/wire.rs` (length-prefixed framing of the core's canonical `Encode`/`Decode` format; `WireMessage<M>` = original signed envelope or echoer-signed §4.7 echo, generic over the payload; `verify` against the party key registry), `src/mesh.rs` (`Node<M>`: listener + full-mesh connections + reader threads; first-echo-per-slot rule; unknown sender/bad signature/misrouted p2p dropped + logged; self-echo loopback for the M2 per-node acceptor; config-driven send delay for benchmarks; `bind_tls` wraps every connection in M3c mTLS — same frames inside the TLS stream), `src/tls.rs` (M3c, SPEC §13.1: OPTIONAL mTLS with certificates PINNED to the committee — `CommitteeTls` own cert/key + pinned per-party cert set, TLS 1.3 only, rustls ring provider, blocking `StreamOwned` over `TcpStream`; outgoing handshakes accept ONLY the expected peer's pinned cert (TLS identity == PartyId), incoming accept any pinned committee cert and are attributed to the matching party; NO PKI/system roots, NO plaintext fallback; rcgen self-signed certs are the dev/test stand-in for a deployment PKI; `setup --tls` / `spawn-demo --tls` / `node --tls CERT KEY --pinned DIR`; envelope signatures stay ON regardless), `src/transport.rs` (`MeshTransport` — M1 — implementing the core `Transport<SignedEnvelope<DkgMessage>>`: echo-broadcast acceptor — accept on `⌈(n+1)/2⌉` echoes from parties OTHER than the sender, dedup by `(sid, phase, round, from)`; blocking round collection with a generous timeout that returns the partial set and lets the DKG fail closed), `src/party.rs` (M2/M3a: `PartyNode` — holds ONLY its own transport key/id and runs only its own logic; per-node keygen §6 with the §6.1 complaint subprotocol on the wire — signed `Complaints`/`Defenses` broadcast rounds adjudicated identically at every node, factored as `joint_vss` + a shared wire `complaint_round` helper — per-node §7.2 triple driver (T1 two `joint_vss` instances, T2 `FeldCommit(g_j)` + ONE DLEQ product proof broadcast + P2P re-shares, T3 proof checks ⇒ F3 blame and re-share checks ⇒ wire §6.1 complaints, Lagrange combine), per-node §8 presign driver (two triple sessions + ⟦u⟧/⟦a⟧ `joint_vss`, fail-fast point-equality openings δ/ε/v/δ′/ε′ and nonce-point `R_j == EvalCom(A[k], j)` checks ⇒ F5 blame, `v=0`/`r=0` ⇒ `Error::ZeroValue` retry-with-fresh-id; §10.4 robust continuation deliberately stays in the core's sim), and per-node §9/§10.4 signing: broadcast `sign_share`, point-equality verification, robust combine, low-s; §8.7 KI mode over the wire — `presign_ki` (P1–P3 of the presign driver verbatim via the shared `presign_p1_p3` helper, P4 omitted — the record is key-free and NOT key-equivalent), the 2-round `sign_ki` (R1 fresh per-node triple + fail-fast verified δ/ε openings, R2 `s_j` verified by core `combine_ki`, low-s; F6 sign-share tokens archived as in §9), and the in-memory key-free pool wrappers `presign_ki_pooled` / `sign_ki_pooled` (core `KiPool`, atomic consume — the M3b durable store stays per-key); `NodePayload` wire enum; `Cheat` fault injection — `BadDeal`/`FalseAccuse` (VSS), `BadProductProof`/`BadReshare` (triples), `BadNoncePoint`/`BadOpenShare` (presign), `BadSignShare`), `src/seed.rs` (the DEMO-ONLY one-process ceremony writing per-party SECRET seed files + a PUBLIC committee file — the `--seeded` fallback for presignature distribution; transport keys come from the seed files in that mode), `src/ceremony.rs` (H3: the DISTRIBUTED ceremony — the standard setup path: per-party `init` writing a SECRET `party-<id>.identity` + PUBLIC `party-<id>.pub` on each party's own machine, hex `fingerprint` for out-of-band verification, and the PUBLIC `assemble` validating bundles — ids exactly `1..=n`, uniform TLS posture — and writing the unchanged `committee.hex` format with `x` = identity point, i.e. NO ceremony key; nodes boot with `--identity` and fail closed when their own key/cert does not match the registry/pins), `src/main.rs` (`node`/`setup`/`init`/`assemble`/`spawn-demo` process separation + `m1-demo` + the M3b `auditor`; spawn-demo runs the FULL ARC keygen→presign→sign under the fresh key by default, `--persist` gives each child a per-node `--data-dir`, `--tls` runs the arc over M3c mTLS), `src/persist.rs` (M3b: `DiskPresigStore` — the §8.6 durable single-use presignature store, write-tmp-rename + fsync per insert, the consume tombstone fsync'd BEFORE the record is handed out so a kill/restart can never sign twice with the same presignature; `Archive` — the §4.7 accepted-envelope transcript + `aborts.log`; `BlameEvidence` token files for the fault classes with wire evidence — F2 dealt shares, F6 sign shares; other classes logged `token: none`; `audit_token` — the §A.4 offline verifier reusing the core's `BlameToken::verify` where the shape fits), `examples/mesh_perf.rs` (latency benchmark). M1 is the reference-orchestration pattern (one process holds all transport keys); M2/M3a enforce key separation by construction. H2 network resilience is done (reconnection with backoff + per-session journal re-sync, `Node::shutdown`/`PartyNode::shutdown` clean shutdown, write/handshake/round timeouts, DoS guards — per-connection frame-rate window, `wire::FrameBound` per-variant size bounds, listener accept-rate window, mTLS handshake concurrency cap, bounded mailbox, acceptor caps — counted in `MeshMetrics`, and multiple concurrent sessions via the collector-thread + condvar acceptor with the `node --factory N` demo as the proving ground), and H4 (`src/party.rs`, §10.4 + §10.3, OPT-IN — default stays fail-fast): the robust drivers (`presign_robust` — every opening filtered-and-continued through the core's `open_robust` with blame identical at every node, nonce points filtered with subset-Lagrange `R` interpolation, blamed expelled from later rounds' share sets; `triple_robust` — T3 re-share faults publicly reconstruct the cheater's committed re-sharing polynomial over two added broadcast rounds: `ReshareRequests` carrying the dealer's own signed `Reshare` envelope as self-authenticating evidence (a fabricated/verifying request blames the REQUESTER) and `ReshareSupply` pooling the received shares, first `t` valid supplies interpolate, `< t` aborts as in the core's `generate_robust`; `sign_ki_robust` — robust R1 openings + the core's new `sign::combine_ki_robust` in R2) and the §10.3 expel-and-restart wrappers (`keygen_with_restart` / `presign_with_restart` — deterministic `policy::restart_committee` verdicts, poisoned sid/id per §10.3(2), survivors' ORIGINAL ids preserved — the wire never renumbers, retries inherently bounded, zero-slack refusal propagates the abort with the refusal noted; every driver is committee-aware via `*_over` id sets, `sign_over` / `sign_stored_over` sign over the post-restart committee; `node --restart` / `spawn-demo --restart`); still open: crash recovery of finished rounds, committee rejoin after a full restart, SIGINT handling |
 
 Architecture: per-party protocol logic is message-oriented (broadcast/P2P
 structs keyed by sender); the `runtime/transport.rs` seam (`Envelope` /
@@ -348,6 +430,13 @@ signatures, SPEC §13.1) without changing the per-party logic.
 - `k256` provides constant-time curve arithmetic; keep new secret-dependent
   branching out of the code (verification paths may branch on public data
   only).
+- The canonical wire decoders (`src/runtime/transport.rs` `Decode` impls)
+  run on UNTRUSTED network input in the node crate: they must never panic,
+  over-allocate on an untrusted length prefix, or accept non-canonical
+  encodings. They are fuzzed with cargo-fuzz/libFuzzer — see
+  `fuzz/README.md` (the workspace-excluded `fuzz/` crate is a dev tool
+  only); keep new decoders panic-free and add them to the
+  `decode_arbitrary` fuzz target.
 - This is unaudited research code: do not add features that imply
   production readiness (networking, key storage, custody flows) without
   flagging the SPEC §13 disclaimers.

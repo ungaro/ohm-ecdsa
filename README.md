@@ -360,10 +360,49 @@ sets, issuers, auditors.
   verified δ/ε openings, R2 verified shares); one in-memory key-free
   pool signs under ANY key the committee owns (`spawn-demo --ki`;
   thread-level proof: one pool, two different keys)
+* H2 network resilience (`node/src/mesh.rs`, `node/src/party.rs`):
+  reconnection with capped exponential backoff + jitter and a
+  journal-based re-sync of in-flight sessions, clean shutdown
+  (`Node::shutdown`, join-with-deadline), timeouts on all blocking IO
+  (writes, the mTLS handshake, loud round timeouts against stalled
+  peers), DoS guards that only drop/delay (per-connection frame-rate
+  window, per-variant frame size bounds, listener accept-rate window,
+  handshake concurrency cap, bounded mailbox, acceptor caps — all
+  counted in `MeshMetrics`), and multiple concurrent protocol sessions
+  demultiplexed by sid (`spawn-demo --factory 2`: a background
+  presignature factory overlapping online signing)
+* H3 distributed committee ceremony (`node/src/ceremony.rs`): the
+  standard setup path — each party generates its own transport keypair
+  (and M3c cert) on its own machine (`init`), only PUBLIC bundles are
+  exchanged out of band (hex fingerprints for second-channel
+  verification), and a PUBLIC `assemble` step writes the shared
+  committee file; no process ever holds another party's secret. The
+  one-process `setup`/`spawn-demo` ceremony is DEMO-ONLY
+* H4 robust continuation + expel-and-restart over the wire
+  (`node/src/party.rs`, OPT-IN — the default drivers stay fail-fast):
+  §10.4 robust presign (`presign_robust` — every opening filtered and
+  continued with consistent blame), robust triples (`triple_robust` —
+  a T3 re-share fault publicly reconstructs the cheater's committed
+  re-sharing polynomial via two added broadcast rounds:
+  `ReshareRequests` carrying the dealer's own signed envelope as
+  self-authenticating evidence, `ReshareSupply` pooling the received
+  shares), robust KI signing (`sign_ki_robust`; `sign` was already
+  robust), and the §10.3 expel-and-restart policy at the driver level
+  (`keygen_with_restart` / `presign_with_restart` — the same
+  deterministic restart committee at every node via the core's
+  `policy::restart_committee`, poisoned sid/id per §10.3(2), survivors'
+  ORIGINAL ids preserved, retries bounded, zero-slack refusal — `t`
+  never lowered; `node --restart` / `spawn-demo --restart`)
 
-**Not yet** (roadmap): production-hardened transport beyond M3c
-(reconnection, clean shutdown, DoS hardening — the `transport` module
-is the contract), key rotation
+**Not yet** (roadmap): production-hardened transport beyond the node
+crate's H2 (crash recovery of finished rounds, committee rejoin after a
+full restart, SIGINT handling — the `transport`
+module is the contract; the canonical wire decoders ARE fuzzed with
+cargo-fuzz, see `fuzz/README.md`), H4 robustness for transport-level
+faults (TLS handshakes, crash-stop — H4 covers active protocol cheaters
+whose meshes stay alive), a KI-mode restart wrapper and robust KI pool
+production, authentication of the H3 ceremony's
+out-of-band bundle exchange itself (ops, not code), key rotation
 (§13.4 — re-DKG with a new `X`), audit.
 
 ## Documentation map
@@ -405,7 +444,7 @@ crate root (`ohm_ecdsa::shamir`, `ohm_ecdsa::sim`, …).
 | `runtime/transport` | 4.7, 10.2, 13.1, 13.2 | transport seam: `Envelope` message contract, sync `Transport` trait, `SimTransport` reference impl, `drive_dkg` transport-driven keygen driver, signed envelopes (`SignedEnvelope`/`SigningTransport`), offline-verifiable `BlameToken`, `drive_dkg_signed` |
 | `runtime/transport` | 4.7, 10.2, 13.1, 13.2 | transport seam: `Envelope` message contract, sync `Transport` trait, `SimTransport` reference impl, `drive_dkg` transport-driven keygen driver, canonical `Encode`/`Decode` wire format, signed envelopes (`SignedEnvelope`/`SigningTransport`), offline-verifiable `BlameToken`, `drive_dkg_signed` |
 | `runtime/sim` | 4.7, 10.3, 13.2 | reference orchestrator (keygen routes through the `transport` seam), §10.3 restart wrappers |
-| `node/` (crate `ohm-ecdsa-node`) | 4.7, 10.2, 13.1, 13.2, 8.7 | transport companion: full-mesh real TCP, signed envelopes verified on receipt, echo broadcast; M1 `MeshTransport` orchestrator driver; M2 `PartyNode` per-party drivers (keygen with §6.1 wire complaints, §9/§10.4 signing, process separation, `mesh_perf` benchmark); M3a per-node offline factory (§7.2 triples + §8 presign over the wire — the demo signs under its own keygen's key); M3b durable stores + transcript/blame archive + auditor; M3c optional committee-pinned mTLS (`node/src/tls.rs`); §8.7 KI mode over the wire (`presign_ki` + 2-round `sign_ki`, in-memory key-free pool, `--ki` demo) |
+| `node/` (crate `ohm-ecdsa-node`) | 4.7, 10.2, 10.3, 10.4, 13.1, 13.2, 8.7 | transport companion: full-mesh real TCP, signed envelopes verified on receipt, echo broadcast; M1 `MeshTransport` orchestrator driver; M2 `PartyNode` per-party drivers (keygen with §6.1 wire complaints, §9/§10.4 signing, process separation, `mesh_perf` benchmark); M3a per-node offline factory (§7.2 triples + §8 presign over the wire — the demo signs under its own keygen's key); M3b durable stores + transcript/blame archive + auditor; M3c optional committee-pinned mTLS (`node/src/tls.rs`); §8.7 KI mode over the wire (`presign_ki` + 2-round `sign_ki`, in-memory key-free pool, `--ki` demo); H2 network resilience (reconnect + journal re-sync, clean shutdown, IO timeouts, DoS guards with `MeshMetrics`, concurrent sessions — `--factory` demo); H4 opt-in §10.4-robust drivers (`presign_robust`, `triple_robust` with the request/supply reconstruction rounds, `sign_ki_robust`) + §10.3 expel-and-restart wrappers (`keygen_with_restart`, `presign_with_restart`, `--restart` demo) |
 
 Contributions: keep `cargo fmt && cargo clippy --workspace --all-targets &&
 cargo test --workspace` green; follow `AGENTS.md`.

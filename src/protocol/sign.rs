@@ -18,6 +18,10 @@
 //! triple share and the opened masks ([`ki_z_share`]). [`combine_ki`]
 //! verifies each share against `m·A[u] + r·A[z]` — same point-equality
 //! semantics as [`combine`], with `A[z]` formed online ([`ki_z_com`]).
+//!
+//! [`combine_robust`] / [`combine_ki_robust`] are the §10.4 blame-and-
+//! continue variants: bad shares are filtered and blamed, and the
+//! signature is interpolated from the first `t` valid shares.
 
 use k256::Scalar;
 
@@ -183,6 +187,34 @@ pub fn combine_robust(
     shares: &[SignShare],
 ) -> Result<((Scalar, Scalar), Vec<PartyId>)> {
     let s_com = meta.u_com.scale(m).add(&meta.z_com.scale(&meta.r));
+    combine_robust_verified(params.t, meta.r, &s_com, shares)
+}
+
+/// Robust variant of [`combine_ki`] (SPEC §10.4): identical semantics to
+/// [`combine_robust`] — bad shares filtered, senders blamed, `(r, s)`
+/// interpolated from the first `t` valid shares — with `A[z]` formed
+/// online from the R1 openings ([`ki_z_com`]). `meta` is any party's pool
+/// record (the commitments are identical across parties).
+pub fn combine_ki_robust(
+    params: &Params,
+    meta: &KiPresignature,
+    z_com: &FeldmanCommitment,
+    m: &Scalar,
+    shares: &[SignShare],
+) -> Result<((Scalar, Scalar), Vec<PartyId>)> {
+    let s_com = meta.u_com.scale(m).add(&z_com.scale(&meta.r));
+    combine_robust_verified(params.t, meta.r, &s_com, shares)
+}
+
+/// The shared §10.4 robust combine body: filter shares failing the
+/// point-equality check against `s_com` (senders blamed), interpolate
+/// `(r, s)` from the first `quorum` valid shares at 0.
+fn combine_robust_verified(
+    quorum: usize,
+    r: Scalar,
+    s_com: &FeldmanCommitment,
+    shares: &[SignShare],
+) -> Result<((Scalar, Scalar), Vec<PartyId>)> {
     let mut valid_parties = Vec::new();
     let mut valid_shares = Vec::new();
     let mut blamed = Vec::new();
@@ -194,14 +226,14 @@ pub fn combine_robust(
             blamed.push(sh.from);
         }
     }
-    if valid_parties.len() < params.t {
+    if valid_parties.len() < quorum {
         return Err(Error::NotEnoughShares {
             got: valid_parties.len(),
-            need: params.t,
+            need: quorum,
         });
     }
-    valid_parties.truncate(params.t);
-    valid_shares.truncate(params.t);
+    valid_parties.truncate(quorum);
+    valid_shares.truncate(quorum);
     let s = interpolate_at_zero(&valid_parties, &valid_shares);
-    Ok(((meta.r, s), blamed))
+    Ok(((r, s), blamed))
 }

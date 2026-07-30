@@ -1,0 +1,38 @@
+[package]
+name = "ohm-ecdsa-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Workspace-excluded per the cargo-fuzz convention: the fuzz crate is its
+# own workspace so the main workspace (MSRV 1.75) never builds it.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+
+[dependencies.ohm-ecdsa]
+path = ".."
+
+[[bin]]
+name = "decode_dkg_message"
+path = "fuzz_targets/decode_dkg_message.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_signed_envelope"
+path = "fuzz_targets/decode_signed_envelope.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_arbitrary"
+path = "fuzz_targets/decode_arbitrary.rs"
+test = false
+doc = false

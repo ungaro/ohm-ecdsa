@@ -40,6 +40,26 @@ mTLS layer). Milestones:
   streams) with certificates **pinned to the committee** — no PKI, no
   system roots. Plain TCP remains the default for localhost dev; any
   non-localhost deployment MUST run TLS (see below).
+* **H2** — network resilience (still localhost reference scale):
+  reconnection with capped exponential backoff + jitter and a
+  journal-based re-sync of in-flight sessions, clean shutdown
+  (`Node::shutdown` / `PartyNode::shutdown`, also on `Drop`), timeouts
+  on all blocking IO, DoS guards that only drop/delay (per-connection
+  frame-rate window, per-variant frame size bounds, listener
+  accept-rate window, mTLS handshake concurrency cap, bounded mailbox,
+  acceptor-level caps — all counted in `MeshMetrics`), and MULTIPLE
+  concurrent protocol sessions demultiplexed by sid (the
+  `node --factory N` background presignature factory is the proving
+  ground). Details below.
+* **H3** — the distributed committee ceremony (`src/ceremony.rs`): the
+  standard setup path for a real committee. Each party generates its
+  OWN transport keypair (and M3c certificate) on its own machine
+  (`init`); only PUBLIC `party-<id>.pub` bundles leave, exchanged out
+  of band over an authenticated channel (short hex fingerprints for
+  second-channel verification); a PUBLIC `assemble` step — safe to run
+  anywhere — writes the shared `committee.hex` in the unchanged
+  existing format. No process ever holds another party's secret. The
+  one-process `setup`/`spawn-demo` ceremony stays as a DEMO-ONLY path.
 * **§8.7 KI mode over the wire** — the OPTIONAL key-independent
   presignature pool (`PartyNode::presign_ki` / `sign_ki`): pool
   production is P1–P3 of the per-node presign verbatim with P4 omitted
@@ -55,8 +75,8 @@ mTLS layer). Milestones:
 * **Key separation by construction.** `PartyNode::bind` takes exactly
   one `SecretKey` (this node's) plus the public registry; no `PartyNode`
   API accepts another party's secret material. A node process reads
-  exactly its own seed file plus the public committee file
-  (`src/seed.rs`).
+  exactly its own secret file (demo seed or H3 identity) plus the public
+  committee file (`src/seed.rs`, `src/ceremony.rs`).
 * **Per-node keygen (SPEC §6)** over the mesh: commit → reveal + P2P
   shares → **§6.1 complaint subprotocol on the wire** — round 3 carries
   signed `Complaints` broadcasts, round 4 signed `Defenses` broadcasts,
@@ -83,9 +103,9 @@ mTLS layer). Milestones:
   share checked against its public commitment by point equality, every
   nonce point against `EvalCom(A[k], j)` (F5 ⇒ blame the sender). ε′
   masks this node's OWN long-term key share. Openings are FAIL-FAST
-  identifiable aborts: robust blame-and-continue (§10.4) stays with the
-  core's sim and is deliberately NOT re-implemented at the wire level —
-  the driver fails closed. `v = 0` / `r = 0` return `Error::ZeroValue`;
+  identifiable aborts (the default posture; the §10.4 robust
+  blame-and-continue variant is the opt-in `presign_robust` — see H4
+  below). `v = 0` / `r = 0` return `Error::ZeroValue`;
   the caller retries with a fresh presignature id (the demo treats it as
   fatal — probability ~2⁻¹²⁸ per session). Records are held in memory, or
   persisted by the M3b durable store when the node runs with
@@ -233,19 +253,229 @@ still no async runtime):
   (`base64ct 1.6.0`, `zeroize 1.8.2`) keep it that way — newer
   releases of those crates need edition2024 toolchains.
 
-## What M3b/M3c is still NOT
+## What H2 adds (network resilience)
 
-* **No robust continuation at the wire level.** Openings and dealing
-  phases are fail-fast: a cheater is named and the session aborts —
-  recovery (§10.3 expel-and-restart, §10.4 blame-and-continue) lives in
-  the core's sim and is not re-implemented in the per-node drivers.
-* **No reconnection after startup**, no clean thread shutdown, no rate
-  limiting, no DoS hardening beyond the 4 MiB frame cap,
-  drop-on-bad-signature and (M3c) the mTLS handshake gate. The blocking
-  TLS handshake has no timeout — a stalled peer parks a reader thread
-  (localhost scale; a deployment concern, §13.1).
+H2 hardens the mesh and the per-node drivers along three axes —
+everything stays localhost reference scale, and every guard only
+drops/delays: signature and commitment verification is never weakened.
+
+* **Connection lifecycle.** Every message a node sends is journaled per
+  session id BEFORE the write is attempted. When a send fails (or the
+  outgoing connection is gone), one reconnect task per peer re-dials
+  with capped exponential backoff + up to +100% jitter
+  (`ReconnectConfig`: 100 ms initial, ×2, 5 s cap, unlimited attempts
+  by default) and on success RE-SENDS the whole journal — the resync
+  semantics are **"re-deliver every message of every in-flight session,
+  in original order per session"**. Re-delivery is safe because the
+  receive path is idempotent (the §4.7 first-echo rule and the acceptor
+  dedup per `(sid, phase, round, from)`); messages for rounds that
+  already completed are absorbed by the same dedup. Drivers retire a
+  session's journal when it finishes (`retire_session`, prefix-matching
+  the sub-session sids) — there is deliberately **no crash recovery of
+  finished rounds**. The dial side reconnects; the accept side simply
+  serves whatever arrives, and the mesh heals through the dial side
+  (both directions of a pair reconnect independently).
+  `Node::shutdown` (also on `Drop`, and `PartyNode::shutdown`) stops
+  the accept loop (a dummy self-connection unblocks it), closes the
+  outgoing connections (peer readers see EOF), signals every reader and
+  reconnect task, and joins all tracked threads with a 5 s deadline —
+  stragglers are logged and detached (std cannot kill threads). There
+  is no SIGINT handler: std has no signal API, so a deployment wraps
+  `shutdown()` in its own signal handling (adding a ctrlc-style
+  dependency was deliberately skipped).
+* **Timeouts.** Writes carry a 10 s `WRITE_TIMEOUT` (a dead peer fails
+  the send — which triggers the reconnector — instead of parking the
+  writer). The blocking rustls handshake runs under a 10 s
+  `HANDSHAKE_TIMEOUT` via the simplest strategy compatible with
+  blocking rustls: the socket gets short read/write timeouts and the
+  `complete_io` loop treats `WouldBlock`/`TimedOut` as a tick until the
+  deadline (see `src/tls.rs`). Reader threads poll with a 250 ms
+  `READ_POLL` — NOT a liveness timeout, just shutdown responsiveness.
+  Read stalls are bounded by the drivers' ROUND timeout: a peer that
+  accepts but never sends fails its round loudly (partial accepted set,
+  fail closed) instead of parking a thread forever.
+* **DoS guards** (each increments exactly one `MeshMetrics` counter —
+  a silent drop is a bug): a per-connection frame-rate window
+  (`1024·n` frames/s, pre-verification, drops the connection —
+  protocol-legitimate traffic is ≤ `n` frames per round per connection
+  and rounds are sequential, so this is orders of magnitude of
+  headroom), per-variant frame size bounds (`wire::FrameBound`, derived
+  from the protocol's message sizes — points 33 B, scalars 32 B,
+  commitment vectors bounded by `n` worst case — instead of one global
+  4 MiB cap), a listener accept-rate window (`32·n` accepts/s), an mTLS
+  handshake concurrency cap (`4n`), a bounded mailbox (65536, drops +
+  counts when full), and acceptor-level caps (4096 distinct sids, 8
+  equivocating candidates per broadcast slot). Unknown-sid/wrong-phase
+  frames land in slots nothing queries and are bounded by the sid cap.
+* **Concurrent sessions.** A dedicated collector thread drains the mesh
+  mailbox into the acceptor and wakes round waiters via a condvar, so
+  ANY NUMBER of protocol sessions (distinct sids) may be in flight:
+  the acceptor demultiplexes by `(sid, phase, round)` and each driver
+  waits only on its own session's slots. Keygen/triples/presign
+  sessions overlap freely, and online signing (share exchange against
+  an existing presignature) interleaves with the offline factory. One
+  discipline: CONCURRENT sessions must not have prefix-related sids
+  (journal retirement is a prefix match); the demo's
+  `session_id`-derived sids are digests and never prefix-related. The
+  proving ground is `node --factory N` / `spawn-demo --factory N`: a
+  background factory thread keeps N presignatures in a pool while the
+  main thread signs 3 messages against consumed records.
+
+## What H4 adds (robust continuation + expel-and-restart, §10.4 + §10.3)
+
+H4 brings the core's §10.4 robust continuation and §10.3 restart policy
+to the per-node wire drivers — **opt-in**: the default drivers stay
+fail-fast (some deployments prefer loud aborts — a halt is a signal,
+robustness masks it), exactly as the core keeps `presign` next to
+`presign_robust`. A single cheater causes **blame + continued service**,
+not an outage. Every verdict is a point-equality check on public data
+over the echo-consistent accepted sets, so blame is deterministic and
+identical at every honest node — the same discipline as the existing
+drivers; the filter happens only AFTER a check fails, and every
+interpolated share is still commitment-checked.
+
+* **Robust online signing** was already the default (`PartyNode::sign`
+  filters bad `s_j`, blames, interpolates from the remaining ≥ t valid
+  shares, archives the F6 token per blamed party). H4 adds
+  `sign_ki_robust` — the §8.7 KI sign with robust R1 openings (bad δ/ε
+  shares filtered, senders expelled from R2's share set) and a robust
+  R2 combine (the core's new `sign::combine_ki_robust`).
+* **Robust presign** (`presign_robust`): every opening (δ/ε, v, δ′/ε′)
+  goes through the core's `open_robust` — bad shares filtered and
+  blamed, the opening interpolated from the first `t` valid shares; bad
+  nonce points are filtered individually and `R` interpolates over the
+  valid senders with the subset Lagrange weights (the core's
+  `presign_robust` semantics). Blamed parties are expelled from
+  subsequent rounds' share sets. Returns the record plus the blame
+  list (identical everywhere).
+* **Robust triples** (`triple_robust`): a T3 re-share fault no longer
+  aborts — the honest majority **publicly reconstructs the cheater's
+  committed re-sharing polynomial**. The sim sees every P2P share; a
+  per-node driver does not, so H4 adds two broadcast rounds to the
+  triple session: `ReshareRequests` (every node broadcasts the dealers
+  whose re-share failed HERE, carrying the dealer's OWN signed
+  `Reshare` envelope as self-authenticating evidence — every node
+  re-verifies the signature against the registry and the failing
+  `EvalCom`, so a fabricated or actually-verifying request blames the
+  REQUESTER instead of the dealer) and `ReshareSupply` (every node
+  broadcasts the re-share it received from each dealer in the verified
+  reconstruction set; the first `t` supplies that verify against the
+  dealer's public commitment interpolate the committed polynomial, and
+  each node recomputes its own contaminated share). Fewer than `t`
+  valid supplies aborts blaming the dealer (the committed polynomial is
+  unrecoverable — same rule as the core's `generate_robust`). **Round
+  cost: +1 broadcast round per triple session in the honest case (the
+  request round must complete everywhere for the verdict to be
+  consistent), +2 on a re-share fault.** The blamed dealer's commitment
+  still enters `A[γ]` — its DLEQ proof already bound `g_j(0) = α_j·β_j`.
+* **Expel-and-restart** (`keygen_with_restart`,
+  `presign_with_restart`, CLI `node --restart` / `spawn-demo
+  --restart`): faults that cannot continue (dealing-phase F1/F2/F3)
+  abort the attempt; every node then deterministically computes the
+  SAME surviving committee (the core's `policy::restart_committee` over
+  the current ids minus the blamed), poisons the sid (§10.3(2)) — and
+  the presignature id per restarted attempt — and re-runs over the
+  survivors with **original ids preserved** (their key shares stay
+  valid; unlike the sim's keygen restart, the wire restart never
+  renumbers — the transport registry pins the ids). The presign wrapper
+  COMPOSES the two layers exactly like the sim's
+  `run_presign_with_restart`: robust continuation in-attempt (id NOT
+  poisoned, blame accumulated), restart only for dealing-phase aborts.
+  Retries are inherently bounded (every restart expels ≥ 1 party) and
+  the policy REFUSES once the remainder would drop below `n′ < 2t−1` —
+  `t` is never silently lowered (zero-slack committees like 2-of-3
+  refuse every restart; deploy with slack, e.g. 3-of-6, to absorb
+  ejections — SPEC §10.3(1)). Signing over the post-restart committee
+  uses `sign_over` / `sign_stored_over` (rounds wait only for the
+  survivors).
+
+## What M3b/M3c/H2/H4 is still NOT
+
+* **Not everything is robust.** TLS handshake faults, connection-level
+  misbehavior, and crash-stop are NOT covered by H4's continuation (an
+  expelled party's MESH is assumed to keep echoing — alive process,
+  dead driver; a crashed process is the separate H2 crash-recovery
+  gap). The §8.7 KI arc composes only partially: `sign_ki_robust` is
+  robust online, but `presign_ki` pool production stays fail-fast and
+  there is no KI restart wrapper. Dealing phases are fail-fast in ALL
+  drivers — recovery there is exactly the §10.3 restart, never
+  in-attempt continuation. The default drivers remain fail-fast by
+  design (see above).
+* **No crash recovery of finished rounds**, no reconnection of incoming
+  connections (the dial side heals the mesh), no SIGINT handler (std
+  has no signal API — a deployment wraps `Node::shutdown`), no
+  reconnection of a node that fully RESTARTS (a restarted node re-binds
+  and the peers' reconnectors re-dial it only if it keeps its address —
+  rejoining a committee after a full restart is out of scope).
 * **Not audited, not production anything.** localhost-scale demo and
   test scaffolding only.
+
+## Committee ceremony (H3 — the standard setup path)
+
+The one-process ceremony (`setup`, `spawn-demo`, `src/seed.rs`) generates
+**every party's transport keypair in a single process** and distributes
+secret files: one machine momentarily holds the whole committee's
+transport secrets. That is **DEMO-ONLY** — fine for demos and tests,
+unacceptable for a real committee. The standard setup path is the
+**distributed ceremony** (`src/ceremony.rs`), where no secret ever
+leaves its party's machine:
+
+```sh
+# 1. Each party, on its OWN machine (party 1 shown; parties 2, 3 alike):
+cargo run -p ohm-ecdsa-node -- init --id 1 --dir ./party1 --addr 10.0.0.1:7700 --tls
+#    writes ./party1/party-1.identity (SECRET), ./party1/party-1.key.pem (SECRET, with --tls),
+#    ./party1/party-1.crt.pem and ./party1/party-1.pub (PUBLIC); prints:
+#      FINGERPRINT <hex>
+
+# 2. Out of band: exchange the .pub bundles over an AUTHENTICATED channel
+#    (signed email, verified read-out …) and confirm every party's
+#    FINGERPRINT on a second channel (voice, video). See the trust model
+#    below — this step is ops, not code.
+
+# 3. Assembly — PUBLIC data only, safe to run anywhere (even untrusted):
+cargo run -p ohm-ecdsa-node -- assemble --committee ./committee \
+    --inputs party-1.pub,party-2.pub,party-3.pub
+#    validates the bundles (ids exactly 1..=n, uniform TLS posture,
+#    parseable keys/certs), writes ./committee/committee.hex (the exact
+#    format every existing consumer reads) plus the pinned cert set
+#    (party-<id>.crt.pem) with TLS, prints ALL fingerprints for
+#    cross-checking and a suggested --peers line from the addr hints.
+
+# 4. Each party runs its node with its own dir + the shared committee:
+cargo run -p ohm-ecdsa-node -- node --identity ./party1/party-1.identity \
+    --committee ./committee/committee.hex --bind 10.0.0.1:7700 \
+    --peers 1@10.0.0.1:7700,2@10.0.0.2:7700,3@10.0.0.3:7700 \
+    --tls ./party1/party-1.crt.pem ./party1/party-1.key.pem --pinned ./committee
+```
+
+Properties and trust model, honestly:
+
+* **Self-sovereign keys.** `init` uses an OS CSPRNG on the party's own
+  machine; the transport secret key (and TLS key) never touch another
+  machine, a file share, or this repo's demo ceremony.
+* **Assembly is public and re-runnable.** `assemble` reads only `.pub`
+  bundles; every party can re-run it and compare `committee.hex` byte
+  for byte. A corrupt assembly is a liveness issue, not a confidentiality
+  one.
+* **The out-of-band channel is the trust root — and it is OPS, not
+  code.** A swapped `.pub` bundle means the committee bootstraps with an
+  attacker's key in the registry. No code can authenticate that channel;
+  the per-party **fingerprint** (hex of `H(tag ‖ id ‖ transport key ‖
+  cert)`, truncated) exists so the committee confirms every bundle over
+  a second channel BEFORE assembling. `init` prints it; `assemble`
+  prints all of them.
+* **Fail-closed backstops.** Even if a tampered bundle survives the
+  out-of-band check, a node refuses to boot when its own transport key
+  does not match its registry entry, or when its own certificate does
+  not match the pinned set (`node/tests/process_demo.rs` exercises
+  both).
+* **No ceremony key.** An assembled committee file carries the identity
+  point as `x` (an explicit marker): there is no ceremony key share, so
+  the M2 `--seeded` fallback is impossible with `--identity` — the full
+  arc (fresh keygen → presign → sign under the nodes' own key) is the
+  only mode, which is what a real committee wants anyway.
+* The `setup`/`spawn-demo` one-process ceremony stays for demos and
+  tests and now says DEMO-ONLY in its usage text and output.
 
 ## Demo
 
@@ -263,6 +493,12 @@ cargo run -p ohm-ecdsa-node -- spawn-demo --delay-ms 50   # simulated WAN links
 cargo run -p ohm-ecdsa-node -- spawn-demo --persist # M3b: durable stores + transcript/blame archive
 cargo run -p ohm-ecdsa-node -- spawn-demo --tls     # M3c: the full arc over mTLS (rcgen certs, committee-pinned)
 cargo run -p ohm-ecdsa-node -- spawn-demo --ki      # §8.7: keygen → KEY-FREE pool record → 2-round KI sign
+cargo run -p ohm-ecdsa-node -- spawn-demo --factory 2  # H2: background presig factory + 3 concurrent signatures
+cargo run -p ohm-ecdsa-node -- spawn-demo --restart    # H4: §10.4 robust + §10.3 expel-and-restart drivers
+cargo run -p ohm-ecdsa-node -- spawn-demo --restart --cheat-node 2 --cheat bad-open-share
+#   → the cheater is named by every process AND the presign + signature still complete
+cargo run -p ohm-ecdsa-node -- spawn-demo --restart --cheat-node 2 --cheat bad-product-proof
+#   → dealing-phase fault: restart REFUSED (2-of-3 is zero-slack) — consistent abort, t never lowered
 cargo run -p ohm-ecdsa-node -- spawn-demo --tls --persist --cheat-node 2 --cheat bad-sign-share
 cargo run -p ohm-ecdsa-node -- spawn-demo --persist --cheat-node 2 --cheat bad-deal:1 --dir /tmp/ohm-demo
 cargo run -p ohm-ecdsa-node -- auditor /tmp/ohm-demo/node-1/archive/blame-keygen-2.tok \
@@ -288,10 +524,12 @@ M3b) — a cheater run leaves a `blame-*.tok` file in the accuser's
 archive, which the `auditor` subcommand verifies offline.
 
 To run parties by hand (separate terminals or machines — TLS mandatory
-off localhost):
+off localhost), use the distributed ceremony in the previous section.
+The one-process demo path stays for local experiments (**DEMO-ONLY** —
+one machine holds all keys):
 
 ```sh
-cargo run -p ohm-ecdsa-node -- setup --dir /tmp/ohm-demo --tls   # seeds + per-party certs
+cargo run -p ohm-ecdsa-node -- setup --dir /tmp/ohm-demo --tls   # DEMO-ONLY: seeds + per-party certs
 cargo run -p ohm-ecdsa-node -- node --seed /tmp/ohm-demo/party-1.seed \
     --committee /tmp/ohm-demo/committee.hex --bind 127.0.0.1:7700 \
     --peers 1@127.0.0.1:7700,2@127.0.0.1:7701,3@127.0.0.1:7702 \
@@ -342,8 +580,26 @@ cargo test -p ohm-ecdsa-node
   ONE key-free pool signs for TWO different keys from two independent
   keygens (each signature verifies under its own X and not the other);
   a bad R1 opening share is blamed by every node in `Phase::Sign`.
-* `node/tests/process_demo.rs` (M2/M3a/M3b/M3c/§8.7, 13 tests, REAL CHILD
-  PROCESSES via `spawn-demo`): honest full arc across 3 processes; the
+* `node/tests/party_robust.rs` (H4, 10 tests, thread-level with strict
+  per-node key separation): robust sign — a bad `s_j` is filtered,
+  blamed `[2]` at every node, the SAME valid low-`s` signature is
+  delivered everywhere, and the archived F6 token verifies offline at
+  every node; robust presign — a bad `v` opening share and a bad nonce
+  point each continue with consistent blame and records that still sign
+  and verify; robust triples — a bad re-share to one victim is publicly
+  reconstructed via the request/supply rounds (the victim's recovered
+  c-share verifies against `A[γ]`, `c == a·b` per the openings, dealer
+  blamed consistently) and a fabricated reconstruction request blames
+  the requester; §10.3 restart — a 3-of-6 keygen dealing cheater
+  restarts over the 5 survivors' ORIGINAL ids and a 3-of-6 presign
+  dealing cheater restarts with the id poisoned (`first_id + 1`),
+  completes, and signs over the final committee; zero-slack refusal —
+  a 2-of-3 dealing cheater fails the session with the policy refusal
+  (no silent `t`-lowering); robust KI sign — bad R2 signature share and
+  bad R1 opening share each blamed with the KI signature delivered.
+* `node/tests/process_demo.rs` (M2/M3a/M3b/M3c/§8.7/H2/H3/H4, 19 tests, REAL
+  CHILD PROCESSES): 16 via `spawn-demo` — honest full arc across 3
+  processes; the
   `--ki` KI arc (keygen → KEY-FREE pool record → 2-round KI sign, all
   processes agreeing on X and a verifying signature); a
   sign-share cheater named by the other two processes with the signature
@@ -354,7 +610,19 @@ cargo test -p ohm-ecdsa-node
   process; the `--persist` full arc leaving fsync'd consume tombstones
   and decodable transcripts; a `bad-deal` token file verified by the
   `auditor` subcommand (exit 0, `VERDICT: VALID`) and a tampered copy
-  rejected; the `--tls` full arc over mTLS (M3c). These tests are
+  rejected; the `--tls` full arc over mTLS (M3c); the `--factory 2` H2
+  demo (a background presignature factory per process overlapping 3
+  online signatures — factory progress asserted, every signature
+  verifying under the fresh X); the `--restart` H4 demos — a bad opening
+  share named by every process while the presign and signature still
+  COMPLETE (blame + continued service), and a dealing-phase cheat
+  refused at zero slack (consistent abort, `t` never lowered); plus 3 H3
+  distributed-ceremony tests —
+  three separate `init` runs + a public `assemble` booting a full-arc
+  committee from per-party identity files (agreement + a verifying
+  signature), `assemble` rejecting a duplicate party id, and tampered
+  `.pub` bundles (swapped certificate, swapped transport key) failing
+  the node closed at startup. These tests are
   serialized within their binary (a static `Mutex`, documented in the
   file) and run under a 300 s watchdog: each spawns 3 child processes
   whose localhost rounds starve when the whole workspace suite runs in
@@ -379,17 +647,30 @@ cargo test -p ohm-ecdsa-node
   listener is dropped and the node still completes keygen with its
   real TLS peers; the pinning verifiers accept exactly the pinned cert
   and reject any other (unit level).
+* `node/tests/resilience.rs` (H2, 6 tests, thread-level): reconnection
+  after a dropped outgoing connection (journal re-sync re-delivers the
+  in-flight keygen, `reconnects >= 1`); a silent peer failing its round
+  loudly on the round timeout with the honest drivers failing closed
+  and no parked threads (clean shutdown asserted); clean shutdown idle
+  and mid-session (all threads join, no hangs); the listener
+  accept-rate window counting a raw poke flood while the honest keygen
+  completes; garbage frames (absurd length prefix, undecodable
+  payloads) dropped while the honest keygen completes; and MULTIPLE
+  concurrent sessions — a background factory keeping 2 presignatures
+  in the pool per node while signing 3 messages, signatures verifying
+  under the fresh X, factory progress asserted at every node.
 
 ## Layout
 
 | Module | Role |
 |---|---|
-| `src/wire.rs` | `WireMessage<M>` (original / signed echo), canonical framing, signature validation — generic over the payload |
-| `src/mesh.rs` | `Node<M>`: listener + full-mesh connections + reader threads, first-echo rule, verified-only mailbox, self-echo loopback (M2 per-node acceptor), config-driven send delay (benchmarks), optional M3c mTLS wrapping (`bind_tls`) |
-| `src/tls.rs` | M3c: `CommitteeTls` (own cert/key + the pinned committee cert set), committee-pinned TLS 1.3 client/server configs and blocking handshakes (rustls + ring), rcgen cert generation for tests/demos, the PEM file layout (`party-<id>.crt.pem` / `.key.pem`) |
-| `src/transport.rs` | `MeshTransport` (M1): echo-broadcast acceptor + the core `Transport` trait impl over `DkgMessage` |
-| `src/party.rs` | `PartyNode` + `NodePayload` (M2/M3a): per-node keygen driver with §6.1 complaints/defenses on the wire (factored as `joint_vss` + the wire complaint subprotocol), per-node §7.2 triple and §8 presign drivers (the M3a offline factory), per-node §9/§10.4 sign driver, per-node §8.7 KI drivers (`presign_ki` — P1–P3 verbatim, P4 omitted — and the 2-round `sign_ki`, plus the in-memory key-free pool wrappers `presign_ki_pooled` / `sign_ki_pooled`), per-node echo-broadcast acceptor, `Cheat` fault injection; M3b store/archive wiring (`presign_stored`, `sign_stored`, `store_offer`); M3c `bind_with_tls` |
+| `src/wire.rs` | `WireMessage<M>` (original / signed echo), canonical framing, signature validation — generic over the payload; H2 `FrameBound` (per-variant frame size bounds derived from protocol message sizes) |
+| `src/mesh.rs` | `Node<M>`: listener + full-mesh connections + reader threads, first-echo rule, verified-only bounded mailbox, self-echo loopback (M2 per-node acceptor), config-driven send delay (benchmarks), optional M3c mTLS wrapping (`bind_tls`); H2: `ReconnectConfig` + per-session send journal with reconnect re-sync, `Node::shutdown` (join-with-deadline, also on `Drop`), write/handshake timeouts, per-connection rate window, listener accept-rate window, mTLS handshake concurrency cap, `MeshMetrics` drop counters |
+| `src/tls.rs` | M3c: `CommitteeTls` (own cert/key + the pinned committee cert set), committee-pinned TLS 1.3 client/server configs and blocking handshakes (rustls + ring) under the H2 `HANDSHAKE_TIMEOUT` (socket-timeout strategy), rcgen cert generation for tests/demos, the PEM file layout (`party-<id>.crt.pem` / `.key.pem`) |
+| `src/transport.rs` | `MeshTransport` (M1): echo-broadcast acceptor + the core `Transport` trait impl over `DkgMessage` (+ the M1 family's H2 `FrameBound` impl) |
+| `src/party.rs` | `PartyNode` + `NodePayload` (M2/M3a): per-node keygen driver with §6.1 complaints/defenses on the wire (factored as `joint_vss` + the wire complaint subprotocol), per-node §7.2 triple and §8 presign drivers (the M3a offline factory), per-node §9/§10.4 sign driver, per-node §8.7 KI drivers (`presign_ki` — P1–P3 verbatim, P4 omitted — and the 2-round `sign_ki`, plus the in-memory key-free pool wrappers `presign_ki_pooled` / `sign_ki_pooled`), per-node echo-broadcast acceptor, `Cheat` fault injection; M3b store/archive wiring (`presign_stored`, `sign_stored`, `store_offer`); M3c `bind_with_tls`; H2: the collector thread + condvar acceptor (MULTIPLE concurrent sessions demultiplexed by sid), acceptor-level caps (distinct-sid, per-slot equivocation), per-session journal retirement, `PartyNode::shutdown`, `metrics`/`set_reconnect`/`debug_drop_outgoing`; H4: the OPT-IN §10.4-robust drivers (`presign_robust`, `triple_robust` with the `ReshareRequests`/`ReshareSupply` reconstruction rounds, `sign_ki_robust`) and the §10.3 expel-and-restart wrappers (`keygen_with_restart`, `presign_with_restart` + `sign_over`/`sign_stored_over` over the surviving committee, original ids, poisoned sid/id, zero-slack refusal) — every driver is committee-aware (`*_over` id sets) so restart sessions run over survivors |
 | `src/persist.rs` | M3b: `DiskPresigStore` (§8.6 durable single-use store, write-tmp-rename + fsync, consume tombstone fsync'd before the record is handed out), `Archive` (§4.7 accepted-envelope transcript + `aborts.log`), `BlameEvidence` token files (F2 dealt-share, F6 sign-share; other classes `token: none`), `audit_token` offline verifier (§A.4) |
-| `src/seed.rs` | the ceremony + seed/committee files (the `--seeded` fallback for presignature distribution; transport keys come from the seed files in both modes) |
-| `src/main.rs` | `node` / `setup` / `spawn-demo` / `auditor` / `m1-demo` subcommands (`--tls` on `setup`/`node`/`spawn-demo` for M3c, `--ki` on `node`/`spawn-demo` for the §8.7 KI arc) |
+| `src/seed.rs` | the DEMO-ONLY one-process ceremony + seed/committee files (the `--seeded` fallback for presignature distribution; transport keys come from the seed files in that mode) |
+| `src/ceremony.rs` | H3: the DISTRIBUTED committee ceremony — the standard setup path: per-party `init` (own keypair + M3c cert on its own machine; SECRET `party-<id>.identity`, PUBLIC `party-<id>.pub` with id/verifying key/addr hint/cert), short hex `fingerprint` for out-of-band verification, and the PUBLIC `assemble` (validates bundles — ids exactly `1..=n`, uniform TLS posture — and writes the unchanged `committee.hex` format + the pinned cert set; committee `x` is the identity point: no ceremony key) |
+| `src/main.rs` | `node` / `setup` (DEMO-ONLY) / `init` / `assemble` / `spawn-demo` (DEMO-ONLY) / `auditor` / `m1-demo` subcommands (`--tls` on `setup`/`init`/`node`/`spawn-demo` for M3c, `--ki` on `node`/`spawn-demo` for the §8.7 KI arc, `--factory N` on `node`/`spawn-demo` for the H2 concurrent-sessions demo, `--restart` on `node`/`spawn-demo` for the H4 §10.4-robust + §10.3-restart arc, `--identity` on `node` for the H3 distributed ceremony; a node fails closed at startup when its own key/cert does not match the committee registry/pins) |
 | `examples/mesh_perf.rs` | the latency benchmark described above |

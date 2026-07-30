@@ -28,3 +28,13 @@ rcgen = { version = "=0.14.7", default-features = false, features = [
 # Transitive pin (via rcgen): time >= 0.3.5x requires edition2024
 # (cargo >= 1.85). 0.3.36 builds with the workspace MSRV 1.75.
 time = "=0.3.36"
+# H5 (SPEC §13.3): mlock(2) for long-lived secret pages (node crate ONLY —
+# the core stays dependency-pure). libc is already in the tree transitively
+# (0.2.189, builds with MSRV 1.75).
+libc = "=0.2.189"
+# H5 (SPEC §8.6(2), §13.3): authenticated encryption at rest (node crate
+# ONLY). RustCrypto chacha20poly1305, no RNG/getrandom features (nonces
+# come from rand::OsRng); builds with MSRV 1.75.
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = [
+    "alloc",
+] }

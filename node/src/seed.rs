@@ -2,6 +2,14 @@
 //! as the `--seeded` presignature-distribution fallback (SPEC §8.6,
 //! §13.1).
 //!
+//! **DEMO-ONLY.** `seed::ceremony` (the `setup` subcommand) generates
+//! EVERY party's transport keypair in ONE process and distributes secret
+//! files — one machine momentarily holds the whole committee's transport
+//! secrets. That is fine for demos and tests and unacceptable for a real
+//! committee: the standard setup path is the DISTRIBUTED ceremony in
+//! [`crate::ceremony`] (per-party `init` → out-of-band `.pub` exchange →
+//! public `assemble`), where no secret ever leaves its party's machine.
+//!
 //! With M3a the default demo presigns through the mesh under the key its
 //! own keygen produced (`party::PartyNode::presign`). The ceremony is
 //! kept as a FALLBACK (`--seeded`): a PRIOR ORCHESTRATED RUN — one
@@ -18,10 +26,11 @@
 //! transport verifying-key registry). A node process reads exactly its
 //! own seed file plus the public committee file.
 //!
-//! File format: hex of the canonical byte encoding below (no serde, as
-//! everywhere in this workspace). Seed files are secret material on disk
-//! — retention/zeroization of files is a deployment concern (SPEC §13.3),
-//! accepted here for localhost demos and tests.
+//! File format: hex of the H5-SEALED canonical byte encoding below
+//! (ChaCha20-Poly1305 under the node's storage key, [`crate::seal`] —
+//! seed files are key-equivalent secret material, SPEC §8.6(2)). Legacy
+//! cleartext seed files are rejected with an explicit error (no silent
+//! downgrade); every file is written `0600`.
 
 use std::fs;
 use std::io;
@@ -38,6 +47,11 @@ use ohm_ecdsa::sim;
 use ohm_ecdsa::transport::{Decode, Encode};
 use ohm_ecdsa::vss::FeldmanCommitment;
 use ohm_ecdsa::{Params, PartyId};
+
+use crate::seal::{self, StorageKey};
+
+/// The H5 seal purpose for party seed files.
+pub(crate) const SEED_PURPOSE: &[u8] = b"party-seed";
 
 /// The public committee file: threshold params, the ceremony joint public
 /// key `X`, and the transport verifying-key registry. No secrets.
@@ -107,11 +121,11 @@ pub fn ceremony(params: &Params, n_presigs: u64, seed: u64) -> (CommitteeInfo, V
 
 // --- canonical byte encoding (hex on disk) ---------------------------------
 
-fn put_u64(out: &mut Vec<u8>, v: u64) {
+pub(crate) fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
-fn take_u64(b: &[u8]) -> Option<(u64, usize)> {
+pub(crate) fn take_u64(b: &[u8]) -> Option<(u64, usize)> {
     let a: [u8; 8] = b.get(..8)?.try_into().ok()?;
     Some((u64::from_be_bytes(a), 8))
 }
@@ -243,11 +257,11 @@ fn decode_seed(b: &[u8]) -> Option<PartySeed> {
     })
 }
 
-fn hex_encode(b: &[u8]) -> String {
+pub(crate) fn hex_encode(b: &[u8]) -> String {
     b.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn hex_decode(s: &str) -> io::Result<Vec<u8>> {
+pub(crate) fn hex_decode(s: &str) -> io::Result<Vec<u8>> {
     let s = s.trim();
     if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad hex"));
@@ -258,7 +272,7 @@ fn hex_decode(s: &str) -> io::Result<Vec<u8>> {
         .collect())
 }
 
-fn invalid(what: &str) -> io::Error {
+pub(crate) fn invalid(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what.to_string())
 }
 
@@ -270,15 +284,28 @@ pub fn seed_file(dir: &Path, id: PartyId) -> PathBuf {
     dir.join(format!("party-{id}.seed"))
 }
 
-/// Write the public committee file and every party's secret seed file.
-pub fn write_all(dir: &Path, info: &CommitteeInfo, seeds: &[PartySeed]) -> io::Result<()> {
+/// Write ONLY the public committee file into `dir`. The demo ceremony
+/// uses [`write_all`]; the H3 distributed ceremony ([`crate::ceremony`])
+/// assembles the committee file from PUBLIC bundles and has no seeds to
+/// write.
+pub fn write_committee(dir: &Path, info: &CommitteeInfo) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     fs::write(
         dir.join(COMMITTEE_FILE),
         hex_encode(&encode_committee(info)),
-    )?;
+    )
+}
+
+/// Write the public committee file and every party's secret seed file.
+/// Seed files are H5-SEALED under the storage key resolved for `dir`
+/// (env/key-file, else a generated `<dir>/storage.key` — the dev
+/// default, [`crate::seal`]) and written `0600`.
+pub fn write_all(dir: &Path, info: &CommitteeInfo, seeds: &[PartySeed]) -> io::Result<()> {
+    write_committee(dir, info)?;
+    let key = StorageKey::resolve_or_generate(dir)?;
     for seed in seeds {
-        fs::write(seed_file(dir, seed.id), hex_encode(&encode_seed(seed)))?;
+        let sealed = key.seal(SEED_PURPOSE, &encode_seed(seed));
+        seal::write_secret_file(&seed_file(dir, seed.id), hex_encode(&sealed).as_bytes())?;
     }
     Ok(())
 }
@@ -290,8 +317,30 @@ pub fn read_committee(path: &Path) -> io::Result<CommitteeInfo> {
 }
 
 /// Read ONE party's secret seed file — the only secret material a node
-/// process ever loads.
+/// process ever loads. The storage key is resolved from the environment
+/// or `<seed dir>/storage.key` ([`StorageKey::resolve`]); use
+/// [`read_seed_with`] to supply it explicitly. A legacy cleartext seed
+/// file is REJECTED (fail closed — no silent downgrade).
 pub fn read_seed(path: &Path) -> io::Result<PartySeed> {
+    let beside = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let key = StorageKey::resolve(&beside)?.ok_or_else(|| {
+        invalid(&format!(
+            "no storage key configured for {} (set {} or {}, or place {} beside it)",
+            path.display(),
+            seal::ENV_STORAGE_KEY,
+            seal::ENV_STORAGE_KEY_FILE,
+            seal::STORAGE_KEY_FILE
+        ))
+    })?;
+    read_seed_with(path, &key)
+}
+
+/// [`read_seed`] with an explicit storage key.
+pub fn read_seed_with(path: &Path, key: &StorageKey) -> io::Result<PartySeed> {
+    seal::warn_if_loose(path, "seed file");
     let bytes = hex_decode(&fs::read_to_string(path)?)?;
-    decode_seed(&bytes).ok_or_else(|| invalid("malformed seed file"))
+    let plain = key
+        .open(SEED_PURPOSE, &bytes)
+        .map_err(|e| invalid(&format!("seed file {}: {e}", path.display())))?;
+    decode_seed(&plain).ok_or_else(|| invalid("malformed seed file"))
 }

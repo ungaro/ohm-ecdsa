@@ -25,13 +25,20 @@
 //!     A `key.bin` file (canonical bytes of `X`) written and fsync'd on
 //!     first open binds the directory to one long-term key (§8.6(4));
 //!     reopening under a different key is rejected.
+//!   - H5: records are key-equivalent (§8.6(2)), so every `.presig`
+//!     file is SEALED — canonical bytes inside a ChaCha20-Poly1305
+//!     envelope under the node's storage key ([`crate::seal`]), written
+//!     `0600`. `open` rejects a legacy cleartext record and any record
+//!     this storage key cannot authenticate (fail closed).
 //!
 //!   Limits, honestly: this survives process kill and — on a
 //!   cooperating filesystem/OS — machine crash at exactly the fsync
-//!   points above. It is NOT `mlock`/HSM-backed secret storage (records
-//!   are key-equivalent, §8.6/§13.3), it does no wear leveling, and it
-//!   does not defend against a malicious host rolling back the
-//!   directory. Localhost demo and test scaffolding only.
+//!   points above. At-rest confidentiality reduces to the storage key
+//!   (wire it to a KMS/HSM in real deployments — [`crate::seal`] is the
+//!   interface, not a KMS); it is not HSM-backed share storage, it does
+//!   no wear leveling, and it does not defend against a malicious host
+//!   rolling back the directory. Localhost demo and test scaffolding
+//!   only.
 //! * [`Archive`] — the §4.7/§10.2 accepted-message-set transcript: every
 //!   signed envelope a driver ACCEPTS is appended (once) to
 //!   `transcript.log` as `u32 BE length ‖ canonical SignedEnvelope
@@ -60,11 +67,14 @@ use ohm_ecdsa::vss::FeldmanCommitment;
 use ohm_ecdsa::{Error, IdentifiableAbort, PartyId, Phase};
 
 use crate::party::NodePayload;
+use crate::seal::{SealError, StorageKey};
 
 /// Persistence-layer failures: I/O errors stay `io::Error`s; protocol-
 /// semantic failures (duplicate id, unknown/consumed id, key mismatch)
 /// carry the core's [`Error`] — same variants and messages as the
-/// in-memory `PresigStore` (SPEC §8.6).
+/// in-memory `PresigStore` (SPEC §8.6); at-rest integrity failures (H5:
+/// legacy cleartext, wrong storage key, tampered record) carry
+/// [`SealError`] and ALWAYS fail closed.
 #[derive(Debug)]
 pub enum PersistError {
     /// Filesystem failure (the operation's fsync point is documented
@@ -72,6 +82,8 @@ pub enum PersistError {
     Io(io::Error),
     /// Protocol-semantics failure mirroring the core store.
     Protocol(Error),
+    /// H5 at-rest integrity failure ([`SealError`] — fail closed).
+    Seal(SealError),
 }
 
 impl core::fmt::Display for PersistError {
@@ -79,6 +91,7 @@ impl core::fmt::Display for PersistError {
         match self {
             Self::Io(e) => write!(f, "persistence I/O: {e}"),
             Self::Protocol(e) => write!(f, "{e}"),
+            Self::Seal(e) => write!(f, "at-rest integrity: {e}"),
         }
     }
 }
@@ -94,6 +107,12 @@ impl From<io::Error> for PersistError {
 impl From<Error> for PersistError {
     fn from(e: Error) -> Self {
         Self::Protocol(e)
+    }
+}
+
+impl From<SealError> for PersistError {
+    fn from(e: SealError) -> Self {
+        Self::Seal(e)
     }
 }
 
@@ -245,10 +264,35 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 
 /// Write `bytes` to `dir/<name>` atomically: write to a temp file,
 /// fsync the file, rename, fsync the directory. A crash before the
-/// rename leaves only the temp file.
-fn write_atomic(dir: &Path, tmp_name: &str, name: &str, bytes: &[u8]) -> io::Result<()> {
+/// rename leaves only the temp file. `secret` files are written `0600`
+/// (H5 — enforced even if the temp file pre-existed looser).
+fn write_atomic(
+    dir: &Path,
+    tmp_name: &str,
+    name: &str,
+    bytes: &[u8],
+    secret: bool,
+) -> io::Result<()> {
     let tmp = dir.join(tmp_name);
-    let mut f = File::create(&tmp)?;
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        if secret {
+            opts.mode(0o600);
+        }
+        let f = opts.open(&tmp)?;
+        if secret {
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        }
+        f
+    };
+    #[cfg(not(unix))]
+    let mut f = {
+        let _ = secret;
+        File::create(&tmp)?
+    };
     f.write_all(bytes)?;
     f.sync_all()?;
     fs::rename(&tmp, dir.join(name))?;
@@ -257,27 +301,58 @@ fn write_atomic(dir: &Path, tmp_name: &str, name: &str, bytes: &[u8]) -> io::Res
 
 // --- the durable presignature store (SPEC §8.6) -------------------------
 
+/// The H5 seal purpose for one store record (binds the AEAD to the
+/// artifact AND the record id — a renamed file fails authentication).
+fn record_purpose(id: u64) -> Vec<u8> {
+    let mut p = b"presig-record".to_vec();
+    p.extend_from_slice(&id.to_be_bytes());
+    p
+}
+
 /// File-backed single-use presignature store: one directory per node
-/// per long-term key, one canonical-encoded file per record. The
+/// per long-term key, one file per record. Records are KEY-EQUIVALENT
+/// (§8.6(2)), so every file on disk is H5-SEALED — the canonical bytes
+/// inside a ChaCha20-Poly1305 envelope under the node's storage key
+/// ([`crate::seal`]), written `0600`; a legacy cleartext record is
+/// rejected at `open` (fail closed, no silent downgrade). The
 /// durability/crash-safety model is documented in the module docs —
 /// the short version: a consumed id stays consumed across a
 /// kill/restart, because the tombstone rename is fsync'd BEFORE the
 /// record is handed to the caller.
-#[derive(Debug)]
 pub struct DiskPresigStore {
     dir: PathBuf,
     public_key: AffinePoint,
+    /// H5: this node's at-rest AEAD key (its own locked copy).
+    storage_key: StorageKey,
     live: BTreeSet<u64>,
     consumed: BTreeSet<u64>,
 }
 
+impl std::fmt::Debug for DiskPresigStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskPresigStore")
+            .field("dir", &self.dir)
+            .field("public_key", &self.public_key)
+            .field("live", &self.live)
+            .field("consumed", &self.consumed)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DiskPresigStore {
     /// Open (or create) the store at `dir`, bound to `public_key` (the
-    /// DKG output `X`, §8.6(4)). Replays the directory: live records,
-    /// consumed tombstones, stray `.tmp` files (crash mid-insert —
-    /// deleted, the insert was never acknowledged). Reopening under a
-    /// different key is rejected.
-    pub fn open(dir: &Path, public_key: &AffinePoint) -> Result<Self, PersistError> {
+    /// DKG output `X`, §8.6(4)) and sealed under `storage_key` (H5).
+    /// Replays the directory: live records, consumed tombstones, stray
+    /// `.tmp` files (crash mid-insert — deleted, the insert was never
+    /// acknowledged). Reopening under a different key is rejected, and
+    /// so is any record that is not H5-sealed (a legacy cleartext file —
+    /// fail closed) or fails authentication under THIS storage key
+    /// (wrong key or tampered).
+    pub fn open(
+        dir: &Path,
+        public_key: &AffinePoint,
+        storage_key: &StorageKey,
+    ) -> Result<Self, PersistError> {
         fs::create_dir_all(dir)?;
         let key_bytes = {
             let mut b = Vec::new();
@@ -290,7 +365,7 @@ impl DiskPresigStore {
                 return Err(Error::PresigStore("store bound to a different key").into());
             }
         } else {
-            write_atomic(dir, "key.tmp", "key.bin", &key_bytes)?;
+            write_atomic(dir, "key.tmp", "key.bin", &key_bytes, false)?;
         }
         let mut live = BTreeSet::new();
         let mut consumed = BTreeSet::new();
@@ -303,6 +378,16 @@ impl DiskPresigStore {
             let Ok(id) = id.parse::<u64>() else { continue };
             match kind {
                 "presig" => {
+                    // H5: reject a legacy cleartext record at STARTUP
+                    // (fail closed — the error names the file), and any
+                    // record this storage key cannot authenticate.
+                    let bytes = fs::read(dir.join(name))?;
+                    if !StorageKey::is_sealed(&bytes) {
+                        return Err(PersistError::Seal(SealError::LegacyCleartext));
+                    }
+                    storage_key
+                        .open(&record_purpose(id), &bytes)
+                        .map_err(PersistError::Seal)?;
                     live.insert(id);
                 }
                 "consumed" => {
@@ -319,6 +404,7 @@ impl DiskPresigStore {
         Ok(Self {
             dir: dir.to_path_buf(),
             public_key: *public_key,
+            storage_key: storage_key.clone(),
             live,
             consumed,
         })
@@ -332,7 +418,8 @@ impl DiskPresigStore {
     /// Persist a presignature (the caller keeps the in-memory record —
     /// the file is the durable copy); rejects a duplicate id, including
     /// an id that was already CONSUMED (nonce-reuse guard, §8.6(1)).
-    /// fsync points: file, then directory after the rename.
+    /// The record is SEALED (H5) and written `0600`. fsync points:
+    /// file, then directory after the rename.
     pub fn insert(&mut self, presig: &Presignature) -> Result<(), PersistError> {
         let id = presig.id;
         if self.live.contains(&id) || self.consumed.contains(&id) {
@@ -340,11 +427,13 @@ impl DiskPresigStore {
         }
         let mut bytes = Vec::new();
         put_presig(&mut bytes, presig);
+        let sealed = self.storage_key.seal(&record_purpose(id), &bytes);
         write_atomic(
             &self.dir,
             &format!("{id}.tmp"),
             &format!("{id}.presig"),
-            &bytes,
+            &sealed,
+            true,
         )?;
         self.live.insert(id);
         Ok(())
@@ -354,12 +443,17 @@ impl DiskPresigStore {
     /// restarts (§8.6(1)): the tombstone rename is fsync'd BEFORE the
     /// record is returned, so a crash can lose the record but can never
     /// hand it out twice. Unknown or consumed ids mirror the core
-    /// store's error.
+    /// store's error; a record that fails H5 authentication (wrong
+    /// storage key or tampered) fails closed.
     pub fn consume(&mut self, id: u64) -> Result<Presignature, PersistError> {
         if !self.live.contains(&id) {
             return Err(Error::PresigStore("unknown or consumed presignature id").into());
         }
-        let bytes = fs::read(self.dir.join(format!("{id}.presig")))?;
+        let sealed = fs::read(self.dir.join(format!("{id}.presig")))?;
+        let bytes = self
+            .storage_key
+            .open(&record_purpose(id), &sealed)
+            .map_err(PersistError::Seal)?;
         let (presig, _) = take_presig(&bytes)
             .filter(|(_, used)| *used == bytes.len())
             .ok_or(Error::PresigStore("corrupt presignature file"))?;
@@ -565,7 +659,13 @@ pub fn write_token(dir: &Path, evidence: &BlameEvidence) -> io::Result<PathBuf> 
         .collect::<Vec<_>>()
         .join("-");
     let name = format!("blame-{}-{ids}.tok", abort.phase);
-    write_atomic(dir, &format!("{name}.tmp"), &name, &evidence.encode())?;
+    write_atomic(
+        dir,
+        &format!("{name}.tmp"),
+        &name,
+        &evidence.encode(),
+        false,
+    )?;
     Ok(dir.join(name))
 }
 

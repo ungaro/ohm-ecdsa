@@ -43,8 +43,26 @@ use k256::SecretKey;
 use ohm_ecdsa::transport::{DkgMessage, Encode, Envelope, SignedEnvelope, Transport};
 use ohm_ecdsa::{PartyId, Phase};
 
-use crate::mesh::Node;
-use crate::wire::{Received, WireMessage};
+use crate::mesh::{Node, INBOX_BOUND};
+use crate::wire::{FrameBound, Received, WireMessage};
+
+/// H2 per-variant frame bounds for the M1 payload family (see
+/// `wire::FrameBound`): same sizes as `party.rs`'s `NodePayload::Dkg` —
+/// Commit ≈ 40 B (id + hash), Reveal = `8 + 33n` (Feldman vector,
+/// threshold degree bounded by `n` worst case), Share ≈ 48 B — one
+/// bound over the largest variant (Reveal), rounded up with slack.
+impl FrameBound for DkgMessage {
+    fn payload_variant_max(&self, n: usize) -> u64 {
+        match self {
+            Self::Commit(_) | Self::Share(_) => 64,
+            Self::Reveal(_) => Self::family_max(n),
+        }
+    }
+
+    fn family_max(n: usize) -> u64 {
+        64 + 40 * n as u64
+    }
+}
 
 /// Default per-round timeout (localhost rounds complete in milliseconds).
 pub const DEFAULT_ROUND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -230,7 +248,7 @@ impl MeshTransport {
             .iter()
             .map(|(p, sk)| (*p, *SigningKey::from(sk).verifying_key()))
             .collect();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(INBOX_BOUND);
         // Phase 1: bind all listeners first so every address is known
         // (supports port 0 — the OS-assigned ports are collected here).
         let mut nodes = Vec::new();

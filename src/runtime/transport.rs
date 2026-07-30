@@ -412,6 +412,15 @@ impl Encode for FeldmanCommitment {
 impl Decode for FeldmanCommitment {
     fn decode(bytes: &[u8]) -> Option<(Self, usize)> {
         let (n, mut used) = take_u64(bytes)?;
+        // Every point encodes to at least one byte (SEC1 infinity), so a
+        // count larger than the remaining input is malformed. Reject it
+        // BEFORE the loop: a count of `k` followed by `k` one-byte
+        // identity points is valid, but an over-counted prefix must not
+        // turn a small frame into a large allocation (decode-side DoS
+        // hardening; valid encodings are unaffected).
+        if n > (bytes.len() - used) as u64 {
+            return None;
+        }
         // No `with_capacity`: the length is untrusted wire data.
         let mut points = Vec::new();
         for _ in 0..n {
@@ -1564,5 +1573,32 @@ mod tests {
         for cut in [0, 1, 8, 11, 13, 21, sbuf.len() - 1] {
             assert!(SignedEnvelope::<DkgMessage>::decode(&sbuf[..cut]).is_none());
         }
+    }
+
+    #[test]
+    fn wire_decode_rejects_oversized_commitment_len() {
+        // Decode-side DoS hardening: the Feldman point count is untrusted.
+        // A count larger than the remaining input is malformed (every
+        // point encodes to at least one byte) and must be rejected BEFORE
+        // the decode loop, not after a huge allocation.
+        let mut buf = u64::MAX.to_be_bytes().to_vec();
+        assert!(FeldmanCommitment::decode(&buf).is_none());
+        // n = 5 but only 4 bytes follow.
+        buf = 5u64.to_be_bytes().to_vec();
+        buf.extend_from_slice(&[0x00; 4]);
+        assert!(FeldmanCommitment::decode(&buf).is_none());
+        // n = 4 with 4 one-byte identity points is VALID (identity points
+        // encode as the single byte 0x00, §7.4.3 zero-padding).
+        buf = 4u64.to_be_bytes().to_vec();
+        buf.extend_from_slice(&[0x00; 4]);
+        let (com, used) = FeldmanCommitment::decode(&buf).unwrap();
+        assert_eq!(used, buf.len());
+        assert_eq!(com.points, vec![ProjectivePoint::IDENTITY; 4]);
+        // The same over-counted prefix nested in a Reveal is rejected too.
+        let mut reveal = vec![2u8]; // DkgMessage::Reveal tag
+        reveal.extend_from_slice(&3u64.to_be_bytes()); // from
+        reveal.extend_from_slice(&u64::MAX.to_be_bytes()); // point count
+        reveal.extend_from_slice(&[0x00; 64]);
+        assert!(DkgMessage::decode(&reveal).is_none());
     }
 }

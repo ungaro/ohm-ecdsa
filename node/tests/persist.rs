@@ -27,9 +27,15 @@ use ohm_ecdsa::{session_id, Error, Params, PartyId, Phase};
 use ohm_ecdsa_node::persist::{
     audit_token, read_transcript, Archive, DiskPresigStore, PersistError,
 };
+use ohm_ecdsa_node::seal::StorageKey;
 use ohm_ecdsa_node::{Cheat, NodePayload, PartyNode};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+
+/// Deterministic storage key for sealed-store tests (H5).
+fn sk() -> StorageKey {
+    StorageKey::from_secret(&[7u8; 32])
+}
 
 const ROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const DKG_TAG: &[u8] = b"ohm-ecdsa-node/test/dkg";
@@ -68,11 +74,11 @@ fn disk_store_survives_reopen() {
     let dir = tmpdir("reopen");
     let (presig, x) = test_presig();
     {
-        let mut store = DiskPresigStore::open(&dir, &x).unwrap();
+        let mut store = DiskPresigStore::open(&dir, &x, &sk()).unwrap();
         store.insert(&presig).unwrap();
         assert!(store.contains(0));
     } // drop == close
-    let mut store = DiskPresigStore::open(&dir, &x).unwrap();
+    let mut store = DiskPresigStore::open(&dir, &x, &sk()).unwrap();
     assert_eq!(store.len(), 1);
     let back = store.consume(0).unwrap();
     assert_eq!(back.id, presig.id);
@@ -86,14 +92,14 @@ fn disk_store_consumed_stays_consumed_across_restart() {
     let dir = tmpdir("consumed");
     let (presig, x) = test_presig();
     {
-        let mut store = DiskPresigStore::open(&dir, &x).unwrap();
+        let mut store = DiskPresigStore::open(&dir, &x, &sk()).unwrap();
         store.insert(&presig).unwrap();
         store.consume(0).unwrap();
         assert!(dir.join("0.consumed").exists());
     } // simulated crash: the process dies here
       // §8.6(1): the tombstone was fsync'd BEFORE the record was handed
       // out, so the id stays consumed across the kill/restart.
-    let mut store = DiskPresigStore::open(&dir, &x).unwrap();
+    let mut store = DiskPresigStore::open(&dir, &x, &sk()).unwrap();
     assert!(store.is_empty());
     let err = store.consume(0).unwrap_err();
     assert!(
@@ -108,13 +114,13 @@ fn disk_store_rejects_duplicate_insert_after_reopen() {
     let dir = tmpdir("duplicate");
     let (presig, x) = test_presig();
     {
-        let mut store = DiskPresigStore::open(&dir, &x).unwrap();
+        let mut store = DiskPresigStore::open(&dir, &x, &sk()).unwrap();
         store.insert(&presig).unwrap();
         let err = store.insert(&presig).unwrap_err();
         assert!(matches!(err, PersistError::Protocol(Error::PresigStore(_))));
     }
     // Duplicate rejection survives the reopen, both for a live id…
-    let mut store = DiskPresigStore::open(&dir, &x).unwrap();
+    let mut store = DiskPresigStore::open(&dir, &x, &sk()).unwrap();
     let err = store.insert(&presig).unwrap_err();
     assert!(matches!(err, PersistError::Protocol(Error::PresigStore(_))));
     // …and for an id that was already CONSUMED (nonce-reuse guard).
@@ -128,13 +134,13 @@ fn disk_store_rejects_duplicate_insert_after_reopen() {
 fn disk_store_rejects_wrong_key() {
     let dir = tmpdir("wrong-key");
     let (presig, x) = test_presig();
-    let mut store = DiskPresigStore::open(&dir, &x).unwrap();
+    let mut store = DiskPresigStore::open(&dir, &x, &sk()).unwrap();
     store.insert(&presig).unwrap();
     drop(store);
     // §8.6(4): one store per long-term key — reopening under a different
     // key is rejected.
     let other = ProjectivePoint::GENERATOR.to_affine();
-    let err = DiskPresigStore::open(&dir, &other).unwrap_err();
+    let err = DiskPresigStore::open(&dir, &other, &sk()).unwrap_err();
     assert!(matches!(err, PersistError::Protocol(Error::PresigStore(_))));
     fs::remove_dir_all(&dir).ok();
 }
@@ -146,7 +152,7 @@ fn disk_store_drops_stray_tmp_file() {
     // A crash between the temp write and the rename leaves a `.tmp`
     // file; the insert was never acknowledged, so `open` deletes it.
     fs::write(dir.join("5.tmp"), b"partial record").unwrap();
-    let store = DiskPresigStore::open(&dir, &x).unwrap();
+    let store = DiskPresigStore::open(&dir, &x, &sk()).unwrap();
     assert!(!dir.join("5.tmp").exists());
     assert!(!store.contains(5));
     assert!(store.is_empty());
@@ -384,7 +390,7 @@ fn party_arc_restart_keeps_consumed_ids() {
         let store_dir = dir.join(format!("node-{id}/store"));
         assert!(store_dir.join("0.consumed").exists());
         assert!(!store_dir.join("0.presig").exists());
-        let mut store = DiskPresigStore::open(&store_dir, &xs[0]).unwrap();
+        let mut store = DiskPresigStore::open(&store_dir, &xs[0], &sk()).unwrap();
         assert!(store.is_empty());
         let err = store.consume(0).unwrap_err();
         assert!(

@@ -10,11 +10,31 @@
 //!   robust) with that presignature. `--seeded` keeps the M2 fallback:
 //!   sign with a ceremony-seeded presignature ([`ohm_ecdsa_node::seed`])
 //!   under the ceremony key. `--tls CERT KEY --pinned DIR` (M3c, §13.1)
-//!   wraps the mesh in mTLS with committee-pinned certs.
-//! * `setup` — the demo ceremony: one orchestrated run writing the public
-//!   committee file and one SECRET seed file per party; `--tls` also
-//!   writes per-party self-signed certs for the M3c mTLS mesh.
-//! * `spawn-demo` — the showcase: set up a 2-of-3 committee and launch
+//!   wraps the mesh in mTLS with committee-pinned certs. `--restart`
+//!   (H4, §10.4 + §10.3) runs the arc on the ROBUST drivers with the
+//!   expel-and-restart policy: continuable faults are filtered with
+//!   blame in-attempt; dealing-phase aborts expel the blamed and re-run
+//!   over the surviving committee (original ids, poisoned sid/id; never
+//!   lowering `t`). Default stays fail-fast — some deployments prefer
+//!   loud aborts.
+//! * `setup` — **DEMO-ONLY**: the one-process ceremony writing the
+//!   public committee file and one SECRET seed file per party — a single
+//!   machine momentarily holds EVERY party's transport secret key. For
+//!   anything real use the distributed ceremony (`init` + `assemble`,
+//!   below). `--tls` also writes per-party self-signed certs for the
+//!   M3c mTLS mesh.
+//! * `init` — H3 distributed ceremony, per-party step: on its OWN
+//!   machine each party generates its own transport keypair (plus its
+//!   self-signed cert with `--tls`), writes the SECRET
+//!   `party-<id>.identity` and the PUBLIC `party-<id>.pub` bundle, and
+//!   prints the bundle's fingerprint for out-of-band verification.
+//! * `assemble` — H3 distributed ceremony, PUBLIC assembly step (safe
+//!   to run anywhere): validates the collected `.pub` bundles and
+//!   writes the shared `committee.hex` (the format every consumer
+//!   already reads) plus the pinned cert set with TLS. Prints every
+//!   party's fingerprint for cross-checking.
+//! * `spawn-demo` — **DEMO-ONLY** showcase: set up a 2-of-3 committee
+//!   IN THIS PROCESS (it holds all keys) and launch
 //!   three child `node` processes on localhost, keygen → presign → sign
 //!   across real processes, printing per-process logs, per-phase timings,
 //!   the joint key, the signature, and any blame. `--cheat-node K
@@ -22,7 +42,8 @@
 //!   the M2 seeded-sign demo; `--tls` (M3c) generates per-party certs
 //!   and runs the arc over mTLS; `--ki` (§8.7) runs the key-independent
 //!   arc: keygen → KEY-FREE pool record → 2-round online KI sign under
-//!   the key the processes' own keygen produced.
+//!   the key the processes' own keygen produced; `--restart` (H4) runs
+//!   the arc on the §10.4-robust + §10.3-restart drivers.
 //! * `m1-demo [port_base]` — the original M1 orchestrator demo (one
 //!   process, all keys, `drive_dkg_signed` over `MeshTransport`).
 //! * `auditor TOKEN_FILE COMMITTEE_FILE` — the M3b offline evidence
@@ -35,20 +56,23 @@
 //!
 //! Run `… --help`-less: wrong usage prints the usage text.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use k256::ecdsa::signature::Verifier;
-use k256::ecdsa::{Signature, VerifyingKey};
+use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::SecretKey;
+use ohm_ecdsa::presign::{KeyShare, Presignature};
 use ohm_ecdsa::transport::{drive_dkg_signed, SigningTransport};
 use ohm_ecdsa::{session_id, Error, Params, PartyId, Phase};
+use ohm_ecdsa_node::ceremony::{self, PubBundle};
 use ohm_ecdsa_node::persist::{self, PersistError};
 use ohm_ecdsa_node::seed::{self, CommitteeInfo};
 use ohm_ecdsa_node::tls::{self, CommitteeTls};
@@ -59,6 +83,14 @@ use rand::rngs::OsRng;
 const GENESIS: &[u8] = b"ohm-ecdsa-node/m2-demo";
 /// The message the demo committee signs.
 const DEMO_MESSAGE: &[u8] = b"ohm-ecdsa-node M2 demo: signed across real OS processes";
+/// The messages the `--factory N` demo signs while the background
+/// presignature factory keeps running (H2 Phase 3 — concurrent
+/// sessions): distinct from each other and from [`DEMO_MESSAGE`].
+const FACTORY_MESSAGES: [&[u8]; 3] = [
+    b"ohm-ecdsa-node factory demo: message 1",
+    b"ohm-ecdsa-node factory demo: message 2",
+    b"ohm-ecdsa-node factory demo: message 3",
+];
 /// DKG commit tag for the per-node keygen driver.
 const DKG_TAG: &[u8] = b"ohm-ecdsa-node/dkg";
 
@@ -67,6 +99,8 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("m1-demo") => m1_demo(args.get(1).and_then(|a| a.parse().ok()).unwrap_or(0)),
         Some("setup") => setup(&args[1..]),
+        Some("init") => init_mode(&args[1..]),
+        Some("assemble") => assemble_mode(&args[1..]),
         Some("node") => node_mode(&args[1..]),
         Some("spawn-demo") => spawn_demo(&args[1..]),
         Some("auditor") => auditor(&args[1..]),
@@ -74,13 +108,15 @@ fn main() -> ExitCode {
             eprintln!(
                 "usage:\n  \
                  ohm-ecdsa-node m1-demo [PORT_BASE]\n  \
-                 ohm-ecdsa-node setup --dir DIR [--presigs K] [--seed S] [--tls]\n  \
-                 ohm-ecdsa-node node --seed FILE --committee FILE --bind ADDR \\\n    \
+                 ohm-ecdsa-node init --id N --dir DIR [--addr HOST:PORT] [--tls]   (H3: per-party, on its OWN machine)\n  \
+                 ohm-ecdsa-node assemble --committee DIR --inputs PUB,... [--t T]  (H3: PUBLIC, safe anywhere)\n  \
+                 ohm-ecdsa-node setup --dir DIR [--presigs K] [--seed S] [--tls]   (DEMO-ONLY: one process holds ALL keys)\n  \
+                 ohm-ecdsa-node node (--seed FILE | --identity FILE) --committee FILE --bind ADDR \\\n    \
                  [--rendezvous | --peers id@host:port,...] [--delay-ms D] [--seeded] [--ki] \\\n    \
                  [--round-timeout-secs S] [--cheat C] [--presig-id K] [--message MSG] \\\n    \
-                 [--data-dir DIR] [--tls CERT KEY --pinned DIR]\n  \
+                 [--data-dir DIR] [--tls CERT KEY --pinned DIR] [--factory N] [--restart]\n  \
                  ohm-ecdsa-node spawn-demo [--dir DIR] [--delay-ms D] [--seeded] [--persist] \\\n    \
-                 [--tls] [--ki] [--cheat-node K --cheat C]\n  \
+                 [--tls] [--ki] [--factory N] [--restart] [--cheat-node K --cheat C]   (DEMO-ONLY)\n  \
                  ohm-ecdsa-node auditor TOKEN_FILE COMMITTEE_FILE\n  \
                  cheats: bad-deal:V | false-accuse:D | bad-sign-share | \\\n    \
                  bad-product-proof | bad-reshare:V | bad-nonce-point | bad-open-share"
@@ -178,6 +214,15 @@ fn setup(args: &[String]) -> ExitCode {
         eprintln!("setup: writing seed files failed: {e}");
         return ExitCode::FAILURE;
     }
+    eprintln!(
+        "WARNING: DEMO-ONLY ceremony — this one process momentarily holds ALL parties' secret"
+    );
+    eprintln!(
+        "         transport keys. For a real committee use the distributed ceremony instead:"
+    );
+    eprintln!(
+        "         `init` (per party, on its own machine) → exchange .pub out-of-band → `assemble`."
+    );
     let x = info.x.to_affine().to_encoded_point(true);
     println!("ceremony complete (2-of-3, {presigs} presignature(s) per party)");
     println!("  joint public key X = {}", hex(x.as_bytes()));
@@ -218,21 +263,149 @@ fn setup(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// --- H3: the distributed committee ceremony -----------------------------------
+//
+// The standard setup path for a real committee: each party runs `init`
+// on its OWN machine (its secrets never leave), the PUBLIC `.pub`
+// bundles travel out of band over an authenticated channel (the
+// fingerprints below exist for the second-channel cross-check), and
+// `assemble` — public data only, safe to run anywhere — writes the
+// shared committee file. See `node/src/ceremony.rs` for the trust model.
+
+fn init_mode(args: &[String]) -> ExitCode {
+    let mut args = args.to_vec();
+    let (Some(id), Some(dir)) = (
+        flag_value(&mut args, "--id").and_then(|v| v.parse::<PartyId>().ok()),
+        flag_value(&mut args, "--dir").map(PathBuf::from),
+    ) else {
+        eprintln!("init: --id N and --dir DIR are required");
+        return ExitCode::FAILURE;
+    };
+    let addr = flag_value(&mut args, "--addr").unwrap_or_default();
+    let with_tls = has_flag(&mut args, "--tls");
+    match ceremony::init(id, &dir, &addr, with_tls) {
+        Ok(bundle) => {
+            println!(
+                "party {id} initialized (secrets stay in {} — back it up and guard it)",
+                dir.display()
+            );
+            println!(
+                "  SECRET identity:  {} (ONLY this party may read it)",
+                ceremony::identity_file(&dir, id).display()
+            );
+            if with_tls {
+                println!("  SECRET TLS key:   {}", tls::key_file(&dir, id).display());
+            }
+            println!(
+                "  PUBLIC bundle:    {} — distribute it over an AUTHENTICATED channel",
+                ceremony::pub_file(&dir, id).display()
+            );
+            println!("  FINGERPRINT {}", ceremony::fingerprint(&bundle));
+            println!(
+                "  confirm this fingerprint with every other party out-of-band before assemble"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("init: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn assemble_mode(args: &[String]) -> ExitCode {
+    let mut args = args.to_vec();
+    let (Some(dir), Some(inputs)) = (
+        flag_value(&mut args, "--committee").map(PathBuf::from),
+        flag_value(&mut args, "--inputs"),
+    ) else {
+        eprintln!("assemble: --committee DIR and --inputs PUB,... are required");
+        return ExitCode::FAILURE;
+    };
+    let t: Option<usize> = flag_value(&mut args, "--t").and_then(|v| v.parse().ok());
+    let mut bundles: Vec<PubBundle> = Vec::new();
+    for path in inputs.split(',') {
+        match ceremony::read_pub(std::path::Path::new(path)) {
+            Ok(b) => bundles.push(b),
+            Err(e) => {
+                eprintln!("assemble: reading {path} failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    match ceremony::assemble(&bundles, t, &dir) {
+        Ok(info) => {
+            let with_tls = bundles.iter().any(|b| !b.cert_pem.is_empty());
+            println!(
+                "committee assembled: {}-of-{} (parties 1..={})",
+                info.params.t, info.params.n, info.params.n
+            );
+            println!(
+                "  public committee file: {}",
+                dir.join(seed::COMMITTEE_FILE).display()
+            );
+            if with_tls {
+                println!(
+                    "  pinned M3c cert set:   {} (pass as --pinned to every node)",
+                    dir.display()
+                );
+            }
+            println!("  VERIFY these fingerprints out-of-band against every party:");
+            for b in &bundles {
+                println!(
+                    "    party {} fingerprint {}",
+                    b.id,
+                    ceremony::fingerprint(b)
+                );
+            }
+            if bundles.iter().all(|b| !b.addr.is_empty()) {
+                println!(
+                    "  suggested --peers: {}",
+                    bundles
+                        .iter()
+                        .map(|b| format!("{}@{}", b.id, b.addr))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("assemble: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 // --- node mode: one party, one process ----------------------------------------
 
 fn node_mode(args: &[String]) -> ExitCode {
     let mut args = args.to_vec();
-    let (Some(seed_path), Some(committee_path), Some(bind)) = (
-        flag_value(&mut args, "--seed").map(PathBuf::from),
+    let (Some(committee_path), Some(bind)) = (
         flag_value(&mut args, "--committee").map(PathBuf::from),
         flag_value(&mut args, "--bind"),
     ) else {
-        eprintln!("node: --seed, --committee and --bind are required");
+        eprintln!("node: --committee and --bind are required");
         return ExitCode::FAILURE;
     };
+    // Exactly one secret source: `--seed` (the DEMO-ONLY one-process
+    // ceremony — carries a ceremony key share and presignatures for the
+    // `--seeded` fallback) or `--identity` (the H3 distributed ceremony —
+    // only this party's own transport key, generated on its own machine).
+    let seed_path = flag_value(&mut args, "--seed").map(PathBuf::from);
+    let identity_path = flag_value(&mut args, "--identity").map(PathBuf::from);
     let rendezvous = has_flag(&mut args, "--rendezvous");
     let seeded = has_flag(&mut args, "--seeded");
     let ki = has_flag(&mut args, "--ki");
+    // H4 (§10.4 + §10.3): `--restart` runs the arc on the ROBUST drivers
+    // with the expel-and-restart policy — a cheater causes blame +
+    // continued service, not an outage (default stays fail-fast: some
+    // deployments prefer loud aborts).
+    let restart = has_flag(&mut args, "--restart");
+    // H2 Phase 3: `--factory N` runs the concurrent-sessions demo — a
+    // background factory thread keeps N presignatures in an in-memory
+    // pool while the main thread signs.
+    let factory: Option<usize> = flag_value(&mut args, "--factory").and_then(|v| v.parse().ok());
     let peers_arg = flag_value(&mut args, "--peers");
     let delay_ms: u64 = flag_value(&mut args, "--delay-ms")
         .and_then(|v| v.parse().ok())
@@ -257,15 +430,43 @@ fn node_mode(args: &[String]) -> ExitCode {
         parsed
     });
 
-    // This process reads ONLY its own secret seed file plus the public
+    if factory.is_some() && (seeded || ki) {
+        eprintln!("node: --factory does not combine with --seeded or --ki");
+        return ExitCode::FAILURE;
+    }
+    if restart && (seeded || ki || factory.is_some()) {
+        eprintln!("node: --restart does not combine with --seeded, --ki, or --factory");
+        return ExitCode::FAILURE;
+    }
+
+    // This process reads ONLY its own secret material plus the public
     // committee file — key separation by construction.
-    let my_seed = match seed::read_seed(&seed_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("node: reading {} failed: {e}", seed_path.display());
+    let (me, transport_key, seed_presigs) = match (seed_path, identity_path) {
+        (Some(path), None) => match seed::read_seed(&path) {
+            Ok(s) => (s.id, s.transport_key, Some(s.presigs)),
+            Err(e) => {
+                eprintln!("node: reading {} failed: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, Some(path)) => match ceremony::read_identity(&path) {
+            Ok(i) => (i.id, i.transport_key, None),
+            Err(e) => {
+                eprintln!("node: reading {} failed: {e}", path.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => {
+            eprintln!("node: exactly one of --seed FILE or --identity FILE is required");
             return ExitCode::FAILURE;
         }
     };
+    if seeded && seed_presigs.is_none() {
+        eprintln!(
+            "node: --seeded needs a ceremony seed file (--seed); a distributed-ceremony identity has no ceremony presignatures"
+        );
+        return ExitCode::FAILURE;
+    }
     let info = match seed::read_committee(&committee_path) {
         Ok(c) => c,
         Err(e) => {
@@ -273,8 +474,18 @@ fn node_mode(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let me = my_seed.id;
     let registry: BTreeMap<PartyId, VerifyingKey> = info.registry.iter().cloned().collect();
+    // Fail closed on a tampered or mismatched committee file: this
+    // node's own transport secret key MUST match its registry entry
+    // (with the distributed ceremony this is the backstop for a swapped
+    // `.pub` bundle that survived the out-of-band check).
+    if registry.get(&me) != Some(SigningKey::from(&transport_key).verifying_key()) {
+        eprintln!(
+            "node {me}: own transport key does not match the committee registry entry \
+             (tampered or wrong committee file?)"
+        );
+        return ExitCode::FAILURE;
+    }
     // M3c: --tls CERT KEY --pinned DIR enables mTLS on the mesh (SPEC
     // §13.1). All-or-nothing: partial flags are a usage error, never a
     // silent plaintext fallback.
@@ -312,7 +523,7 @@ fn node_mode(args: &[String]) -> ExitCode {
     let node = match PartyNode::bind_with_tls(
         me,
         info.params,
-        &my_seed.transport_key,
+        &transport_key,
         registry,
         bind_addr,
         Duration::from_secs(timeout_secs),
@@ -382,21 +593,33 @@ fn node_mode(args: &[String]) -> ExitCode {
         .to_vec();
 
     // Phase 1: fresh keygen through the per-node driver (§6 + §6.1
-    // complaints/defenses over the wire).
+    // complaints/defenses over the wire). With `--restart` (H4 §10.3) a
+    // dealing-phase cheater is expelled and the session re-runs over the
+    // surviving committee with original ids (zero-slack refusal — e.g.
+    // 2-of-3 — propagates the abort; `t` is never lowered).
     let phase_start = Instant::now();
     let kg_sid = session_id(GENESIS, &anchor_x, None, b"keygen");
     let mut rng = OsRng;
-    let fresh = match node.keygen(&kg_sid, DKG_TAG, &mut rng, cheat) {
-        Ok(share) => {
+    let kg_out = if restart {
+        node.keygen_with_restart(&kg_sid, DKG_TAG, &mut rng, cheat)
+    } else {
+        node.keygen(&kg_sid, DKG_TAG, &mut rng, cheat)
+            .map(|share| (share, info.params.parties(), Vec::new()))
+    };
+    let (fresh, committee) = match kg_out {
+        Ok((share, committee, blamed)) => {
             let x = share.com.points[0].to_affine().to_encoded_point(true);
             println!("X {}", hex(x.as_bytes()));
+            if !blamed.is_empty() {
+                println!("BLAME keygen {}", ids_str(&blamed));
+            }
             eprintln!("[node {me}] keygen complete in {:?}", phase_start.elapsed());
-            Some(share)
+            (Some(share), committee)
         }
         Err(Error::Abort { abort }) => {
             println!("BLAME {} {}", abort.phase, ids_str(&abort.blamed));
             eprintln!("[node {me}] keygen aborted: {}", abort.detail);
-            None
+            (None, Vec::new())
         }
         Err(e) => {
             eprintln!("[node {me}] keygen failed: {e}");
@@ -420,6 +643,16 @@ fn node_mode(args: &[String]) -> ExitCode {
             .to_encoded_point(true)
             .as_bytes()
             .to_vec();
+
+        // H2 Phase 3 (concurrent sessions): `--factory N` — a background
+        // factory thread keeps N presignatures in an in-memory pool while
+        // the main thread signs FACTORY_MESSAGES against consumed
+        // records. Every session (factory presign, online sign) is
+        // demultiplexed by sid in the acceptor and progresses
+        // concurrently; the node is shut down cleanly at the end.
+        if let Some(target) = factory {
+            return run_factory_demo(Arc::new(node), me, share, x_bytes, target, cheat);
+        }
 
         // §8.7 KI mode: produce a KEY-FREE pool record (P1–P3 only — no
         // key involved), then bind it to the fresh key ONLINE with the
@@ -476,6 +709,60 @@ fn node_mode(args: &[String]) -> ExitCode {
             false
         };
 
+        // Phase 2+3 with `--restart` (H4 §10.4 + §10.3): the ROBUST
+        // presign composed with expel-and-restart — continuable faults
+        // (bad opening shares, bad nonce points) are filtered in-attempt
+        // with blame; dealing-phase aborts expel the blamed and re-run
+        // over the surviving committee with a poisoned sid and id. The
+        // survivors then sign over the final committee.
+        if restart {
+            let phase_start = Instant::now();
+            let ps_sid = session_id(GENESIS, &x_bytes, Some(presig_id), b"presign");
+            match node
+                .presign_with_restart_over(&ps_sid, presig_id, &share, &committee, &mut rng, cheat)
+            {
+                Ok((presig, used_id, ps_committee, blamed)) => {
+                    println!("PRESIG {} {}", presig.id, hex(&presig.r.to_bytes()));
+                    if !blamed.is_empty() {
+                        println!("BLAME presign {}", ids_str(&blamed));
+                    }
+                    eprintln!(
+                        "[node {me}] presign complete in {:?} (id {used_id}, committee {ps_committee:?})",
+                        phase_start.elapsed()
+                    );
+                    if stored {
+                        // M3b: persist the produced record (id poisoning
+                        // already guarantees freshness, §10.3(2)).
+                        if let Err(e) = node.store_offer(&presig) {
+                            eprintln!("node {me}: persisting the presignature failed: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                    let sign_sid = session_id(GENESIS, &x_bytes, Some(used_id), b"sign");
+                    return finish_sign(
+                        &node,
+                        me,
+                        &sign_sid,
+                        &presig,
+                        &ps_committee,
+                        stored,
+                        &message,
+                        cheat,
+                        Instant::now(),
+                    );
+                }
+                Err(Error::Abort { abort }) => {
+                    println!("BLAME {} {}", abort.phase, ids_str(&abort.blamed));
+                    eprintln!("[node {me}] presign aborted: {}", abort.detail);
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("[node {me}] presign failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+
         // Phase 2: per-node presign — two triple sessions (§7.2) plus the
         // §8 P1–P4 rounds, all over the wire.
         let phase_start = Instant::now();
@@ -508,6 +795,7 @@ fn node_mode(args: &[String]) -> ExitCode {
             me,
             &sign_sid,
             &presig,
+            &info.params.parties(),
             stored,
             &message,
             cheat,
@@ -518,8 +806,11 @@ fn node_mode(args: &[String]) -> ExitCode {
     // Seeded fallback (M2): sign with a ceremony-seeded presignature —
     // one broadcast round. With `--data-dir` the records are offered to
     // the durable store first (already-persisted ids are a no-op), so the
-    // single-use guarantee holds across restarts here too (§8.6).
-    let Some(presig) = my_seed.presigs.iter().find(|p| p.id == presig_id) else {
+    // single-use guarantee holds across restarts here too (§8.6). Only
+    // reachable with `--seed` (`--identity` + `--seeded` is rejected at
+    // startup above).
+    let seed_presigs = seed_presigs.expect("--seeded requires --seed");
+    let Some(presig) = seed_presigs.iter().find(|p| p.id == presig_id) else {
         eprintln!("node {me}: no presignature id {presig_id} in the seed");
         return ExitCode::FAILURE;
     };
@@ -529,7 +820,7 @@ fn node_mode(args: &[String]) -> ExitCode {
             eprintln!("node {me}: opening the presignature store failed: {e}");
             return ExitCode::FAILURE;
         }
-        for p in &my_seed.presigs {
+        for p in &seed_presigs {
             if let Err(e) = node.store_offer(p) {
                 eprintln!("node {me}: persisting the seeded presignatures failed: {e}");
                 return ExitCode::FAILURE;
@@ -543,6 +834,7 @@ fn node_mode(args: &[String]) -> ExitCode {
         me,
         &sign_sid,
         presig,
+        &info.params.parties(),
         stored,
         &message,
         cheat,
@@ -550,25 +842,28 @@ fn node_mode(args: &[String]) -> ExitCode {
     )
 }
 
-/// The sign phase's outcome handling (shared by the full-arc and seeded
-/// paths): print the signature / blame lines and the process exit code.
-/// With `stored`, the presignature is CONSUMED from the node's durable
-/// store (M3b, §8.6) instead of using the in-memory record.
+/// The sign phase's outcome handling (shared by the full-arc, restart,
+/// and seeded paths): print the signature / blame lines and the process
+/// exit code. With `stored`, the presignature is CONSUMED from the
+/// node's durable store (M3b, §8.6) instead of using the in-memory
+/// record. `ids` is the signing committee (H4: the post-restart
+/// survivors with original ids; the full committee otherwise).
 #[allow(clippy::too_many_arguments)] // the sign phase's full context
 fn finish_sign(
     node: &PartyNode,
     me: PartyId,
     sign_sid: &[u8],
     presig: &ohm_ecdsa::presign::Presignature,
+    ids: &[PartyId],
     stored: bool,
     message: &[u8],
     cheat: Option<Cheat>,
     started: Instant,
 ) -> ExitCode {
     let out = if stored {
-        node.sign_stored(sign_sid, presig.id, message, cheat)
+        node.sign_stored_over(sign_sid, presig.id, message, ids, cheat)
     } else {
-        node.sign(sign_sid, presig, message, cheat)
+        node.sign_over(sign_sid, presig, message, ids, cheat)
             .map_err(PersistError::from)
     };
     match out {
@@ -636,6 +931,151 @@ fn ids_str(ids: &[PartyId]) -> String {
         .map(|i| i.to_string())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// H2 Phase 3 proving ground (`node --factory N`, concurrent sessions):
+/// a BACKGROUND factory thread keeps `target` presignatures in an
+/// in-memory pool (per-node §7.2/§8 over the wire) while the main thread
+/// signs [`FACTORY_MESSAGES`] against the oldest records. All three node
+/// processes run the same deterministic session sequence (presign ids
+/// `1..` in pool order; sign id = the consumed record's id), so their
+/// sids line up without any extra coordination; a sign session starting
+/// while another node's factory session is mid-flight is exactly the
+/// overlap this demonstrates. Prints one `SIG` line per message and a
+/// final `FACTORY` line; the node is shut down cleanly before exit.
+fn run_factory_demo(
+    node: Arc<PartyNode>,
+    me: PartyId,
+    share: KeyShare,
+    x_bytes: Vec<u8>,
+    target: usize,
+    cheat: Option<Cheat>,
+) -> ExitCode {
+    let pool: Arc<Mutex<VecDeque<Presignature>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let produced = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let failed = Arc::new(AtomicBool::new(false));
+
+    // The factory thread: refill the pool up to `target`, one presign
+    // session per record (ids `1..`, fresh id on the ~2⁻¹²⁸ ZeroValue).
+    let factory = {
+        let node = Arc::clone(&node);
+        let pool = Arc::clone(&pool);
+        let produced = Arc::clone(&produced);
+        let stop = Arc::clone(&stop);
+        let failed = Arc::clone(&failed);
+        let x_bytes = x_bytes.clone();
+        std::thread::spawn(move || {
+            let mut rng = OsRng;
+            let mut next_id = 1u64;
+            while !stop.load(Ordering::SeqCst) {
+                if pool.lock().expect("pool mutex").len() >= target {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                let id = next_id;
+                next_id += 1;
+                let sid = session_id(GENESIS, &x_bytes, Some(id), b"presign");
+                match node.presign(&sid, id, &share, &mut rng, cheat) {
+                    Ok(p) => {
+                        pool.lock().expect("pool mutex").push_back(p);
+                        produced.fetch_add(1, Ordering::SeqCst);
+                        eprintln!("[node {me}] factory: presignature {id} produced");
+                    }
+                    Err(Error::ZeroValue(_)) => continue, // retry with the next id
+                    Err(Error::Abort { abort }) => {
+                        println!("BLAME {} {}", abort.phase, ids_str(&abort.blamed));
+                        eprintln!("[node {me}] factory presign aborted: {}", abort.detail);
+                        failed.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[node {me}] factory presign failed: {e}");
+                        failed.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            }
+        })
+    };
+
+    // The sign loop: consume the pool's OLDEST record per message (the
+    // same order at every node) and sign while the factory keeps
+    // producing — concurrent sessions over the same mesh.
+    let mut ok = true;
+    for msg in FACTORY_MESSAGES {
+        let presig = loop {
+            if failed.load(Ordering::SeqCst) {
+                ok = false;
+                break None;
+            }
+            if let Some(p) = pool.lock().expect("pool mutex").pop_front() {
+                break Some(p);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let Some(presig) = presig else { break };
+        let started = Instant::now();
+        let sign_sid = session_id(GENESIS, &x_bytes, Some(presig.id), b"sign");
+        match node.sign(&sign_sid, &presig, msg, cheat) {
+            Ok((sig, blamed)) => {
+                let (r, s) = sig.split_bytes();
+                println!("SIG {} {}", hex(&r), hex(&s));
+                if !blamed.is_empty() {
+                    println!("BLAME sign {}", ids_str(&blamed));
+                }
+                eprintln!(
+                    "[node {me}] signature for presignature {} delivered in {:?}",
+                    presig.id,
+                    started.elapsed()
+                );
+            }
+            Err(Error::Abort { abort }) => {
+                println!("BLAME {} {}", abort.phase, ids_str(&abort.blamed));
+                eprintln!("[node {me}] signing aborted: {}", abort.detail);
+                ok = false;
+                break;
+            }
+            Err(e) => {
+                eprintln!("[node {me}] signing failed: {e}");
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    // The factory must have refilled everything the signs consumed
+    // (deterministic under honest completion) — factory progress WHILE
+    // signing is the property under test.
+    if ok {
+        let want = target as u64 + FACTORY_MESSAGES.len() as u64;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while produced.load(Ordering::SeqCst) < want && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if produced.load(Ordering::SeqCst) < want {
+            eprintln!(
+                "[node {me}] factory made too little progress: {} < {want}",
+                produced.load(Ordering::SeqCst)
+            );
+            ok = false;
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let _ = factory.join();
+    println!(
+        "FACTORY target={target} produced={} signed={}",
+        produced.load(Ordering::SeqCst),
+        FACTORY_MESSAGES.len()
+    );
+    // H2 clean shutdown: stop the mesh and join every thread (Drop
+    // would do it too — this demonstrates the programmatic API).
+    node.shutdown();
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 // --- auditor: offline blame-token verification (SPEC §10.2, §A.4) -------------
@@ -706,8 +1146,29 @@ fn spawn_demo(args: &[String]) -> ExitCode {
     let persist = has_flag(&mut args, "--persist");
     let with_tls = has_flag(&mut args, "--tls");
     let ki = has_flag(&mut args, "--ki");
+    // H4: `--restart` runs the children on the §10.4 robust drivers with
+    // the §10.3 expel-and-restart policy.
+    let restart = has_flag(&mut args, "--restart");
+    // H2 Phase 3: `--factory N` — the concurrent-sessions demo (see
+    // `run_factory_demo`).
+    let factory: Option<usize> = flag_value(&mut args, "--factory").and_then(|v| v.parse().ok());
+    if factory.is_some() && (seeded || ki || persist || with_tls || cheat.is_some()) {
+        eprintln!(
+            "spawn-demo: --factory does not combine with --seeded/--ki/--persist/--tls/--cheat"
+        );
+        return ExitCode::FAILURE;
+    }
+    if restart && (seeded || ki || factory.is_some()) {
+        eprintln!("spawn-demo: --restart does not combine with --seeded/--ki/--factory");
+        return ExitCode::FAILURE;
+    }
 
-    if seeded {
+    if let Some(target) = factory {
+        println!(
+            "== ohm-ecdsa-node H2 demo: 2-of-3 keygen, then a background presig factory (target {target}) + {} concurrent signatures across 3 OS processes ==",
+            FACTORY_MESSAGES.len()
+        );
+    } else if seeded {
         println!("== ohm-ecdsa-node M2/M3a demo (SEEDED fallback): 2-of-3 keygen + sign across 3 OS processes ==");
     } else if with_tls {
         println!(
@@ -716,6 +1177,10 @@ fn spawn_demo(args: &[String]) -> ExitCode {
     } else if ki {
         println!(
             "== ohm-ecdsa-node §8.7 KI demo: 2-of-3 keygen → KEY-FREE pool record → 2-round KI sign across 3 OS processes =="
+        );
+    } else if restart {
+        println!(
+            "== ohm-ecdsa-node H4 demo: 2-of-3 keygen → presign → sign across 3 OS processes (§10.4 robust + §10.3 restart) =="
         );
     } else {
         println!(
@@ -729,7 +1194,10 @@ fn spawn_demo(args: &[String]) -> ExitCode {
         eprintln!("spawn-demo: writing seed files failed: {e}");
         return ExitCode::FAILURE;
     }
-    println!("  ceremony seeds written to {}", dir.display());
+    println!(
+        "  ceremony seeds written to {} (DEMO-ONLY: this process momentarily holds ALL keys — for a real committee use init + assemble)",
+        dir.display()
+    );
     if with_tls {
         // M3c: per-party self-signed certs; every child pins the whole
         // committee set (--pinned DIR) and presents its own cert+key.
@@ -745,6 +1213,11 @@ fn spawn_demo(args: &[String]) -> ExitCode {
     if ki {
         println!(
             "  KI mode (§8.7): the presignature is a KEY-FREE pool record; the key binds ONLINE in 2 rounds"
+        );
+    }
+    if restart {
+        println!(
+            "  H4 mode: §10.4 robust continuation (blame + service continues) + §10.3 expel-and-restart on dealing-phase aborts"
         );
     }
     if let (Some(k), Some(c)) = (cheat_node, cheat) {
@@ -781,8 +1254,14 @@ fn spawn_demo(args: &[String]) -> ExitCode {
         if seeded {
             cmd.arg("--seeded");
         }
+        if let Some(target) = factory {
+            cmd.arg("--factory").arg(target.to_string());
+        }
         if ki {
             cmd.arg("--ki");
+        }
+        if restart {
+            cmd.arg("--restart");
         }
         if persist {
             cmd.arg("--data-dir").arg(dir.join(format!("node-{i}")));
@@ -885,7 +1364,7 @@ fn spawn_demo(args: &[String]) -> ExitCode {
         node_lines.push(f.join().unwrap_or_default());
     }
 
-    if summarize(&info, seeded, &node_lines) && ok {
+    if summarize(&info, seeded, factory, &node_lines) && ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -906,7 +1385,14 @@ fn cheat_arg(c: Cheat) -> String {
 
 /// Cross-check the per-process outputs and print the RESULT lines the
 /// process-level tests assert on. Returns the demo's success verdict.
-fn summarize(info: &CommitteeInfo, seeded: bool, node_lines: &[Vec<String>]) -> bool {
+/// `factory` is the H2 `--factory N` target (concurrent-sessions demo):
+/// the presign/sign checks are replaced by the factory checks.
+fn summarize(
+    info: &CommitteeInfo,
+    seeded: bool,
+    factory: Option<usize>,
+    node_lines: &[Vec<String>],
+) -> bool {
     let mut ok = true;
     // Keygen: either every process prints the same X, or every process
     // names the same blamed party.
@@ -944,9 +1430,10 @@ fn summarize(info: &CommitteeInfo, seeded: bool, node_lines: &[Vec<String>]) -> 
 
     // Presign (full-arc mode only): either every process prints the same
     // PRESIG line, or every process names the same blamed party in the
-    // offline factory (BLAME triples | BLAME presign).
-    let mut presign_ok = seeded;
-    if keygen_ok && !seeded {
+    // offline factory (BLAME triples | BLAME presign). Factory mode
+    // produces MANY presignatures — its check is the FACTORY line below.
+    let mut presign_ok = seeded || factory.is_some();
+    if keygen_ok && !seeded && factory.is_none() {
         let presigs: Vec<&str> = node_lines
             .iter()
             .filter_map(|lines| lines.iter().find(|l| l.starts_with("PRESIG ")))
@@ -980,7 +1467,7 @@ fn summarize(info: &CommitteeInfo, seeded: bool, node_lines: &[Vec<String>]) -> 
                 ok = false;
             }
         }
-    } else if !seeded {
+    } else if !seeded && factory.is_none() {
         println!("RESULT presign: skipped (keygen aborted)");
     }
 
@@ -988,33 +1475,106 @@ fn summarize(info: &CommitteeInfo, seeded: bool, node_lines: &[Vec<String>]) -> 
     // that signed — the FRESH keygen key in full-arc mode (parsed from
     // the X lines), the ceremony key in --seeded mode. Blame lines are
     // summarized per process.
-    let sigs: Vec<&str> = node_lines
-        .iter()
-        .filter_map(|lines| lines.iter().find(|l| l.starts_with("SIG ")))
-        .map(|l| l.as_str())
-        .collect();
-    if sigs.len() == 3 && sigs.iter().all(|s| *s == sigs[0]) {
-        let sig = hex_decode(&sigs[0].replace("SIG ", "").replace(' ', ""))
-            .and_then(|b| Signature::from_slice(&b).ok());
-        let vk = if seeded {
-            VerifyingKey::from_affine(info.x.to_affine()).ok()
+    if let Some(target) = factory {
+        // H2 factory mode: every process prints one FACTORY line with
+        // `produced >= target + signed` (the factory refilled everything
+        // the signs consumed) and one SIG line per FACTORY_MESSAGES
+        // entry — all processes agreeing, each signature verifying
+        // against its message under the fresh X.
+        let want = target + FACTORY_MESSAGES.len();
+        let facts: Vec<&str> = node_lines
+            .iter()
+            .filter_map(|lines| lines.iter().find(|l| l.starts_with("FACTORY ")))
+            .map(|l| l.as_str())
+            .collect();
+        let facts_ok = facts.len() == 3
+            && facts.iter().all(|f| {
+                f.strip_prefix("FACTORY ")
+                    .and_then(|rest| {
+                        let (mut produced, mut signed) = (None, None);
+                        for kv in rest.split_whitespace() {
+                            let (k, v) = kv.split_once('=')?;
+                            match k {
+                                "produced" => produced = v.parse::<usize>().ok(),
+                                "signed" => signed = v.parse::<usize>().ok(),
+                                _ => {}
+                            }
+                        }
+                        Some((produced?, signed?))
+                    })
+                    .is_some_and(|(p, s)| p >= want && s == FACTORY_MESSAGES.len())
+            });
+        if facts_ok {
+            println!(
+                "RESULT factory: all 3 processes kept the pool at {target} while signing (produced >= {want})"
+            );
         } else {
+            println!("RESULT factory: MISSING or INSUFFICIENT progress (lines={facts:?})");
+            ok = false;
+        }
+        let vk = if keygen_ok {
             xs[0]
                 .strip_prefix("X ")
                 .and_then(hex_decode)
                 .and_then(|b| VerifyingKey::from_sec1_bytes(&b).ok())
+        } else {
+            None
         };
-        let verified = match (vk, sig) {
-            (Some(vk), Some(sig)) => vk.verify(DEMO_MESSAGE, &sig).is_ok(),
-            _ => false,
-        };
-        println!("RESULT sign: all 3 processes agree; signature verifies under X: {verified}");
-        ok &= verified;
-    } else if !keygen_ok || !presign_ok {
-        println!("RESULT sign: skipped (earlier phase aborted)");
+        for (idx, msg) in FACTORY_MESSAGES.iter().enumerate() {
+            let sigs: Vec<&str> = node_lines
+                .iter()
+                .filter_map(|lines| lines.iter().filter(|l| l.starts_with("SIG ")).nth(idx))
+                .map(|l| l.as_str())
+                .collect();
+            let sig = if sigs.len() == 3 && sigs.iter().all(|s| *s == sigs[0]) {
+                hex_decode(&sigs[0].replace("SIG ", "").replace(' ', ""))
+                    .and_then(|b| Signature::from_slice(&b).ok())
+            } else {
+                None
+            };
+            let verified = match (vk, sig) {
+                (Some(vk), Some(sig)) => vk.verify(msg, &sig).is_ok(),
+                _ => false,
+            };
+            println!(
+                "RESULT sign {}: all 3 processes agree; signature verifies under X: {verified}",
+                idx + 1
+            );
+            ok &= verified;
+        }
+        if !keygen_ok {
+            println!("RESULT sign: factory mode requires a completed keygen");
+            ok = false;
+        }
     } else {
-        println!("RESULT sign: MISSING or DISAGREEING signatures (sigs={sigs:?})");
-        ok = false;
+        let sigs: Vec<&str> = node_lines
+            .iter()
+            .filter_map(|lines| lines.iter().find(|l| l.starts_with("SIG ")))
+            .map(|l| l.as_str())
+            .collect();
+        if sigs.len() == 3 && sigs.iter().all(|s| *s == sigs[0]) {
+            let sig = hex_decode(&sigs[0].replace("SIG ", "").replace(' ', ""))
+                .and_then(|b| Signature::from_slice(&b).ok());
+            let vk = if seeded {
+                VerifyingKey::from_affine(info.x.to_affine()).ok()
+            } else {
+                xs[0]
+                    .strip_prefix("X ")
+                    .and_then(hex_decode)
+                    .and_then(|b| VerifyingKey::from_sec1_bytes(&b).ok())
+            };
+            let verified = match (vk, sig) {
+                (Some(vk), Some(sig)) => vk.verify(DEMO_MESSAGE, &sig).is_ok(),
+                _ => false,
+            };
+            println!("RESULT sign: all 3 processes agree; signature verifies under X: {verified}");
+            ok &= verified;
+        } else if !keygen_ok || !presign_ok {
+            println!("RESULT sign: skipped (earlier phase aborted)");
+        } else {
+            println!("RESULT sign: MISSING or DISAGREEING signatures (sigs={sigs:?})");
+            ok = false;
+        }
     }
     for (i, lines) in node_lines.iter().enumerate() {
         for line in lines.iter().filter(|l| l.starts_with("BLAME")) {

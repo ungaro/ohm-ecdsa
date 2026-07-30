@@ -29,12 +29,21 @@
 //! Failure policy: a handshake failure (unpinned certificate,
 //! plaintext peer, corrupt stream) rejects the connection with a loud
 //! log. There is NO fallback to plaintext once TLS is configured.
+//!
+//! H2: both handshakes run under [`HANDSHAKE_TIMEOUT`]. The strategy is
+//! socket timeouts — the simplest approach compatible with blocking
+//! rustls: the `TcpStream` gets short read/write timeouts, and the
+//! `complete_io` loop treats `WouldBlock`/`TimedOut` as a tick
+//! (retrying until the deadline) — a peer that connects and never
+//! completes the handshake is rejected within the timeout instead of
+//! parking the accept thread forever.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::ring::default_provider;
@@ -53,6 +62,16 @@ use ohm_ecdsa::PartyId;
 /// verifiers authenticate by exact certificate equality and ignore the
 /// server name, but rustls requires one — a fixed committee-wide name.
 pub const TLS_SERVER_NAME: &str = "ohm-ecdsa.node";
+
+/// H2: deadline for the blocking mTLS handshake (both directions). A
+/// peer that never completes the handshake is rejected within this
+/// budget instead of parking a thread; localhost handshakes complete in
+/// milliseconds, so 10 s is generous.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The socket poll interval inside the handshake loop (see the module
+/// docs): how often a stalled handshake re-checks its deadline.
+const HANDSHAKE_POLL: Duration = Duration::from_millis(250);
 
 /// `party-<id>.crt.pem` — one party's public certificate.
 pub fn cert_file(dir: &Path, id: PartyId) -> PathBuf {
@@ -79,12 +98,13 @@ pub fn generate_party(id: PartyId) -> io::Result<(String, String)> {
 
 /// Generate and write `party-<id>.crt.pem` / `party-<id>.key.pem` for
 /// every id (the `setup`/`spawn-demo` ceremony step; real deployments
-/// substitute their own PKI, SPEC §13.1).
+/// substitute their own PKI, SPEC §13.1). The key PEMs are secret —
+/// written `0600` (H5).
 pub fn write_committee_certs(dir: &Path, ids: &[PartyId]) -> io::Result<()> {
     for &id in ids {
         let (cert_pem, key_pem) = generate_party(id)?;
         std::fs::write(cert_file(dir, id), cert_pem)?;
-        std::fs::write(key_file(dir, id), key_pem)?;
+        crate::seal::write_secret_file(&key_file(dir, id), key_pem.as_bytes())?;
     }
     Ok(())
 }
@@ -232,6 +252,7 @@ impl CommitteeTls {
 
     /// Run the blocking client handshake on `tcp` toward `peer`
     /// (fails closed: any handshake error rejects the connection).
+    /// H2: bounded by [`HANDSHAKE_TIMEOUT`] (see the module docs).
     pub(crate) fn client_handshake(
         &self,
         peer: PartyId,
@@ -241,8 +262,25 @@ impl CommitteeTls {
         let name = ServerName::try_from(TLS_SERVER_NAME).expect("a valid DNS name constant");
         let mut conn = ClientConnection::new(cfg, name).map_err(tls_err)?;
         let mut sock = tcp;
+        sock.set_read_timeout(Some(HANDSHAKE_POLL))?;
+        sock.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
         while conn.is_handshaking() {
-            conn.complete_io(&mut sock)?;
+            match conn.complete_io(&mut sock) {
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    if Instant::now() > deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "tls: client handshake timed out",
+                        ));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(StreamOwned::new(conn, sock))
     }
@@ -251,7 +289,7 @@ impl CommitteeTls {
     /// connection, returning the stream and the party the peer
     /// authenticated AS (the pinned-set entry matching its exact
     /// certificate — the client verifier already rejected anything
-    /// else).
+    /// else). H2: bounded by [`HANDSHAKE_TIMEOUT`] (see the module docs).
     pub(crate) fn server_handshake(
         &self,
         tcp: TcpStream,
@@ -259,8 +297,25 @@ impl CommitteeTls {
         let cfg = self.server_config()?;
         let mut conn = ServerConnection::new(cfg).map_err(tls_err)?;
         let mut sock = tcp;
+        sock.set_read_timeout(Some(HANDSHAKE_POLL))?;
+        sock.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
         while conn.is_handshaking() {
-            conn.complete_io(&mut sock)?;
+            match conn.complete_io(&mut sock) {
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    if Instant::now() > deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "tls: server handshake timed out",
+                        ));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
         let peer = conn
             .peer_certificates()
