@@ -43,15 +43,42 @@
 //!     fsync'd FIRST (the id is durably burned before the record leaves
 //!     the filesystem — the same discipline as the consume tombstone),
 //!     then the sealed file is removed; the id can never be re-issued.
+//!   - A4 ROLLBACK DETECTION (§13.3): every mutation (insert, consume,
+//!     expire) is also appended to `journal.log` — one canonical-encoded
+//!     entry `(seq, op, id, prev_hash, payload_hash, entry_hash)` per
+//!     mutation, fsync'd per append, hash-chained (`entry_hash =
+//!     H(tag ‖ seq ‖ op ‖ id ‖ prev_hash ‖ payload_hash)`). `open`
+//!     replays the journal and verifies it against the directory (chain
+//!     links, op transitions, every journaled artifact present with
+//!     matching bytes; crash windows — artifact fsync'd, journal append
+//!     not — heal in the safe direction), then cross-checks the
+//!     transcript archive (`<store>/../archive/transcript.log`): a
+//!     presignature id evidenced as SPENT by an accepted Sign-phase
+//!     envelope must not be LIVE. Any break fails closed with
+//!     [`PersistError::Integrity`] naming the divergence point — a store
+//!     backup restored over an intact archive is REFUSED as a detected
+//!     rollback. `--allow-unverified-store` (dev only) downgrades every
+//!     refusal to a loud warning. The limitation is honest: the journal
+//!     and the transcript live in the SAME rollback-able directory, so a
+//!     WHOLE-DIRECTORY restore to an older self-consistent state remains
+//!     undetectable (a startup warning says so); true prevention needs
+//!     state outside the directory (HSM monotonic counter, peer
+//!     attestation — SPEC §13.3; ship `transcript.log` off-box for real
+//!     independence). A pre-A4 store (records, no journal) is adopted
+//!     into a fresh journal with a loud warning.
 //!
 //!   Limits, honestly: this survives process kill and — on a
 //!   cooperating filesystem/OS — machine crash at exactly the fsync
-//!   points above. At-rest confidentiality reduces to the storage key
+//!   points above, and it DETECTS (and refuses) the common rollback
+//!   shape via the journal + transcript cross-check — it does not
+//!   PREVENT rollback: a whole-directory restore is undetectable without
+//!   state outside the directory (SPEC §13.3). At-rest confidentiality
+//!   reduces to the storage key
 //!   (wire it to a KMS/HSM in real deployments — [`crate::seal`] is the
 //!   interface, not a KMS); it is not HSM-backed share storage, it does
 //!   no wear leveling, and it does not defend against a malicious host
-//!   rolling back the directory. Localhost demo and test scaffolding
-//!   only.
+//!   with write access beyond what the checks above catch. Localhost
+//!   demo and test scaffolding only.
 //! * [`Archive`] — the §4.7/§10.2 accepted-message-set transcript: every
 //!   signed envelope a driver ACCEPTS is appended (once) to
 //!   `transcript.log` as `u32 BE length ‖ canonical SignedEnvelope
@@ -74,8 +101,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use k256::ecdsa::VerifyingKey;
+use k256::sha2::{Digest, Sha256};
 use k256::{AffinePoint, ProjectivePoint, Scalar};
-use ohm_ecdsa::presign::Presignature;
+use ohm_ecdsa::presign::{KeyShare, Presignature};
 use ohm_ecdsa::transport::{BlameToken, Decode, Encode, SignedEnvelope};
 use ohm_ecdsa::vss::FeldmanCommitment;
 use ohm_ecdsa::{Error, IdentifiableAbort, PartyId, Phase};
@@ -98,6 +126,10 @@ pub enum PersistError {
     Protocol(Error),
     /// H5 at-rest integrity failure ([`SealError`] — fail closed).
     Seal(SealError),
+    /// A4 store-integrity failure (journal chain, journal-vs-directory
+    /// divergence, or the transcript cross-check — ROLLBACK DETECTED):
+    /// ALWAYS fails closed, the message names the divergence point.
+    Integrity(String),
 }
 
 impl core::fmt::Display for PersistError {
@@ -106,6 +138,7 @@ impl core::fmt::Display for PersistError {
             Self::Io(e) => write!(f, "persistence I/O: {e}"),
             Self::Protocol(e) => write!(f, "{e}"),
             Self::Seal(e) => write!(f, "at-rest integrity: {e}"),
+            Self::Integrity(m) => write!(f, "store integrity: {m}"),
         }
     }
 }
@@ -342,6 +375,334 @@ fn write_atomic(
     sync_dir(dir)
 }
 
+// --- A4: the chained store journal (rollback detection, SPEC §8.6/§13.3) -----
+
+/// The journal file name within the store directory.
+const JOURNAL_FILE: &str = "journal.log";
+
+/// Domain-separation tag for the journal entry hash chain.
+const JOURNAL_TAG: &[u8] = b"OHM-ECDSA-node/v0.1/store-journal";
+
+/// Domain-separation tag for per-entry payload digests (the hash of the
+/// on-disk artifact the journal entry accounts for).
+const PAYLOAD_TAG: &[u8] = b"OHM-ECDSA-node/v0.1/store-payload";
+
+/// Journal op codes.
+const OP_INSERT: u8 = 1;
+const OP_CONSUME: u8 = 2;
+const OP_EXPIRE: u8 = 3;
+/// Burn a NEVER-INSERTED id (a failed production session — A7): the
+/// same on-disk end state as [`OP_EXPIRE`] (an empty `<id>.expired`
+/// tombstone), but valid only for an id with no prior journal entry.
+const OP_BURN: u8 = 4;
+
+const ZERO_HASH: [u8; 32] = [0u8; 32];
+
+/// The digest of the on-disk artifact a journal entry accounts for
+/// (the sealed record/tombstone bytes; the empty tombstone for an
+/// expire).
+fn payload_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(PAYLOAD_TAG);
+    h.update(bytes);
+    h.finalize().into()
+}
+
+/// `entry_hash = H(JOURNAL_TAG ‖ seq ‖ op ‖ id ‖ prev_hash ‖
+/// payload_hash)` — one link of the journal hash chain.
+fn entry_digest(seq: u64, op: u8, id: u64, prev: &[u8; 32], payload: &[u8; 32]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(JOURNAL_TAG);
+    h.update(seq.to_be_bytes());
+    h.update([op]);
+    h.update(id.to_be_bytes());
+    h.update(prev);
+    h.update(payload);
+    h.finalize().into()
+}
+
+/// One journal entry: every store mutation (insert / consume / expire)
+/// is logged as `(seq, op, id, prev_hash, payload_hash, entry_hash)`,
+/// canonical-encoded and framed as `u32 BE length ‖ entry bytes` (the
+/// transcript's framing), fsync'd per append. `entry_hash` chains each
+/// entry to its predecessor, so rewriting or reordering HISTORY breaks
+/// the chain at replay.
+#[derive(Clone, Copy, Debug)]
+struct JournalEntry {
+    seq: u64,
+    op: u8,
+    id: u64,
+    prev: [u8; 32],
+    payload: [u8; 32],
+    hash: [u8; 32],
+}
+
+impl JournalEntry {
+    fn new(seq: u64, op: u8, id: u64, prev: [u8; 32], payload: [u8; 32]) -> Self {
+        let hash = entry_digest(seq, op, id, &prev, &payload);
+        Self {
+            seq,
+            op,
+            id,
+            prev,
+            payload,
+            hash,
+        }
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + 1 + 8 + 32 * 3);
+        put_u64(&mut out, self.seq);
+        out.push(self.op);
+        put_u64(&mut out, self.id);
+        out.extend_from_slice(&self.prev);
+        out.extend_from_slice(&self.payload);
+        out.extend_from_slice(&self.hash);
+        out
+    }
+
+    fn decode(b: &[u8]) -> Option<Self> {
+        let (seq, mut used) = take_u64(b)?;
+        let op = *b.get(used)?;
+        used += 1;
+        let (id, u) = take_u64(b.get(used..)?)?;
+        used += u;
+        let prev: [u8; 32] = b.get(used..used + 32)?.try_into().ok()?;
+        used += 32;
+        let payload: [u8; 32] = b.get(used..used + 32)?.try_into().ok()?;
+        used += 32;
+        let hash: [u8; 32] = b.get(used..used + 32)?.try_into().ok()?;
+        used += 32;
+        (used == b.len()).then_some(Self {
+            seq,
+            op,
+            id,
+            prev,
+            payload,
+            hash,
+        })
+    }
+}
+
+/// Replay the journal bytes: strict framing (`u32 BE length ‖ entry`),
+/// sequential seqs from 1, `prev_hash` links, recomputed entry hashes,
+/// and op-transition validity (an id is inserted once; consume/expire
+/// need a live insert). Returns the verified entries; any break is an
+/// error naming the divergence point.
+fn journal_replay(bytes: &[u8]) -> Result<Vec<JournalEntry>, String> {
+    let mut entries = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let n = entries.len() as u64 + 1;
+        let hdr: [u8; 4] = rest
+            .get(..4)
+            .ok_or_else(|| format!("journal truncated before entry {n}"))?
+            .try_into()
+            .expect("4 bytes");
+        let len = u32::from_be_bytes(hdr) as usize;
+        let body = rest
+            .get(4..4 + len)
+            .ok_or_else(|| format!("journal truncated inside entry {n}"))?;
+        let e = JournalEntry::decode(body)
+            .ok_or_else(|| format!("journal entry {n} is not canonical"))?;
+        if e.seq != n {
+            return Err(format!(
+                "journal entry seq {} out of order (expected {n})",
+                e.seq
+            ));
+        }
+        let prev = entries
+            .last()
+            .map(|l: &JournalEntry| l.hash)
+            .unwrap_or(ZERO_HASH);
+        if e.prev != prev {
+            return Err(format!(
+                "journal entry {n} breaks the hash chain (prev_hash)"
+            ));
+        }
+        if e.hash != entry_digest(e.seq, e.op, e.id, &e.prev, &e.payload) {
+            return Err(format!("journal entry {n} has a wrong entry_hash"));
+        }
+        let known = entries.iter().any(|l: &JournalEntry| l.id == e.id);
+        let live = entries.iter().rev().find(|l| l.id == e.id).map(|l| l.op) == Some(OP_INSERT);
+        match e.op {
+            OP_INSERT if !known => {}
+            OP_CONSUME | OP_EXPIRE if live => {}
+            OP_BURN if !known => {}
+            OP_INSERT => return Err(format!("journal entry {n} re-inserts id {}", e.id)),
+            OP_CONSUME | OP_EXPIRE => {
+                return Err(format!("journal entry {n} mutates non-live id {}", e.id))
+            }
+            OP_BURN => return Err(format!("journal entry {n} re-burns id {}", e.id)),
+            op => return Err(format!("journal entry {n} has unknown op {op}")),
+        }
+        entries.push(e);
+        rest = &rest[4 + len..];
+    }
+    Ok(entries)
+}
+
+/// The journal writer: appends canonical-framed entries, fsync'd per
+/// entry (a crash loses at most the in-flight entry — resolved in the
+/// safe direction at `open`, see the reconciliation rules).
+struct Journal {
+    file: File,
+    next_seq: u64,
+    tip: [u8; 32],
+}
+
+impl Journal {
+    fn append(&mut self, op: u8, id: u64, payload: [u8; 32]) -> io::Result<()> {
+        let e = JournalEntry::new(self.next_seq, op, id, self.tip, payload);
+        let body = e.encode();
+        let len = u32::try_from(body.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "journal entry too large"))?;
+        self.file.write_all(&len.to_be_bytes())?;
+        self.file.write_all(&body)?;
+        self.file.sync_all()?;
+        self.next_seq += 1;
+        self.tip = e.hash;
+        Ok(())
+    }
+}
+
+/// The on-disk final state of one id, as the directory scan sees it
+/// (tombstones win over a live record — the safe direction).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiskState {
+    /// `<id>.presig` present (payload = the sealed file digest).
+    Live([u8; 32]),
+    /// `<id>.consumed` present (payload = the sealed file digest — the
+    /// same bytes as the record had, the consume is a rename).
+    Consumed([u8; 32]),
+    /// `<id>.expired` present (empty tombstone).
+    Expired,
+}
+
+/// The journal's final state of one id after replay.
+#[derive(Clone, Copy, Debug)]
+enum JournalState {
+    Live([u8; 32]),
+    Consumed([u8; 32]),
+    Expired,
+}
+
+/// A healing journal append for a crash window: `(op, id, payload)`.
+type HealOp = (u8, u64, [u8; 32]);
+
+/// The outcome of reconciling the journal's final state against the
+/// directory: the healing appends needed for crash windows (a mutation
+/// whose artifact was fsync'd but whose journal append was not — the
+/// mutation never returned, so the artifact's safe-direction state is
+/// adopted and journaled now), plus warnings for safe-direction
+/// divergences (unaccounted tombstones honored, unacknowledged inserts
+/// dropped). A hard divergence (missing/mismatched artifact, a live
+/// record for an id the journal shows consumed — the rollback shape) is
+/// `Err` naming the divergence point.
+fn reconcile_journal(
+    journaled: &BTreeMap<u64, JournalState>,
+    disk: &BTreeMap<u64, DiskState>,
+) -> Result<(Vec<HealOp>, Vec<String>), String> {
+    let mut heals = Vec::new();
+    let mut warnings = Vec::new();
+    for (id, js) in journaled {
+        match (js, disk.get(id)) {
+            (JournalState::Live(ph), Some(DiskState::Live(dh))) if ph == dh => {}
+            (JournalState::Live(ph), Some(DiskState::Consumed(dh))) if ph == dh => {
+                // Crash mid-consume (tombstone fsync'd, journal append
+                // not): the record was never handed out — adopt the
+                // consumed state (safe direction) and journal it now.
+                heals.push((OP_CONSUME, *id, *dh));
+            }
+            (JournalState::Live(_), Some(DiskState::Expired)) => {
+                // Crash mid-expire, same discipline.
+                heals.push((OP_EXPIRE, *id, payload_digest(&[])));
+            }
+            (JournalState::Live(_), found) => {
+                return Err(format!(
+                    "record <{id}.presig> is missing or does not match the journal \
+                     (on disk: {})",
+                    disk_label(found)
+                ));
+            }
+            (JournalState::Consumed(ph), Some(DiskState::Consumed(dh))) if ph == dh => {}
+            (JournalState::Consumed(_), found) => {
+                // A LIVE record here is exactly the rollback shape: the
+                // consume tombstone was undone.
+                return Err(format!(
+                    "the tombstone for consumed id {id} is missing or does not match the \
+                     journal (on disk: {})",
+                    disk_label(found)
+                ));
+            }
+            (JournalState::Expired, Some(DiskState::Expired)) => {}
+            (JournalState::Expired, found) => {
+                return Err(format!(
+                    "the expiry tombstone for id {id} is missing (on disk: {})",
+                    disk_label(found)
+                ));
+            }
+        }
+    }
+    for (id, ds) in disk {
+        if journaled.contains_key(id) {
+            continue;
+        }
+        match ds {
+            // Crash mid-insert (record fsync'd, journal append not): the
+            // insert was never acknowledged — drop the record, like a
+            // stray `.tmp` (never serve an unaccounted record).
+            DiskState::Live(_) => warnings.push(format!(
+                "dropping <{id}.presig>: no journal entry accounts for it \
+                 (crash mid-insert or manual copy — never acknowledged)"
+            )),
+            // An unaccounted tombstone only BURNS an id — safe direction,
+            // honor it (and it stays honored via the in-memory state).
+            DiskState::Consumed(_) => warnings.push(format!(
+                "honoring unaccounted consume tombstone <{id}.consumed> (id burned)"
+            )),
+            DiskState::Expired => warnings.push(format!(
+                "honoring unaccounted expiry tombstone <{id}.expired> (id burned)"
+            )),
+        }
+    }
+    Ok((heals, warnings))
+}
+
+fn disk_label(found: Option<&DiskState>) -> String {
+    match found {
+        None => "absent".to_string(),
+        Some(DiskState::Live(_)) => "live record".to_string(),
+        Some(DiskState::Consumed(_)) => "consume tombstone".to_string(),
+        Some(DiskState::Expired) => "expiry tombstone".to_string(),
+    }
+}
+
+/// The default transcript location for the A4 cross-check: the store
+/// lives at `<data-dir>/store`, the archive at `<data-dir>/archive` (the
+/// `--data-dir` layout). `None` when the store has no parent.
+fn default_transcript(store_dir: &Path) -> Option<PathBuf> {
+    store_dir
+        .parent()
+        .map(|p| p.join("archive").join("transcript.log"))
+}
+
+/// Ids evidenced as SPENT by a transcript's Sign-phase envelopes (every
+/// accepted `SignShare` broadcast names the presignature it belongs to).
+/// `None` when the transcript is missing or unreadable.
+fn sign_evidence_ids(transcript: &Path) -> Option<BTreeSet<u64>> {
+    let entries = read_transcript(transcript).ok()?;
+    Some(
+        entries
+            .iter()
+            .filter_map(|se| match (&se.envelope.phase, &se.envelope.payload) {
+                (Phase::Sign, NodePayload::SignShare { presig, .. }) => Some(*presig),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
 // --- the durable presignature store (SPEC §8.6) -------------------------
 
 /// The H5 seal purpose for one store record (binds the AEAD to the
@@ -382,6 +743,11 @@ pub struct DiskPresigStore {
     expired: BTreeSet<u64>,
     /// H5 pool TTL: created-at (unix seconds) per LIVE record.
     created: BTreeMap<u64, u64>,
+    /// A4: the chained mutation journal (every insert/consume/expire is
+    /// appended, fsync'd per entry).
+    journal: Journal,
+    /// A4: integrity warnings collected at `open` (printed there too).
+    warnings: Vec<String>,
 }
 
 impl std::fmt::Debug for DiskPresigStore {
@@ -404,11 +770,55 @@ impl DiskPresigStore {
     /// so is any record that is not H5-sealed (a legacy cleartext file —
     /// fail closed) or fails authentication under THIS storage key
     /// (wrong key or tampered).
+    ///
+    /// A4 integrity checks (ON by default — [`Self::open_unverified`] is
+    /// the dev escape hatch): replay the chained journal and verify it
+    /// against the directory (every journaled mutation's artifact
+    /// present and matching; a live record for an id the journal shows
+    /// consumed — the ROLLBACK shape — is a hard failure), then
+    /// cross-check the transcript archive at `<dir>/../archive/
+    /// transcript.log` when present: a presignature id evidenced as
+    /// spent by an accepted Sign-phase envelope must not be live in the
+    /// store. Any break fails closed with [`PersistError::Integrity`]
+    /// naming the divergence point.
     pub fn open(
         dir: &Path,
         public_key: &AffinePoint,
         storage_key: &StorageKey,
     ) -> Result<Self, PersistError> {
+        Self::open_mode(dir, public_key, storage_key, false)
+    }
+
+    /// [`Self::open`] with the A4 integrity checks downgraded to loud
+    /// warnings (the `--allow-unverified-store` dev escape hatch): a
+    /// detected rollback does NOT stop the node — this is exactly the
+    /// dangerous path (a rolled-back store will happily sign twice with
+    /// one presignature id, which extracts the long-term key). Never use
+    /// outside development.
+    pub fn open_unverified(
+        dir: &Path,
+        public_key: &AffinePoint,
+        storage_key: &StorageKey,
+    ) -> Result<Self, PersistError> {
+        Self::open_mode(dir, public_key, storage_key, true)
+    }
+
+    #[allow(clippy::too_many_lines)] // startup verification is one sequential audit
+    fn open_mode(
+        dir: &Path,
+        public_key: &AffinePoint,
+        storage_key: &StorageKey,
+        allow_unverified: bool,
+    ) -> Result<Self, PersistError> {
+        let mut warnings: Vec<String> = Vec::new();
+        if allow_unverified {
+            warnings.push(
+                "WARNING [A4]: store integrity checks are DISABLED (--allow-unverified-store) — \
+                 a rolled-back presignature store will NOT be refused, and signing twice with one \
+                 presignature id extracts the long-term key. DEV ONLY."
+                    .to_string(),
+            );
+        }
         fs::create_dir_all(dir)?;
         let key_bytes = {
             let mut b = Vec::new();
@@ -423,9 +833,6 @@ impl DiskPresigStore {
         } else {
             write_atomic(dir, "key.tmp", "key.bin", &key_bytes, false)?;
         }
-        let mut live = BTreeSet::new();
-        let mut consumed = BTreeSet::new();
-        let mut expired = BTreeSet::new();
         let mut created = BTreeMap::new();
         let mut entries = Vec::new();
         for entry in fs::read_dir(dir)? {
@@ -437,16 +844,20 @@ impl DiskPresigStore {
             let Ok(id) = id.parse::<u64>() else { continue };
             entries.push((id, kind.to_string(), name.to_string()));
         }
-        // Tombstones first: a crash mid-expire (tombstone durable, sealed
-        // file not yet removed) leaves BOTH — the tombstone wins and the
-        // stray record is deleted in the second pass (never served).
-        for (id, kind, _) in &entries {
+        // Directory scan → the on-disk final state per id. Tombstones
+        // first: a crash mid-expire (tombstone durable, sealed file not
+        // yet removed) leaves BOTH — the tombstone wins and the stray
+        // record is deleted in the second pass (never served). A consume
+        // tombstone wins over a live record for the same reason.
+        let mut disk: BTreeMap<u64, DiskState> = BTreeMap::new();
+        for (id, kind, name) in &entries {
             match kind.as_str() {
                 "consumed" => {
-                    consumed.insert(*id);
+                    let bytes = fs::read(dir.join(name))?;
+                    disk.insert(*id, DiskState::Consumed(payload_digest(&bytes)));
                 }
                 "expired" => {
-                    expired.insert(*id);
+                    disk.insert(*id, DiskState::Expired);
                 }
                 _ => {}
             }
@@ -454,7 +865,9 @@ impl DiskPresigStore {
         for (id, kind, name) in &entries {
             match kind.as_str() {
                 "presig" => {
-                    if expired.contains(id) {
+                    if disk.contains_key(id) {
+                        // A tombstone (consumed or expired) exists for
+                        // this id: it wins; the stray record is deleted.
                         fs::remove_file(dir.join(name))?;
                         continue;
                     }
@@ -485,7 +898,7 @@ impl DiskPresigStore {
                             .map(|d| d.as_secs())
                             .unwrap_or(0),
                     };
-                    live.insert(*id);
+                    disk.insert(*id, DiskState::Live(payload_digest(&bytes)));
                     created.insert(*id, created_at);
                 }
                 "tmp" => {
@@ -496,6 +909,182 @@ impl DiskPresigStore {
                 _ => {}
             }
         }
+
+        // --- A4: the chained journal ----------------------------------
+        let journal_path = dir.join(JOURNAL_FILE);
+        let journal_existed = journal_path.exists();
+        let mut journal = Journal {
+            file: OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&journal_path)?,
+            next_seq: 1,
+            tip: ZERO_HASH,
+        };
+        // The final truth per id after journal reconciliation.
+        let mut truth: BTreeMap<u64, DiskState> = disk.clone();
+        if !journal_existed && !disk.is_empty() {
+            // LEGACY store (pre-A4: records but no journal): there is no
+            // history to verify — adopt the current state as the journal
+            // genesis, loudly. Rollback of such a store is undetectable
+            // until the first journaled mutation.
+            warnings.push(format!(
+                "WARNING [A4]: {} predates the store journal — adopting the current state \
+                 as the journal genesis; history before this point is unverifiable",
+                dir.display()
+            ));
+            for (id, ds) in &disk {
+                match ds {
+                    DiskState::Live(h) => journal.append(OP_INSERT, *id, *h)?,
+                    DiskState::Consumed(h) => {
+                        journal.append(OP_INSERT, *id, *h)?;
+                        journal.append(OP_CONSUME, *id, *h)?;
+                    }
+                    DiskState::Expired => {
+                        journal.append(OP_INSERT, *id, ZERO_HASH)?;
+                        journal.append(OP_EXPIRE, *id, payload_digest(&[]))?;
+                    }
+                }
+            }
+        } else if journal_existed {
+            let bytes = fs::read(&journal_path)?;
+            match journal_replay(&bytes) {
+                Ok(jentries) => {
+                    if let Some(last) = jentries.last() {
+                        journal.next_seq = last.seq + 1;
+                        journal.tip = last.hash;
+                    }
+                    let mut journaled: BTreeMap<u64, JournalState> = BTreeMap::new();
+                    for e in &jentries {
+                        let js = match e.op {
+                            OP_INSERT => JournalState::Live(e.payload),
+                            OP_CONSUME => JournalState::Consumed(e.payload),
+                            _ => JournalState::Expired,
+                        };
+                        journaled.insert(e.id, js);
+                    }
+                    match reconcile_journal(&journaled, &disk) {
+                        Ok((heals, warns)) => {
+                            warnings.extend(warns);
+                            for (op, id, payload) in heals {
+                                journal.append(op, id, payload)?;
+                                let healed = match op {
+                                    OP_CONSUME => DiskState::Consumed(payload),
+                                    OP_EXPIRE => DiskState::Expired,
+                                    _ => unreachable!("only consume/expire heal"),
+                                };
+                                truth.insert(id, healed);
+                            }
+                            // Unaccounted live records were dropped by the
+                            // caller of reconcile (the warnings say which);
+                            // remove them from the truth and the disk.
+                            for (id, ds) in &disk {
+                                if !journaled.contains_key(id) && matches!(ds, DiskState::Live(_)) {
+                                    fs::remove_file(dir.join(format!("{id}.presig")))?;
+                                    truth.remove(id);
+                                }
+                            }
+                        }
+                        Err(divergence) if allow_unverified => {
+                            warnings.push(format!(
+                                "WARNING [A4]: integrity divergence IGNORED \
+                                 (--allow-unverified-store): {divergence}"
+                            ));
+                        }
+                        Err(divergence) => {
+                            return Err(PersistError::Integrity(divergence));
+                        }
+                    }
+                }
+                Err(chain_break) if allow_unverified => {
+                    warnings.push(format!(
+                        "WARNING [A4]: journal chain broken, IGNORED \
+                         (--allow-unverified-store): {chain_break}"
+                    ));
+                }
+                Err(chain_break) => {
+                    return Err(PersistError::Integrity(chain_break));
+                }
+            }
+        }
+        // A journal that exists but is empty while records exist is the
+        // same shape as a deleted journal: unaccounted live records are
+        // dropped (safe direction), tombstones honored — handled above
+        // via the (empty) replay.
+
+        // --- A4: the transcript cross-check (the rollback detector) ----
+        // The archive is append-only and its writes are independent of
+        // the store's: a consume leaves accepted Sign-phase envelopes
+        // naming the presignature id. A store backup restored over an
+        // intact archive shows a spent id as LIVE — fail closed.
+        let has_history = journal.next_seq > 1;
+        match default_transcript(dir).and_then(|t| sign_evidence_ids(&t).map(|ids| (t, ids))) {
+            Some((path, ids)) => {
+                for id in &ids {
+                    if matches!(truth.get(id), Some(DiskState::Live(_))) {
+                        let divergence = format!(
+                            "ROLLBACK DETECTED: presignature id {id} is evidenced as SPENT by \
+                             the sign transcript {} but the store shows it LIVE — the store \
+                             directory was restored from a stale backup; refusing to operate \
+                             (§8.6/§13.3). Wipe the store or restore a consistent backup.",
+                            path.display()
+                        );
+                        if allow_unverified {
+                            warnings.push(format!(
+                                "WARNING [A4]: {divergence} — IGNORED (dev mode): signing with \
+                                 id {id} again would reuse a nonce and EXTRACT THE LONG-TERM KEY"
+                            ));
+                        } else {
+                            return Err(PersistError::Integrity(divergence));
+                        }
+                    }
+                }
+                if has_history {
+                    warnings.push(
+                        "NOTE [A4]: journal + transcript cross-checks passed; the journal and \
+                         the transcript live in the SAME rollback-able directory — a \
+                         whole-directory restore to an older self-consistent state remains \
+                         undetectable. True rollback prevention needs state outside this \
+                         directory (HSM monotonic counter, peer attestation — SPEC §13.3); \
+                         ship transcript.log off-box for real independence."
+                            .to_string(),
+                    );
+                }
+            }
+            None => {
+                if has_history {
+                    warnings.push(
+                        "WARNING [A4]: no transcript archive found next to the store — store \
+                         integrity is only self-consistent (journal chain); a rollback of the \
+                         whole directory is UNDETECTABLE without the sign transcript. True \
+                         prevention needs state outside this directory (SPEC §13.3)."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        for w in &warnings {
+            eprintln!("{w}");
+        }
+
+        let mut live = BTreeSet::new();
+        let mut consumed = BTreeSet::new();
+        let mut expired = BTreeSet::new();
+        for (id, ds) in &truth {
+            match ds {
+                DiskState::Live(_) => {
+                    live.insert(*id);
+                }
+                DiskState::Consumed(_) => {
+                    consumed.insert(*id);
+                }
+                DiskState::Expired => {
+                    expired.insert(*id);
+                }
+            }
+        }
+        // The created-at map covers exactly the surviving live records.
+        created.retain(|id, _| live.contains(id));
         Ok(Self {
             dir: dir.to_path_buf(),
             public_key: *public_key,
@@ -504,7 +1093,15 @@ impl DiskPresigStore {
             consumed,
             expired,
             created,
+            journal,
+            warnings,
         })
+    }
+
+    /// A4: the integrity warnings collected at `open` (already printed
+    /// to stderr there; exposed for tests and tooling).
+    pub fn integrity_warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// The long-term public key this store is bound to (§8.6(4)).
@@ -544,6 +1141,11 @@ impl DiskPresigStore {
             &sealed,
             true,
         )?;
+        // A4: journal the mutation (fsync'd) BEFORE acknowledging the
+        // insert — a crash in between leaves an unaccounted record that
+        // `open` drops (never acknowledged, like a stray `.tmp`).
+        self.journal
+            .append(OP_INSERT, id, payload_digest(&sealed))?;
         self.live.insert(id);
         self.created.insert(id, created_at);
         Ok(())
@@ -571,6 +1173,11 @@ impl DiskPresigStore {
             self.dir.join(format!("{id}.consumed")),
         )?;
         sync_dir(&self.dir)?;
+        // A4: journal the consume BEFORE handing the record out — a
+        // crash in between loses the record (never returned) and `open`
+        // heals the journal from the durable tombstone (safe direction).
+        self.journal
+            .append(OP_CONSUME, id, payload_digest(&sealed))?;
         self.live.remove(&id);
         self.created.remove(&id);
         self.consumed.insert(id);
@@ -580,6 +1187,16 @@ impl DiskPresigStore {
     /// Number of stored (unconsumed) presignatures.
     pub fn len(&self) -> usize {
         self.live.len()
+    }
+
+    /// Number of consumed presignatures (tombstoned, never re-issuable).
+    pub fn consumed_count(&self) -> usize {
+        self.consumed.len()
+    }
+
+    /// Number of TTL-expired presignatures (§8.6(3), burned forever).
+    pub fn expired_count(&self) -> usize {
+        self.expired.len()
     }
 
     /// Whether the store holds no live presignatures.
@@ -653,11 +1270,103 @@ impl DiskPresigStore {
         )?;
         fs::remove_file(self.dir.join(format!("{id}.presig")))?;
         sync_dir(&self.dir)?;
+        // A4: journal the expiry (the tombstone is durable first, so a
+        // crash in between is healed at `open` — the id stays burned).
+        self.journal.append(OP_EXPIRE, id, payload_digest(&[]))?;
         self.live.remove(&id);
         self.created.remove(&id);
         self.expired.insert(id);
         Ok(true)
     }
+
+    /// Burn an id whose PRODUCTION session failed before any record was
+    /// inserted (A7 — the fault-tolerant pool loop, `pool::PoolManager::tick_tolerant`):
+    /// the empty `<id>.expired` tombstone is written and fsync'd, then a
+    /// journal `OP_BURN` entry is appended, so the id is DURABLY
+    /// never-re-issuable. A restarted pool manager re-seeds id
+    /// allocation from `max_seen_id` (which covers burned ids), so a
+    /// retried session can never reuse a presignature id — hence a sid —
+    /// the wire may still hold acceptor/journal state for (a fresh
+    /// payload in a stale slot would look like an equivocation).
+    /// `Ok(false)` when the id is already known (live, consumed, or
+    /// burned) — burning an INSERTED id is a caller bug (use
+    /// [`Self::expire`]).
+    pub fn burn(&mut self, id: u64) -> Result<bool, PersistError> {
+        if self.live.contains(&id) || self.consumed.contains(&id) || self.expired.contains(&id) {
+            return Ok(false);
+        }
+        write_atomic(
+            &self.dir,
+            &format!("{id}.tmp"),
+            &format!("{id}.expired"),
+            &[],
+            false,
+        )?;
+        self.journal.append(OP_BURN, id, payload_digest(&[]))?;
+        self.expired.insert(id);
+        Ok(true)
+    }
+}
+
+// --- A7: the node's long-term key share at rest (soak process-restart) --------
+
+/// The sealed key-share file name inside a node's `--data-dir` (A7
+/// soak): written once after the node's first keygen, loaded instead of
+/// re-running keygen when the process is restarted into the SAME
+/// committee (the kill/restart soak cycle).
+pub const KEYSHARE_FILE: &str = "keyshare.sealed";
+
+/// The H5 seal purpose for the key-share file (binds the AEAD).
+fn keyshare_purpose() -> Vec<u8> {
+    b"ohm-ecdsa-node/keyshare-v1".to_vec()
+}
+
+/// Persist the node's long-term key share, SEALED under the node's
+/// storage key (resolved/generated at `dir`, the same source
+/// abstraction as the store — [`crate::seal`]) and written `0600`. The
+/// share is as secret as it gets — this file gets exactly the H5
+/// at-rest treatment the seed/identity files get; it exists so a killed
+/// node process can REJOIN its committee (the A7 soak restart cycle),
+/// not as a general key-backup mechanism.
+pub fn save_keyshare(dir: &Path, share: &KeyShare) -> Result<(), PersistError> {
+    fs::create_dir_all(dir)?;
+    let key = StorageKey::resolve_or_generate(dir)?;
+    let mut plain = Vec::new();
+    put_u64(&mut plain, share.index as u64);
+    share.share.encode(&mut plain);
+    share.com.encode(&mut plain);
+    let sealed = key.seal(&keyshare_purpose(), &plain);
+    crate::seal::write_secret_file(&dir.join(KEYSHARE_FILE), &sealed)?;
+    Ok(())
+}
+
+/// The inverse of [`save_keyshare`]: `Ok(None)` when no key-share file
+/// exists (first boot — the node runs keygen); a present file that
+/// cannot be authenticated/decoded fails CLOSED (wrong storage key,
+/// tampering, legacy cleartext), never a silent re-keygen.
+pub fn load_keyshare(dir: &Path) -> Result<Option<KeyShare>, PersistError> {
+    let path = dir.join(KEYSHARE_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let Some(key) = StorageKey::resolve(dir)? else {
+        return Err(
+            Error::PresigStore("a key-share file exists but no storage key is configured").into(),
+        );
+    };
+    let sealed = fs::read(&path)?;
+    let plain = key.open(&keyshare_purpose(), &sealed)?;
+    let (index, used) = take_u64(&plain).ok_or(Error::PresigStore("corrupt key-share file"))?;
+    let (share, used2) =
+        Scalar::decode(&plain[used..]).ok_or(Error::PresigStore("corrupt key-share file"))?;
+    let (com, used3) = FeldmanCommitment::decode(&plain[used + used2..])
+        .ok_or(Error::PresigStore("corrupt key-share file"))?;
+    if used + used2 + used3 != plain.len() || index == 0 {
+        return Err(Error::PresigStore("corrupt key-share file").into());
+    }
+    let index =
+        PartyId::try_from(index).map_err(|_| Error::PresigStore("corrupt key-share file"))?;
+    Ok(Some(KeyShare { index, share, com }))
 }
 
 // --- blame-token evidence (SPEC §10.2, §A.4) -----------------------------

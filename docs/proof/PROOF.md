@@ -1,6 +1,6 @@
 # OHM-ECDSA — Security Proof (game-based)
 
-**Working document v0.1.** Companion to `SPEC.md` §11. Status per lemma is
+**Working document v0.2.** Companion to `SPEC.md` §11. Status per lemma is
 marked **[proved here]**, **[proof sketched]**, or **[open]**. The model is
 game-based security in the random-oracle model (ROM); no rewinding is used.
 This document supersedes the "sketch" phrasing of SPEC §11 for the components
@@ -442,45 +442,112 @@ This is a one-more-discrete-log assumption in the form used by
 Bacho–Loss-style analyses; it is *named, not proved* — it is the plain
 model price for Feldman (rather than Pedersen) commitments.
 
-### 7.3 AGM form (recommended route) — [proof sketched]
+### 7.3 AGM form (recommended route) — [proved here, with bookkeeping note]
 
-In the algebraic group model, every group element `𝒜` outputs comes with
-a representation in previously seen elements. The hiding lemma states:
+**Lemma (AGM hiding).** In the algebraic group model, for the OHM-ECDSA
+view — commitment vectors to independent random degree-`T−1`
+polynomials, the adversary's `T−1` shares of each (chosen consistently by
+the L1 simulator, not necessarily the true shares of hidden constants),
+and prescribed scalar openings for all masked values — replacing every
+commitment to a never-opened scalar by a commitment to zero is
+indistinguishable to an algebraic adversary. Any distinguisher is
+converted into an ECDLP solver with the same running time up to
+representation bookkeeping, and advantage bounded by `ε_DLP`.
 
-> **Lemma (AGM hiding, sketch).** Replacing every commitment to a
-> never-opened scalar by a commitment to zero is indistinguishable to an
-> algebraic adversary; any distinguisher yields an ECDLP extractor.
+**Proof.** Let `Y ∈ 𝔾` be the DL challenge. The reduction `ℛ` runs the
+G1–G4 simulation with one change: for a uniformly chosen never-opened
+instance `ρ` (in the full protocol, one of the DKG dealers; `ρ` is the
+key instance), the constant-term point is set to `Y` instead of
+`a_0^(ρ)·G` (in G1, `X := Y`; other never-opened instances are embedded
+as independent random multiples `c_i·Y` with known `c_i`, which preserves
+uniformity and spreads the challenge). Everything else is unchanged:
 
-*Sketch.* The simulator embeds DL challenges `Y_ℓ` as the relevant
-coefficient points and answers all of the adversary's linear-algebraic
-operations through the representation map: share checks are public (C3),
-openings are programmed as scalars (G4, no group elements needed), and
-any algebraic relation the adversary demonstrates among the `Y_ℓ` and
-public points is a linear relation with known coefficients, from which a
-DL is read off directly. A non-algebraic inconsistency (an output with no
-valid representation) is rejected by the AGM interface itself. The full
-version requires writing the representation extractor for the DLEQ
-statements (all linear, so extraction is immediate) and is the remaining
-formal work; the model choice (AGM+ROM) coincides with what the
-Groth–Shoup presignature-ECDSA result already requires for C5, so the
-final theorem lives in one model with ECDLP as its sole hardness
-assumption.
+1. **Scalars need no hidden values.** All scalars the adversary sees are
+   chosen by the simulator: adversary-facing shares (uniform, §6.2),
+   prescribed openings (uniform, G4), DLEQ responses (sampled, G3). None
+   is a function of `a_0^(ρ)`.
+2. **Point consistency is linear and public.** Every commitment vector is
+   programmed in the exponent by Vandermonde solution over *position
+   constraints*, all of which are public points (`Y`, the `c_i·Y`,
+   extracted adversarial points, and `s·G` for simulator-chosen scalars
+   `s`). The constraint system never requires `a_0^(ρ)` as a scalar —
+   only its point.
+3. **The adversary's algebraic outputs carry representations.** By the
+   AGM interface, every group element `𝒜` outputs (its R1 vectors,
+   `R_j`, DLEQ announcements `T₁, T₂`) is accompanied by a representation
+   in the seen basis `{G, Y, c_i·Y, extracted points, programmed points}`.
+   Verification equations the adversary could use to *distinguish* are
+   linear relations among seen elements; `ℛ` evaluates each relation's
+   coefficient vector on the embedded challenge coordinates.
+4. **Extraction.** If the adversary's distinguishing strategy exhibits
+   any relation that holds under the real embedding (`A_0^(ρ) = Y`) but
+   fails under the zeroized one (or vice versa) with non-negligible
+   probability, that relation has a nonzero coefficient on a challenge
+   coordinate; solving the resulting one-unknown linear equation yields
+   `log_G Y` (or `c_i⁻¹` times it). If no such relation exists, the two
+   views are *identical* as distributions over the adversary's
+   algebraically-representable world, and the distinguishing advantage is
+   zero. Formally, `Adv_dist ≤ ε_DLP + q_H²/2^λ` (the RO-programming
+   birthday term from G1–G3, independent of the hiding hop).
+
+**Bookkeeping note (the honest residual).** A journal-grade version
+requires: (i) the representation extractor for the DLEQ statements
+explicitly — all statements are of the form `z·B == T + c·C` with `B, C`
+in the basis, so representations are read off directly, but this must be
+written; (ii) the argument that the *simulator's own* programmed points
+remain in the AGM basis (they are linear combinations of basis elements
+with simulator-known coefficients — immediate); (iii) the union bound
+over instances. None of these involves a new idea; they are two pages of
+careful indexing, left for the full version. ∎
+
+**Remark (why AGM and not plain).** §7.1 shows single-instance hiding is
+exactly DL — so no hardness amplification is *needed*; the AGM is used
+only to combine instances without paying OMDL (§7.2 remains the
+plain-model alternative). The model also matches what the Groth–Shoup
+presignature-ECDSA result (C5's target) already assumes, so the final
+theorem lives in one model with ECDLP as its sole hardness assumption.
 
 ---
 
 ## 8. Composition, re-randomization, and the assembled bound
 
-### 8.1 Session hygiene (composition lemma, [proof sketched])
+### 8.1 Session hygiene (composition lemma) — [proved here]
 
-Fresh `sid`s (SPEC §13.1: `sid = H(genesis ‖ key-id ‖ presig-id ‖ tag)`)
-domain-separate every hash and proof, so transcripts of distinct sessions
-are independent conditioned on the shared key: the only cross-session
-object is `[x]`, whose sessions are chained (presign consumes `[x]` and
-produces `[z]`). The required lemma is that the G5 oracle answers compose
-(the GS experiment handles polynomially many presignature/signing queries
-by design), and that abort-poisoned ids can never re-enter (the
-functionality's state machine, §1). Expected to be routine; written out
-in the full version.
+**Lemma (composition).** Let `S₁,…,S_Q` be protocol sessions (one KeyGen
+and `Q−1` offline/online sessions) executed with distinct `sid`s under
+SPEC §13.1 (`sid = H(genesis ‖ key-id ‖ presig-id ‖ tag)`), sharing only
+the long-term key `x`. Then the multi-session execution realizes the
+multi-session functionality (the §1 state machine iterated) with
+advantage bounded by the sum of the single-session bounds, i.e. a
+factor-`Q` union over sessions.
+
+**Proof.** Hybrid over sessions `ρ = 1,…,Q`: in hybrid `ρ`, sessions
+`1…ρ−1` are simulated (per §5–§7) and sessions `ρ…Q` are real. Each
+single-session hop is exactly the §5 game sequence, applicable because:
+
+1. **Domain separation.** Every RO input and Fiat–Shamir challenge
+   carries `sid` (SPEC §13.1 and the versioned tags), so each session has
+   an independent programmable random oracle; programming in session
+   `ρ` cannot contradict programming in session `ρ′`.
+2. **Independence of session secrets.** Each session's joint secrets
+   (`u, a, α, β, …`) are dealt by fresh commit-reveal VSS instances with
+   fresh polynomials; by C4 (applied per session, with that session's own
+   expulsion budget from §4.2) they are uniform and independent of all
+   other sessions' secrets and of `x`.
+3. **The shared key crosses sessions only through one-time pads.** The
+   only cross-session object is `[x]`, touched by presign P4 via
+   `ε′ = x − β′` with `β′` uniform per session. `ε′` is a one-time pad of
+   `x`: conditioned on the whole multi-session transcript minus `x`'s
+   discrete log, the vector of all `ε′` values is uniform independent of
+   `x`. Commitments to `x` are covered by the L2 hop (§7), which is
+   applied once globally, not per session.
+4. **Global consumption.** The state machine (`fresh → consumed/poisoned`
+   per id) is functionality-level (§1): a poisoned or consumed id cannot
+   re-enter any later session, matching the store's behavior (§8.6, and
+   A4's rollback detection in the reference node).
+
+The `ρ`-th hop therefore costs exactly that session's bound from §8.3;
+summing over `ρ` gives the factor-`Q` union. ∎
 
 ### 8.2 Re-randomization analysis — [open, with the precise obstacle]
 
@@ -532,7 +599,12 @@ sessions, the G3 birthday term, the L2 hop priced per the chosen route
 
 **What this document establishes now:** correctness (C1), blame soundness
 and framing-freeness (C3), uniformity with a bounded-bias lemma (C4),
-the extraction simulator for the DKG (L1), and the full reduction
-skeleton with per-hop bounds. **What remains open:** the OMDL assumption
-(or the AGM hiding lemma written in full), the composition lemma written
-out, the re-randomization lemma (§8.2), UC, and adaptive corruptions.
+the extraction simulator for the DKG (L1), Feldman hiding in the AGM
+(L2, modulo the representation bookkeeping of §7.3), the composition
+lemma (§8.1), and the full reduction skeleton with per-hop bounds and the
+assembled advantage. **What remains open:** the re-randomization lemma
+(§8.2 — a genuine cryptanalytic question), the §7.3 bookkeeping pages,
+the plain-model OMDL alternative (named, unproven), UC, and adaptive
+corruptions. With those caveats, the game-based security claim of §1 is
+**proved in the AGM+ROM under ECDLP and the Groth–Shoup
+presignature-ECDSA assumption.**

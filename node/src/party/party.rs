@@ -115,7 +115,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -887,6 +887,9 @@ pub struct PartyNode {
     /// per-key and does NOT hold pool records (a durable key-free pool
     /// file is follow-up; a restart simply loses unspent records).
     ki_pool: Mutex<KiPool>,
+    /// §4.7 rule (3) / §10.1 F8: broadcast equivocations this node's
+    /// acceptor has detected (counted in [`Self::report_equivocations`]).
+    equivocations: AtomicU64,
 }
 
 impl PartyNode {
@@ -973,6 +976,7 @@ impl PartyNode {
             store: Arc::new(Mutex::new(None)),
             archive: Mutex::new(None),
             ki_pool: Mutex::new(KiPool::new()),
+            equivocations: AtomicU64::new(0),
         })
     }
 
@@ -1007,10 +1011,34 @@ impl PartyNode {
         self.node.metrics()
     }
 
+    /// Sessions with in-flight journaled traffic right now (H2) — the
+    /// gauge next to `MeshMetrics::sessions_completed`.
+    pub fn sessions_active(&self) -> usize {
+        self.node.sessions_active()
+    }
+
+    /// Whether this node runs M3c mTLS on its mesh connections.
+    pub fn tls_enabled(&self) -> bool {
+        self.node.tls_enabled()
+    }
+
+    /// The committee ids this node runs sessions over (the full
+    /// committee; H4 restart sessions run over explicit subsets).
+    pub fn committee(&self) -> Vec<PartyId> {
+        self.params.parties()
+    }
+
     /// Frames dropped by the acceptor-level H2 caps (distinct-sid and
     /// per-slot candidate bounds).
     pub fn acceptor_drops(&self) -> u64 {
         self.state.0.lock().expect("mesh mutex poisoned").dropped
+    }
+
+    /// §4.7 rule (3) / §10.1 F8: broadcast equivocations this node's
+    /// acceptor has detected since boot (each poisons the sender for the
+    /// session and is archived as F8 evidence).
+    pub fn equivocation_count(&self) -> u64 {
+        self.equivocations.load(Ordering::SeqCst)
     }
 
     /// Clean shutdown (H2): stops the mesh (listeners, readers,
@@ -1038,7 +1066,9 @@ impl PartyNode {
     /// bound to `public_key` (§8.6 — one store per long-term key;
     /// reopening under a different key is rejected). From then on
     /// [`Self::presign_stored`] persists every record it produces and
-    /// [`Self::sign_stored`] consumes durably.
+    /// [`Self::sign_stored`] consumes durably. A4 integrity checks
+    /// (journal chain + transcript cross-check) are ON: a detected
+    /// rollback fails closed.
     pub fn set_store(
         &self,
         dir: &Path,
@@ -1046,6 +1076,21 @@ impl PartyNode {
     ) -> std::result::Result<(), PersistError> {
         let storage_key = crate::seal::StorageKey::resolve_or_generate(dir)?;
         let store = DiskPresigStore::open(dir, public_key, &storage_key)?;
+        *self.store.lock().expect("mesh mutex poisoned") = Some(store);
+        Ok(())
+    }
+
+    /// [`Self::set_store`] with the A4 integrity checks downgraded to
+    /// loud warnings (the `--allow-unverified-store` dev escape hatch) —
+    /// a detected rollback does NOT stop the node. This is exactly the
+    /// dangerous path (nonce reuse extracts the long-term key); dev only.
+    pub fn set_store_unverified(
+        &self,
+        dir: &Path,
+        public_key: &AffinePoint,
+    ) -> std::result::Result<(), PersistError> {
+        let storage_key = crate::seal::StorageKey::resolve_or_generate(dir)?;
+        let store = DiskPresigStore::open_unverified(dir, public_key, &storage_key)?;
         *self.store.lock().expect("mesh mutex poisoned") = Some(store);
         Ok(())
     }
@@ -1229,6 +1274,8 @@ impl PartyNode {
     /// §10.3 policy applies. Non-fatal on I/O failure.
     #[allow(clippy::type_complexity)]
     fn report_equivocations(&self, equivocations: Vec<(SlotKey, EquivocationEvidence)>) {
+        self.equivocations
+            .fetch_add(equivocations.len() as u64, Ordering::SeqCst);
         for ((_, phase, round, from), (first, second)) in equivocations {
             eprintln!(
                 "[node {}] EQUIVOCATION: party {from} signed two conflicting values for the \

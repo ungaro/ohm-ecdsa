@@ -85,6 +85,7 @@ impl PoolConfig {
 pub struct PoolCounters {
     produced: AtomicU64,
     expired: AtomicU64,
+    failed: AtomicU64,
 }
 
 impl PoolCounters {
@@ -97,6 +98,13 @@ impl PoolCounters {
     /// Records erased by TTL expiry.
     pub fn expired(&self) -> u64 {
         self.expired.load(Ordering::SeqCst)
+    }
+
+    /// Production sessions that FAILED and had their id burned
+    /// ([`PoolManager::tick_tolerant`], A7 soak) — aborts from an
+    /// injected fault, round timeouts while a peer is down.
+    pub fn failed(&self) -> u64 {
+        self.failed.load(Ordering::SeqCst)
     }
 }
 
@@ -198,15 +206,10 @@ impl PoolManager {
         }
     }
 
-    /// One maintenance pass: expire aged records (§8.6(3)), then produce
-    /// ONE record if the pool is below target. Production errors
-    /// propagate (the run loop stops loudly) — except `ZeroValue`
-    /// (~2⁻¹²⁸ per session): the id is burned and the next tick retries
-    /// with a fresh one, the same rule as the drivers.
-    pub fn tick(&mut self) -> Result<PoolStats, PersistError> {
-        let now = (self.clock)();
-        // 1. TTL expiry: erase aged records; they are never served again
-        //    (consume only serves live ids).
+    /// The TTL-expiry phase of a maintenance pass (§8.6(3)): erase aged
+    /// records; they are never served again (consume only serves live
+    /// ids).
+    fn expire_aged(&self, now: u64) -> Result<(), PersistError> {
         if self.cfg.ttl_secs > 0 {
             let threshold = now.saturating_sub(self.cfg.ttl_secs);
             let aged = self.with_store(|s| s.expired_before(threshold))?;
@@ -220,7 +223,18 @@ impl PoolManager {
                 }
             }
         }
-        // 2. Refill: one record per tick while below target.
+        Ok(())
+    }
+
+    /// One maintenance pass: expire aged records (§8.6(3)), then produce
+    /// ONE record if the pool is below target. Production errors
+    /// propagate (the run loop stops loudly) — except `ZeroValue`
+    /// (~2⁻¹²⁸ per session): the id is burned and the next tick retries
+    /// with a fresh one, the same rule as the drivers.
+    pub fn tick(&mut self) -> Result<PoolStats, PersistError> {
+        let now = (self.clock)();
+        self.expire_aged(now)?;
+        // Refill: one record per tick while below target.
         if self.with_store(|s| s.len())? < self.cfg.target {
             let id = self.next_id;
             self.next_id += 1;
@@ -238,6 +252,50 @@ impl PoolManager {
                 },
                 Err(PersistError::Protocol(Error::ZeroValue(_))) => {}
                 Err(e) => return Err(e),
+            }
+        }
+        Ok(self.stats())
+    }
+
+    /// A7 soak: [`Self::tick`] variant that TOLERATES production-session
+    /// failure and keeps the loop alive — an abort from an injected
+    /// fault or a round timeout while a peer is down fails the ONE
+    /// session, not the pool. The failed id is BURNED DURABLY
+    /// ([`DiskPresigStore::burn`]): a retried session must never reuse a
+    /// presignature id (hence a sid) a past attempt used — the wire may
+    /// still hold acceptor/journal state for it (a fresh payload in a
+    /// stale slot is indistinguishable from an equivocation), and a
+    /// crash/restart re-seeds id allocation from `max_seen_id`, which
+    /// only covers DURABLY burned ids. Failures are counted
+    /// ([`PoolCounters::failed`]); store I/O errors still propagate
+    /// (local corruption is not a tolerable session fault). Production
+    /// outcomes are consistent across the committee (identifiable
+    /// aborts, session timeouts), so every node's manager burns the
+    /// same ids and the id spaces stay aligned.
+    pub fn tick_tolerant(&mut self) -> Result<PoolStats, PersistError> {
+        let now = (self.clock)();
+        self.expire_aged(now)?;
+        if self.with_store(|s| s.len())? < self.cfg.target {
+            let id = self.next_id;
+            self.next_id += 1;
+            match (self.produce)(id) {
+                Ok(record) => match self.with_store(|s| s.insert_at(&record, now))? {
+                    Ok(()) => {
+                        self.counters.produced.fetch_add(1, Ordering::SeqCst);
+                        eprintln!("[{}] presignature {id} produced", self.cfg.label);
+                    }
+                    Err(PersistError::Protocol(Error::PresigStore(_))) => {}
+                    Err(e) => return Err(e),
+                },
+                Err(e) => {
+                    self.with_store(|s| s.burn(id))??;
+                    self.counters.failed.fetch_add(1, Ordering::SeqCst);
+                    eprintln!(
+                        "[{}] production of presignature {id} failed ({e}) — id burned, \
+                         next tick retries with a fresh one",
+                        self.cfg.label
+                    );
+                }
             }
         }
         Ok(self.stats())

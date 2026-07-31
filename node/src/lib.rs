@@ -198,6 +198,24 @@
 //!   (§8.6(3) — expiry tombstone fsync'd first, id burned forever), and
 //!   survives crash/restart without re-issuing ids or over-producing.
 //!
+//! A6 (operability — [`metrics`]): the pull-based metrics snapshot —
+//! `node --metrics-file PATH` appends one stable, greppable block
+//! (`#` header + `name value` counters: mesh frames/drops/reconnects/
+//! sessions, pool and store counts, A4 integrity warnings) every 15 s
+//! and once at shutdown. No HTTP endpoint, no push: a deployment wraps
+//! the file with its own exporter. Operator docs: `docs/runbook.md`.
+//!
+//! A7 (soak testing — the binary's `node --soak` /
+//! `spawn-demo --soak`): long-running end-to-end operation of a
+//! committee — continuous factory on the fault-tolerant
+//! [`pool::PoolManager::tick_tolerant`] loop (failed production ids
+//! DURABLY burned via [`persist::DiskPresigStore::burn`]), parent-driven
+//! jittered sign ticks, per-session fault injection, and
+//! kill/restart/rejoin cycles where the restarted node reloads its
+//! SEALED key share ([`persist::save_keyshare`] /
+//! [`persist::load_keyshare`]) instead of re-running keygen. Demo
+//! tooling (the one-process ceremony), not a new protocol mode.
+//!
 //! H2 is still NOT: crash recovery of finished rounds (the journal
 //! covers in-flight sessions only), reconnection of INCOMING
 //! connections (the dial side reconnects; the accept side just serves
@@ -220,11 +238,12 @@ pub mod store;
 // (`ohm_ecdsa_node::mesh`, `ohm_ecdsa_node::party::NodePayload`, …) is
 // unchanged — internal `crate::…` references resolve through these too.
 pub use net::{mesh, tls, transport, wire};
-pub use party::pool;
+pub use party::{metrics, pool};
 pub use setup::{ceremony, seed};
 pub use store::{locked, persist, seal};
 
 pub use mesh::Node;
+pub use metrics::MetricsReporter;
 pub use party::{Cheat, NodePayload, PartyNode};
 pub use persist::{Archive, AuditReport, BlameEvidence, DiskPresigStore, PersistError};
 pub use pool::{PoolConfig, PoolCounters, PoolManager, PoolStats};

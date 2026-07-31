@@ -46,7 +46,11 @@ mTLS layer). Milestones:
   fallback.
 * **M3b** — persistence + blame-token archiving (`src/store/persist.rs`): a
   durable, crash-safe single-use presignature store per node per key
-  (SPEC §8.6), an append-only transcript of every accepted signed
+  (SPEC §8.6) with A4 rollback DETECTION (a hash-chained mutation
+  journal verified at startup plus a cross-check against the sign
+  transcript — a store backup restored over an intact archive is
+  refused; prevention still needs state outside the directory, §13.3),
+  an append-only transcript of every accepted signed
   envelope (§4.7), blame-token files for the fault classes that leave
   cryptographic evidence on the wire (§10.2), and an offline `auditor`
   subcommand re-verifying a token against the committee's public keys
@@ -94,6 +98,12 @@ mTLS layer). Milestones:
   manager (`src/party/pool.rs`) keeping the durable store filled to a target
   level with per-record TTL expiry (§8.6(3) secure erase). Details
   below.
+* **A6** — operability (`src/party/metrics.rs`): a pull-based metrics
+  dump — `node --metrics-file PATH` appends a stable, greppable counter
+  block (mesh frames/drops/reconnects/sessions, pool + store counts, A4
+  integrity warnings) every 15 s and once at shutdown; no HTTP endpoint.
+  The operator-facing deployment guide is
+  [`../docs/runbook.md`](../docs/runbook.md).
 
 ## What M2/M3a is
 
@@ -213,7 +223,9 @@ child `DIR/node-i`) gets three artifacts, all in the core's canonical
   cleartext rejected — see H5 below) and carries a created-at timestamp
   for the pool manager's TTL expiry (`<id>.expired` tombstones, ids
   never re-issued). The presign driver persists every record it
-  produces; the sign driver consumes from the store.
+  produces; the sign driver consumes from the store. Every mutation is
+  additionally chained into `DIR/store/journal.log` (A4 — see the
+  rollback section below).
 * **Transcript archive (SPEC §4.7)** at `DIR/archive/transcript.log`:
   every ACCEPTED signed envelope appended as `u32 BE length ‖ canonical
   SignedEnvelope bytes`, fsync'd per entry. Append-only, deduped per
@@ -235,8 +247,51 @@ Durability model, honestly: this survives process kill and — on a
 cooperating filesystem/OS — machine crash at exactly the fsync points
 above. At-rest confidentiality reduces to the H5 storage key (wire it to
 a KMS in real deployments — `src/store/seal.rs` is the interface, not a KMS);
-it is not HSM-backed share storage, it does no wear leveling, and it
-does not defend against a malicious host rolling back the directory.
+it is not HSM-backed share storage and it does no wear leveling.
+
+### Rollback: crash-safe is not rollback-safe (A4)
+
+The tombstone discipline above makes the store **crash-safe**, but every
+artifact — records, tombstones — lives in one directory, so restoring an
+OLD BACKUP of that directory un-consumes records: the node would sign
+again with an already-spent presignature id, and two signatures under
+one nonce extract the long-term key `x`. True *prevention* needs state
+outside the rollback-able directory (an HSM monotonic counter, peer
+attestation) — that stays a deployment concern (SPEC §13.3). What A4
+implements is **detect-and-refuse**:
+
+* **Chained store journal** (`DIR/store/journal.log`): every mutation
+  (insert / consume / expire) is appended as one canonical-encoded entry
+  `(seq, op, id, prev_hash, payload_hash, entry_hash)`, fsync'd per
+  append, with `entry_hash = H(tag ‖ seq ‖ op ‖ id ‖ prev_hash ‖
+  payload_hash)` chaining each entry to its predecessor. At `open` the
+  journal is replayed and verified against the directory: chain links,
+  op transitions, and every journaled artifact present with matching
+  bytes. Crash windows (artifact fsync'd, journal append not) heal in
+  the safe direction; any other break — a tampered record, a deleted
+  tombstone, a rewritten journal — fails closed with
+  `PersistError::Integrity` naming the divergence point.
+* **Transcript cross-check (the actual rollback detector):** a consume
+  is independently evidenced in the append-only archive (every accepted
+  Sign-phase envelope names the presignature id it spends). At `open`
+  the store scans `DIR/archive/transcript.log`; an id evidenced as SPENT
+  there but LIVE in the store means the store was rolled back over an
+  intact archive — startup REFUSES, naming the id (`ROLLBACK DETECTED`).
+* **What A4 does NOT defend:** the journal and the transcript live in
+  the SAME rollback-able directory. A WHOLE-DIRECTORY restore (store AND
+  archive rolled back together, e.g. a full VM snapshot) is
+  self-consistent and therefore undetectable — startup prints a warning
+  saying integrity cannot be independently verified, and the node runs.
+  Shipping `transcript.log` off-box (or any state outside the directory)
+  is what turns detection into coverage; an HSM monotonic counter is
+  what turns it into prevention.
+* **Escape hatch (dev only):** `--allow-unverified-store` (or
+  `OHM_ALLOW_UNVERIFIED_STORE=1`) downgrades every refusal to a loud
+  warning. This is exactly the dangerous path — a rolled-back store will
+  happily sign twice with one id — and it exists so development can
+  snapshot/restore data dirs freely. A pre-A4 store (records but no
+  journal) is adopted into a fresh journal at open, with a warning that
+  its prior history is unverifiable.
 
 ## What M3c adds (optional mTLS)
 
@@ -442,12 +497,33 @@ and over time. It changes no protocol message and weakens no check.
   page-locked, erased on drop). The sealed format is versioned and
   purpose-bound (a renamed or repurposed file fails authentication);
   legacy CLEARTEXT files are rejected, fail closed, no silent downgrade.
-  Key resolution, in order: `OHM_STORAGE_KEY` (64 hex chars in the
+  Key resolution, in order (`StorageKeySource`, A5): `OHM_STORAGE_KEY_CMD`
+  (an external helper command printing the secret as hex on stdout — the
+  KMS/HSM plug-in point), `OHM_STORAGE_KEY` (64 hex chars in the
   environment), `OHM_STORAGE_KEY_FILE` (path of a hex key file), or a
   generated `storage.key` (`0600`) beside the secret material — the DEV
   default, loudly warned about. **This is the KMS/HSM integration
-  interface, not a KMS**: real deployments set the env var from their
-  secrets agent; key custody, rotation, and rollback defense stay
+  interface, not a KMS.**
+* **The KMS helper contract (A5).** `OHM_STORAGE_KEY_CMD` is split on
+  whitespace — simple tokenization, NOT a shell (no quoting, pipes,
+  redirects, or expansion) — e.g. `OHM_STORAGE_KEY_CMD="vault kv get
+  -field=hex secret/ohm/node1"`. The helper runs as the node's OS user
+  with the node's privileges (how it authenticates to the KMS is the
+  deployment's business; the plugin trust model is "the helper is as
+  trusted as the node binary itself"). Its stdout is SECRET: the node
+  reads it into memory and never logs it; stderr is inherited, so the
+  helper must keep the secret out of its own diagnostics. It must exit 0
+  within 5 s and print exactly the 32-byte secret as hex; a non-zero
+  exit, a timeout (the helper is killed), or malformed output is a HARD
+  error — fail closed, never a silent fallback to the generated dev key.
+  *Key rotation:* rotate the secret in the KMS and restart the node. The
+  AEAD key is derived from the secret (`SHA-256(tag ‖ secret)`), so
+  files sealed under the OLD key no longer open after rotation — a real
+  rotation must re-seal every secret file under the new key. That
+  re-sealing tooling (`rekey`) is **NOT built**: the store's A4 journal
+  hashes the sealed payloads, so a correct rekey must rewrite every
+  record AND extend the journal coherently — deferred, listed here as a
+  known limitation. Key custody, rotation, and rollback defense stay
   deployment concerns.
 * **File permissions.** Every secret file the node writes is `0600`
   (enforced even when the file pre-existed looser); readers warn loudly
@@ -481,6 +557,103 @@ and over time. It changes no protocol message and weakens no check.
     counts per node (`FACTORY target=… produced=… stored=… expired=…
     signed=…`).
 
+## What A6 adds (operability: the metrics dump)
+
+`node --metrics-file PATH` runs a background reporter
+(`src/party/metrics.rs`) that appends ONE snapshot block every 15 s and
+a final block at clean shutdown (drop). Format — a `#`-prefixed header
+line carrying the node id, committee, pid and uptime, then one
+`name value` pair per line; no ANSI, no timestamps in counter names;
+appended blocks are self-delimiting so a scraper reads the LAST block
+(cron + `tail` into any monitoring stack):
+
+```
+# ohm-ecdsa-node metrics node=2 committee=1,2,3 pid=22417 uptime_s=2
+tls_enabled 0
+frames_sent 1144
+frames_received 1144
+frames_dropped_bad_signature 0
+...
+sessions_active 0
+sessions_completed 49
+pool_target 2
+pool_stored 2
+pool_produced 5
+pool_expired 0
+store_live 2
+store_consumed 3
+store_expired 0
+store_integrity_warnings 0
+```
+
+Counters: the mesh's `MeshMetrics` (frames sent/received, drops per
+reason, reconnects, sessions completed — sessions are driver sessions;
+sub-sessions count individually) plus `sessions_active` (in-flight
+journaled sids), the acceptor-cap drops, and `equivocations` (§4.7 rule
+(3) F8 detections at this node's acceptor); the `pool_*` lines appear
+only when a pool manager runs (`--factory N`), the `store_*` lines only
+with a durable store (`--data-dir`), and `store_integrity_warnings` is
+the A4 startup verdict (nonzero ⇒ the store's integrity could not be
+fully verified — see the runbook §5/§6). **Pull-based by design: no
+HTTP endpoint, no push** — a production deployment wraps the file with
+its own exporter. `spawn-demo --metrics` gives each child
+`DIR/node-i/metrics.log`. Which counters to alert on and what they mean:
+[`../docs/runbook.md`](../docs/runbook.md) §5.
+
+## What A7 adds (soak testing — `--soak`)
+
+The "pilot topology in a box": `spawn-demo --soak SECS` runs a 2-of-3
+committee CONTINUOUSLY — long past the one-shot arc — to shake out the
+liveness, persistence, and leak issues the unit tests cannot see:
+
+```
+cargo run -p ohm-ecdsa-node -- spawn-demo --dir /tmp/soak --persist --metrics \
+    --soak 3600 --factory 4 --fault-rate 0.05 --restart-every 60 --seed 1
+```
+
+* **Continuous factory**: each node keeps its durable pool at
+  `--factory N` (the H5 pool manager on the FAULT-TOLERANT
+  `tick_tolerant` loop — a failed production session burns the id
+  DURABLY and retries, so an abort or a peer-down timeout fails one
+  session, not the pool; the durable burn is what keeps a retried
+  session from ever reusing a sid the wire may still hold).
+* **Periodic signing**: the demo parent drives jittered (~2–5 s) sign
+  ticks of a deterministic message sequence; every signature is
+  verified at the children AND the parent. Per-tick `SOAK-SIGN` lines,
+  per-interval per-node `SOAK-STATS` lines (signs ok/failed, pool
+  produced/stored/expired/failed, reconnects, equivocations, blames).
+* **Fault injection** (`--fault-rate P`): with probability P per tick
+  the parent arms ONE existing `Cheat` at a random node for one session
+  — `bad-sign-share` applies to that tick's sign (§10.4 robust combine
+  still delivers), `bad-open-share` / `bad-nonce-point` / `bad-deal:V`
+  arm a one-shot slot consumed by the next factory production (the
+  session aborts with consistent blame, the id is burned, production
+  continues). Blame must land ONLY on armed parties — the parent
+  cross-checks.
+* **Kill/restart cycles** (`--restart-every SECS`, requires
+  `--persist`): the parent drains every factory (the `DRAINED max_seen`
+  check proves the id spaces still agree), kills one child, restarts it
+  on its ORIGINAL address, and the node REJOINS by reloading its SEALED
+  key share (`<data-dir>/keyshare.sealed` — H5 AEAD at rest, written
+  once after the first keygen; same X, so the store stays valid). A
+  MESH-CHECK probe then proves the survivors' write-triggered H2
+  reconnect has healed before signs resume.
+* **Exit contract**: exit 0 iff `signs_failed == 0` AND no unarmed
+  party was ever blamed AND the end-of-soak A4 store audit (offline
+  store reopen: journal chain + transcript cross-check) passes at every
+  node AND every child shut down cleanly. `--soak 0` runs until killed
+  (killing the parent closes the children's stdin — they take the H2
+  clean-shutdown path). Every randomized choice (jitter, faults,
+  victims) comes from `--seed`, so a failure reproduces.
+
+The soak is DEMO tooling (same one-process ceremony as `spawn-demo`),
+not a new protocol mode; the one new piece of node machinery it uses is
+the sealed key-share reload — documented honestly: that file IS the
+long-term key at rest, it gets exactly the H5 treatment (AEAD under the
+node's storage key, `0600`), and reloading it to rejoin a committee is
+a demo convenience, not production crash recovery (see the "still NOT"
+section below).
+
 ## What M3b/M3c/H2/H4/H5 is still NOT
 
 * **Not everything is robust.** TLS handshake faults, connection-level
@@ -496,14 +669,18 @@ and over time. It changes no protocol message and weakens no check.
 * **No crash recovery of finished rounds**, no reconnection of incoming
   connections (the dial side heals the mesh), no SIGINT handler (std
   has no signal API — a deployment wraps `Node::shutdown`), no
-  reconnection of a node that fully RESTARTS (a restarted node re-binds
-  and the peers' reconnectors re-dial it only if it keeps its address —
-  rejoining a committee after a full restart is out of scope).
+  reconnection of a node that fully RESTARTS into a committee in the
+  general case (the A7 soak demo reloads a SEALED key share to rejoin —
+  demo tooling with the key at rest under the node's storage key, not
+  production crash recovery).
 * **H5 is an interface, not a vault.** The storage-key resolution is
   where a KMS/HSM plugs in — no KMS is implemented; key custody and
   rotation are ops. `mlock` is fail-open (a warning, not a guarantee).
-  There is NO rollback defense (a malicious host restoring deleted
-  sealed files or replaying an old store directory), no wear leveling
+  Rollback is DETECTED, not prevented (A4 — see the M3b section above):
+  the store journal + transcript cross-check refuses a store backup
+  restored over an intact archive, but a whole-directory restore remains
+  undetectable without state outside the directory (HSM monotonic
+  counter, peer attestation — SPEC §13.3). No wear leveling
   (filesystem block reuse is not guaranteed — "secure erase" means
   removed from service), and side channels (timing, cache, swap beyond
   the locked pages) remain out of scope. Pool expiry skew across nodes
@@ -596,6 +773,7 @@ cargo run -p ohm-ecdsa-node -- spawn-demo --tls     # M3c: the full arc over mTL
 cargo run -p ohm-ecdsa-node -- spawn-demo --ki      # §8.7: keygen → KEY-FREE pool record → 2-round KI sign
 cargo run -p ohm-ecdsa-node -- spawn-demo --factory 2  # H2/H5: pool manager (durable store) + 3 concurrent signatures
 cargo run -p ohm-ecdsa-node -- spawn-demo --factory 2 --pool-ttl 600   # + §8.6(3) TTL expiry (erased, never served)
+cargo run -p ohm-ecdsa-node -- spawn-demo --metrics   # A6: per-child metrics.log under DIR/node-i/
 cargo run -p ohm-ecdsa-node -- spawn-demo --restart    # H4: §10.4 robust + §10.3 expel-and-restart drivers
 cargo run -p ohm-ecdsa-node -- spawn-demo --restart --cheat-node 2 --cheat bad-open-share
 #   → the cheater is named by every process AND the presign + signature still complete
@@ -782,6 +960,14 @@ cargo test -p ohm-ecdsa-node
   allocation above the persisted max; and a legacy v1 SEALED record
   (pre-TTL format) is accepted with the file-mtime fallback, stays
   consumable, and expires under a TTL like any other record.
+* `node/tests/metrics.rs` (A6, 2 tests, thread-level): a 3-node full arc
+  with durable stores, then a snapshot per node — every documented
+  counter present with a sane value (`frames_sent`/`frames_received` >
+  0, `sessions_completed` ≥ 3, `store_consumed` 1), the format parsed
+  line-by-line (`#` header + `name value` pairs), and two appended
+  blocks round-tripping through the file; plus the `MetricsReporter`
+  (`node --metrics-file`) appending interval blocks and exactly one
+  final block on drop.
 
 ## Layout
 
@@ -795,16 +981,17 @@ unchanged by the layering.
 | Module | Role |
 |---|---|
 | `src/net/wire.rs` | `WireMessage<M>` (original / signed echo), canonical framing, signature validation — generic over the payload; H2 `FrameBound` (per-variant frame size bounds derived from protocol message sizes) |
-| `src/net/mesh.rs` | `Node<M>`: listener + full-mesh connections + reader threads, first-echo rule, verified-only bounded mailbox, self-echo loopback (M2 per-node acceptor), config-driven send delay (benchmarks), optional M3c mTLS wrapping (`bind_tls`); H2: `ReconnectConfig` + per-session send journal with reconnect re-sync, `Node::shutdown` (join-with-deadline, also on `Drop`), write/handshake timeouts, per-connection rate window, listener accept-rate window, mTLS handshake concurrency cap, `MeshMetrics` drop counters |
+| `src/net/mesh.rs` | `Node<M>`: listener + full-mesh connections + reader threads, first-echo rule, verified-only bounded mailbox, self-echo loopback (M2 per-node acceptor), config-driven send delay (benchmarks), optional M3c mTLS wrapping (`bind_tls`); H2: `ReconnectConfig` + per-session send journal with reconnect re-sync, `Node::shutdown` (join-with-deadline, also on `Drop`), write/handshake timeouts, per-connection rate window, listener accept-rate window, mTLS handshake concurrency cap, `MeshMetrics` frame/drop/session counters |
 | `src/net/tls.rs` | M3c: `CommitteeTls` (own cert/key + the pinned committee cert set), committee-pinned TLS 1.3 client/server configs and blocking handshakes (rustls + ring) under the H2 `HANDSHAKE_TIMEOUT` (socket-timeout strategy), rcgen cert generation for tests/demos, the PEM file layout (`party-<id>.crt.pem` / `.key.pem`) |
 | `src/net/transport.rs` | `MeshTransport` (M1): echo-broadcast acceptor + the core `Transport` trait impl over `DkgMessage` (+ the M1 family's H2 `FrameBound` impl) |
 | `src/party/party.rs` | `PartyNode` + `NodePayload` (M2/M3a): per-node keygen driver with §6.1 complaints/defenses on the wire (factored as `joint_vss` + the wire complaint subprotocol), per-node §7.2 triple and §8 presign drivers (the M3a offline factory), per-node §9/§10.4 sign driver, per-node §8.7 KI drivers (`presign_ki` — P1–P3 verbatim, P4 omitted — and the 2-round `sign_ki`, plus the in-memory key-free pool wrappers `presign_ki_pooled` / `sign_ki_pooled`), per-node echo-broadcast acceptor, `Cheat` fault injection; M3b store/archive wiring (`presign_stored`, `sign_stored`, `store_offer`); M3c `bind_with_tls`; H2: the collector thread + condvar acceptor (MULTIPLE concurrent sessions demultiplexed by sid), acceptor-level caps (distinct-sid, per-slot equivocation), per-session journal retirement, `PartyNode::shutdown`, `metrics`/`set_reconnect`/`debug_drop_outgoing`; H4: the OPT-IN §10.4-robust drivers (`presign_robust`, `triple_robust` with the `ReshareRequests`/`ReshareSupply` reconstruction rounds, `sign_ki_robust`) and the §10.3 expel-and-restart wrappers (`keygen_with_restart`, `presign_with_restart` + `sign_over`/`sign_stored_over` over the surviving committee, original ids, poisoned sid/id, zero-slack refusal) — every driver is committee-aware (`*_over` id sets) so restart sessions run over survivors |
 | `src/party/pool.rs` | H5 (§8.6): `PoolManager` — the per-node pool maintenance layer over the durable store: refill-to-target (single writer; signing only consumes), per-record TTL expiry with secure erase (§8.6(3), injectable clock), crash/restart discipline (ids re-seeded from the persisted max, insert dedup — never over-produces), `PoolConfig`/`PoolStats`/`PoolCounters` |
+| `src/party/metrics.rs` | A6: the pull-based metrics snapshot — `snapshot` renders one greppable block (`#` header + `name value` counters: mesh frames/drops/reconnects/sessions, pool + store counts, A4 integrity warnings), `MetricsReporter` appends it every 15 s and once on drop (`node --metrics-file`); no HTTP endpoint |
 | `src/setup/seed.rs` | the DEMO-ONLY one-process ceremony + seed/committee files (the `--seeded` fallback for presignature distribution; transport keys come from the seed files in that mode) |
 | `src/setup/ceremony.rs` | H3: the DISTRIBUTED committee ceremony — the standard setup path: per-party `init` (own keypair + M3c cert on its own machine; SECRET `party-<id>.identity`, PUBLIC `party-<id>.pub` with id/verifying key/addr hint/cert), short hex `fingerprint` for out-of-band verification, and the PUBLIC `assemble` (validates bundles — ids exactly `1..=n`, uniform TLS posture — and writes the unchanged `committee.hex` format + the pinned cert set; committee `x` is the identity point: no ceremony key) |
 | `src/store/persist.rs` | M3b: `DiskPresigStore` (§8.6 durable single-use store, write-tmp-rename + fsync, consume tombstone fsync'd before the record is handed out; H5: sealed records with the versioned v2 payload — created-at stamp for the pool TTL — `<id>.expired` tombstones burning expired ids forever, legacy v1 sealed records accepted with the mtime fallback, legacy cleartext rejected), `Archive` (§4.7 accepted-envelope transcript + `aborts.log`), `BlameEvidence` token files (F2 dealt-share, F6 sign-share; other classes `token: none`), `audit_token` offline verifier (§A.4) |
 | `src/store/locked.rs` | H5 (§13.3): `LockedSecret<T>` / `LockedBytes` — page-locked (`mlock`) wrappers for long-lived secrets at the node boundary (key shares, transport key, pooled records, the storage key); FAIL-OPEN with a loud WARNING when the OS refuses wiring (the only fail-open path in H5) |
-| `src/store/seal.rs` | H5 (§8.6(2)): `StorageKey` — ChaCha20-Poly1305 AEAD at rest for every secret file (versioned + purpose-bound sealed format, legacy cleartext rejected fail-closed), storage-secret resolution (`OHM_STORAGE_KEY` / `OHM_STORAGE_KEY_FILE` / generated `0600` dev key — the KMS interface, not a KMS), `0600` enforcement + looseness warnings |
-| `src/lib.rs` | crate docs (M1–M3c, §8.7, H2–H5) + the four layer modules with flat re-exports preserving every pre-layering public path |
-| `src/main.rs` | `node` / `setup` (DEMO-ONLY) / `init` / `assemble` / `spawn-demo` (DEMO-ONLY) / `auditor` / `m1-demo` subcommands (`--tls` on `setup`/`init`/`node`/`spawn-demo` for M3c, `--ki` on `node`/`spawn-demo` for the §8.7 KI arc, `--factory N` + `--pool-ttl SECS` on `node`/`spawn-demo` for the H2/H5 concurrent-sessions pool-manager demo, `--restart` on `node`/`spawn-demo` for the H4 §10.4-robust + §10.3-restart arc, `--identity` on `node` for the H3 distributed ceremony; a node fails closed at startup when its own key/cert does not match the committee registry/pins) |
+| `src/store/seal.rs` | H5 (§8.6(2), §13.3): `StorageKey` — ChaCha20-Poly1305 AEAD at rest for every secret file (versioned + purpose-bound sealed format, legacy cleartext rejected fail-closed), `StorageKeySource` (A5 — the storage-secret source abstraction: `OHM_STORAGE_KEY_CMD` helper command → `OHM_STORAGE_KEY` → `OHM_STORAGE_KEY_FILE` → generated `0600` dev key; the KMS/HSM interface, not a KMS; a configured-but-failing source fails closed, never silently generates), `0600` enforcement + looseness warnings |
+| `src/lib.rs` | crate docs (M1–M3c, §8.7, H2–H5, A6) + the four layer modules with flat re-exports preserving every pre-layering public path |
+| `src/main.rs` | `node` / `setup` (DEMO-ONLY) / `init` / `assemble` / `spawn-demo` (DEMO-ONLY) / `auditor` / `m1-demo` subcommands (`--tls` on `setup`/`init`/`node`/`spawn-demo` for M3c, `--ki` on `node`/`spawn-demo` for the §8.7 KI arc, `--factory N` + `--pool-ttl SECS` on `node`/`spawn-demo` for the H2/H5 concurrent-sessions pool-manager demo, `--restart` on `node`/`spawn-demo` for the H4 §10.4-robust + §10.3-restart arc, `--identity` on `node` for the H3 distributed ceremony, `--metrics-file PATH` on `node` / `--metrics` on `spawn-demo` for the A6 metrics dump; a node fails closed at startup when its own key/cert does not match the committee registry/pins) |
 | `examples/mesh_perf.rs` | the latency benchmark described above |

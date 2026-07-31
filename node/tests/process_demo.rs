@@ -784,3 +784,107 @@ fn process_ceremony_node_fails_closed_on_tampered_pub() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// --- A7: soak testing (spawn-demo --soak) ---
+
+#[test]
+fn process_demo_soak_fault_injection() {
+    // A7: a 20 s soak — continuous factory (target 2) plus parent-driven
+    // jittered sign ticks — with per-session fault injection (one armed
+    // cheat per tick with p = 0.9: bad sign share / bad open share /
+    // bad nonce point / bad deal). Every sign still delivers and
+    // verifies (a bad sign share is filtered by the §10.4 robust
+    // combine; presign-phase faults abort ONE factory session, the id
+    // is burned, production continues), and blame lands ONLY on armed
+    // parties (`honest_blamed=false` is part of the exit-0 contract).
+    let out = run_spawn_demo(&[
+        "--soak",
+        "20",
+        "--factory",
+        "2",
+        "--fault-rate",
+        "0.9",
+        "--seed",
+        "5",
+        "--soak-stats-every",
+        "5",
+        "--restart-every",
+        "0",
+    ]);
+    assert!(
+        out.contains("RESULT keygen: all 3 processes agree on X "),
+        "stdout:\n{out}"
+    );
+    assert!(out.contains("SOAK-FAULT seq="), "stdout:\n{out}");
+    assert!(out.contains("BLAME "), "stdout:\n{out}");
+    assert!(out.contains("SOAK-STATS node=1"), "stdout:\n{out}");
+    assert!(out.contains("SOAK-SIGN seq=1 ok=true"), "stdout:\n{out}");
+    assert!(
+        out.contains("RESULT soak: signs_ok=") && out.contains("signs_failed=0"),
+        "stdout:\n{out}"
+    );
+    assert!(out.contains("honest_blamed=false"), "stdout:\n{out}");
+    assert!(out.contains("RESULT demo: SUCCESS"), "stdout:\n{out}");
+}
+
+#[test]
+fn process_demo_soak_node_restart() {
+    // A7: a 30 s soak with --persist and kill/restart/rejoin cycles:
+    // the cycled node reloads its SEALED key share (same X — the
+    // committee does not fork), the survivors' H2 reconnection
+    // re-establishes the mesh (reconnects >= 1), signs continue after
+    // the rejoin, and the end-of-soak A4 store audit (journal chain +
+    // sign-transcript cross-check at `open`) passes at every node.
+    let dir = tmpdir("soak-restart");
+    let out = run_spawn_demo(&[
+        "--dir",
+        dir.to_str().unwrap(),
+        "--soak",
+        "30",
+        "--factory",
+        "2",
+        "--persist",
+        "--restart-every",
+        "10",
+        "--seed",
+        "11",
+        "--soak-stats-every",
+        "5",
+    ]);
+    assert!(out.contains("SOAK-RESTART node="), "stdout:\n{out}");
+    // Signs continue AFTER the restarted node rejoins.
+    let rejoined = out
+        .find("rejoined; signs resume")
+        .expect("the restart cycle completed");
+    let after = &out[rejoined..];
+    assert!(
+        after
+            .lines()
+            .any(|l| l.starts_with("SOAK-SIGN seq=") && l.contains("ok=true")),
+        "no successful sign after the rejoin:\n{after}"
+    );
+    for id in 1..=3usize {
+        assert!(
+            out.contains(&format!("SOAK-STORE node={id}")) && out.contains("integrity=ok"),
+            "stdout:\n{out}"
+        );
+        // The rejoin path: a sealed key share per node (SPEC §13.3/H5
+        // at-rest treatment).
+        assert!(dir.join(format!("node-{id}/keyshare.sealed")).exists());
+    }
+    // The survivors reconnected to the cycled node at least once.
+    assert!(
+        out.lines().any(|l| l.contains("SOAK-SUMMARY node=")
+            && l.split_whitespace().any(|kv| kv
+                .strip_prefix("reconnects=")
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some_and(|n| n >= 1))),
+        "no survivor reported a reconnect:\n{out}"
+    );
+    assert!(
+        out.contains("RESULT soak: signs_ok=") && out.contains("signs_failed=0"),
+        "stdout:\n{out}"
+    );
+    assert!(out.contains("RESULT demo: SUCCESS"), "stdout:\n{out}");
+    std::fs::remove_dir_all(&dir).ok();
+}

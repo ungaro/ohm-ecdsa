@@ -22,14 +22,27 @@
 //! [`combine_robust`] / [`combine_ki_robust`] are the §10.4 blame-and-
 //! continue variants: bad shares are filtered and blamed, and the
 //! signature is interpolated from the first `t` valid shares.
+//!
+//! [`rerand_gamma`] / [`sign_share_rerand`] / [`combine_rerand`] are the
+//! **EXPERIMENTAL** multiplicative re-randomization CANDIDATE (SPEC §9.4:
+//! `k′ = γk` with `γ = H(sid ‖ id ‖ M ‖ τ ‖ X)`, the only
+//! inverse-compatible mitigation direction for the GS21 cube-root attack,
+//! since additive `k′ = k + δ` has no local formula in `[u] = [k⁻¹]`
+//! shares). Every step is a local scalar scaling; commitments scale by the
+//! same public factors, so every point-equality check survives unchanged
+//! and the online phase stays one round. **The security lemma is OPEN
+//! (SPEC §11.3(8)) — this API exists for analysis and testing only, is
+//! off by default, and is not for production use.**
 
-use k256::Scalar;
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::{AffinePoint, ProjectivePoint, Scalar};
+use sha2::{Digest, Sha256};
 
 use crate::presign::{KiPresignature, Presignature};
 use crate::shamir::{interpolate_at, interpolate_at_zero};
 use crate::triples::{TriplePublic, TripleShare};
 use crate::vss::FeldmanCommitment;
-use crate::{Error, IdentifiableAbort, Params, PartyId, Phase, Result};
+use crate::{scalar_from_digest, tags, Error, IdentifiableAbort, Params, PartyId, Phase, Result};
 
 /// A broadcast signature share.
 #[derive(Clone, Debug)]
@@ -120,6 +133,137 @@ fn combine_verified(
         return Ok((r, interpolate_at_zero(&valid_parties, &valid_shares)));
     }
     Ok((r, interpolate_at(point, &valid_parties, &valid_shares)))
+}
+
+// --- EXPERIMENTAL multiplicative re-randomization (SPEC §9.4 candidate) --
+//
+// **EXPERIMENTAL — candidate mitigation, security lemma open (SPEC
+// §11.3(8)); not for production use.** Everything in this section is off
+// by default: nothing in the standard signing path calls it.
+
+/// **EXPERIMENTAL — candidate mitigation, security lemma open (SPEC
+/// §11.3(8)); not for production use.**
+///
+/// The re-randomization factor `γ = H(sid ‖ id ‖ M ‖ τ ‖ X)` (SPEC §9.4
+/// candidate), domain-separated under [`tags::RERAND_GAMMA`] with
+/// length-prefixed variable-length fields (sid) and fixed-width encodings
+/// elsewhere (canonical 32-byte scalars, compressed SEC1 point).
+///
+/// `γ` must be nonzero for `k′ = γk` to be a re-randomization at all: the
+/// hash reduces to zero with probability `~2⁻²⁵⁶` per attempt — negligible
+/// but real — so a zero digest is re-hashed with an incremented counter
+/// byte (the counter is part of the hash input, starting at 0).
+pub fn rerand_gamma(
+    sid: &[u8],
+    id: u64,
+    m: &Scalar,
+    tweak: Option<&Scalar>,
+    x_point: &AffinePoint,
+) -> Scalar {
+    let mut counter = 0u8;
+    loop {
+        let mut h = Sha256::new();
+        h.update(tags::RERAND_GAMMA);
+        h.update([counter]);
+        h.update((sid.len() as u64).to_be_bytes());
+        h.update(sid);
+        h.update(id.to_be_bytes());
+        h.update(m.to_bytes());
+        match tweak {
+            Some(tau) => {
+                h.update([1u8]);
+                h.update(tau.to_bytes());
+            }
+            None => h.update([0u8]),
+        }
+        h.update(x_point.to_encoded_point(true).as_bytes());
+        let gamma = scalar_from_digest(&h.finalize());
+        if gamma != Scalar::ZERO {
+            return gamma;
+        }
+        counter = counter.wrapping_add(1);
+    }
+}
+
+/// `γ⁻¹` and `r′ = F(γ·R)` for a re-randomized signing session (F is the
+/// SPEC §8 x-coordinate mapping, as in presign). Panics if `gamma` is zero
+/// — [`rerand_gamma`] never returns zero.
+fn rerand_factors(big_r: &AffinePoint, gamma: &Scalar) -> (Scalar, Scalar) {
+    let gamma_inv = Option::<Scalar>::from(gamma.invert())
+        .expect("rerand gamma must be nonzero (rerand_gamma guarantees this)");
+    let r_prime_point = (ProjectivePoint::from(*big_r) * gamma).to_affine();
+    let encoded = r_prime_point.to_encoded_point(false);
+    let r_prime = scalar_from_digest(encoded.x().expect("uncompressed point has x"));
+    (gamma_inv, r_prime)
+}
+
+/// **EXPERIMENTAL — candidate mitigation, security lemma open (SPEC
+/// §11.3(8)); not for production use.**
+///
+/// Local re-randomized signature share (SPEC §9.4 candidate): with
+/// `r′ = F(γ·R)`,
+///
+/// * `u′_j = γ⁻¹·u_j`,
+/// * `z′_j = γ⁻¹·(z_j + τ·u_j)` when a tweak `τ` is present (the §9.4
+///   additive child-key update folded into the scaling — equivalent to
+///   [`Presignature::apply_tweak`] followed by the `γ⁻¹` scaling), else
+///   `z′_j = γ⁻¹·z_j`,
+/// * `s_j = m·u′_j + r′·z′_j`.
+///
+/// All local scalar scalings; no interaction. `r′ = 0` is possible with
+/// negligible probability (`γ` is RO-derived); it surfaces as a
+/// `Signature::from_scalars` failure at the caller, as `r = 0` does in
+/// the standard path.
+pub fn sign_share_rerand(
+    presig: &Presignature,
+    m: &Scalar,
+    gamma: &Scalar,
+    tweak: Option<&Scalar>,
+) -> SignShare {
+    let (gamma_inv, r_prime) = rerand_factors(&presig.big_r, gamma);
+    let u_prime = gamma_inv * presig.u_share;
+    let z_prime = match tweak {
+        Some(tau) => gamma_inv * (presig.z_share + *tau * presig.u_share),
+        None => gamma_inv * presig.z_share,
+    };
+    SignShare {
+        from: presig.index,
+        s: *m * u_prime + r_prime * z_prime,
+    }
+}
+
+/// **EXPERIMENTAL — candidate mitigation, security lemma open (SPEC
+/// §11.3(8)); not for production use.**
+///
+/// Verified combine for re-randomized signing (SPEC §9.4 candidate):
+/// identical blame semantics to [`combine`] — every share is verified by
+/// point equality against `m·A[u′] + r′·A[z′]`, a failure is
+/// `Error::Abort` blaming the sender — where the commitments scale by the
+/// same PUBLIC factors as the shares:
+///
+/// * `A[u′] = γ⁻¹·A[u]`,
+/// * `A[z′] = γ⁻¹·(A[z] + τ·A[u])` with a tweak, else `γ⁻¹·A[z]`.
+///
+/// The scaled commitment check is NOT optional: it is what keeps
+/// identifiable abort intact under re-randomization. Returns `(r′, s)`
+/// with `r′ = F(γ·R)`. `meta` is any party's presignature record (the
+/// commitments are identical across parties).
+pub fn combine_rerand(
+    params: &Params,
+    meta: &Presignature,
+    m: &Scalar,
+    gamma: &Scalar,
+    tweak: Option<&Scalar>,
+    shares: &[SignShare],
+) -> Result<(Scalar, Scalar)> {
+    let (gamma_inv, r_prime) = rerand_factors(&meta.big_r, gamma);
+    let u_prime_com = meta.u_com.scale(&gamma_inv);
+    let z_prime_com = match tweak {
+        Some(tau) => meta.z_com.add(&meta.u_com.scale(tau)).scale(&gamma_inv),
+        None => meta.z_com.scale(&gamma_inv),
+    };
+    let s_com = u_prime_com.scale(m).add(&z_prime_com.scale(&r_prime));
+    combine_verified(params.t, &Scalar::ZERO, r_prime, &s_com, shares)
 }
 
 // --- Key-independent online signing (SPEC §8.7) ---------------------------

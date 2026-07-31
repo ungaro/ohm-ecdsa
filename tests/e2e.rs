@@ -11,12 +11,14 @@ use ohm_ecdsa::open::open;
 use ohm_ecdsa::presign::{self, KeyShare, PresignTamper};
 use ohm_ecdsa::refresh::ReshareTamper;
 use ohm_ecdsa::shamir::{interpolate_at, slot_point};
-use ohm_ecdsa::sign::KiSignTamper;
+use ohm_ecdsa::sign::{self, KiSignTamper};
 use ohm_ecdsa::sim;
 use ohm_ecdsa::transport::{self, SimTransport};
 use ohm_ecdsa::triples::{self, TripleShare, TripleTamper};
 use ohm_ecdsa::vss::FeldmanCommitment;
-use ohm_ecdsa::{Committee, Error, KiPool, Params, PartyId, Phase, PresigStore};
+use ohm_ecdsa::{
+    scalar_from_digest, Committee, Error, KiPool, Params, PartyId, Phase, PresigStore,
+};
 
 fn pubkey(keys: &[KeyShare]) -> ProjectivePoint {
     keys[0].com.points[0]
@@ -106,6 +108,114 @@ fn hd_tweak_derivation() {
     let sig = sim::run_sign(&params, &presigs, msg, None).unwrap();
     let x_child = pubkey(&keys) + ProjectivePoint::GENERATOR * tau;
     assert_valid(&x_child, msg, &sig);
+}
+
+// --- EXPERIMENTAL multiplicative re-randomization (SPEC §9.4 candidate,
+// §11.3(8) open lemma) ---------------------------------------------------
+
+#[test]
+fn rerand_signature_verifies() {
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 60);
+    let keys = sim::run_keygen(&params, b"key/60", &mut rngs).unwrap();
+    let presigs = sim::run_presign(&params, &keys, 1, &mut rngs, None).unwrap();
+    let msg = b"re-randomized signature (experimental)";
+    let sid = b"rerand-sid/60";
+    let x = pubkey(&keys);
+    let sig =
+        sim::run_sign_rerand(&params, &presigs, msg, None, sid, &x.to_affine(), None).unwrap();
+    assert_valid(&x, msg, &sig);
+    // r′ = F(γ·R), checked against an independent recomputation.
+    let m = sim::message_scalar(msg);
+    let gamma = sign::rerand_gamma(sid, 1, &m, None, &x.to_affine());
+    let r_prime_point = (presigs[0].big_r * gamma).to_affine();
+    let encoded = r_prime_point.to_encoded_point(false);
+    let r_prime = scalar_from_digest(encoded.x().unwrap());
+    assert_eq!(sig.r().to_bytes(), r_prime.to_bytes());
+    // The re-randomized signature differs from the standard one on the
+    // same presig/message (γ ≠ 1 overwhelmingly).
+    let plain = sim::run_sign(&params, &presigs, msg, None).unwrap();
+    assert_ne!(sig.to_bytes(), plain.to_bytes());
+}
+
+#[test]
+fn rerand_with_tweak_verifies_under_child_key() {
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 61);
+    let keys = sim::run_keygen(&params, b"key/61", &mut rngs).unwrap();
+    let presigs = sim::run_presign(&params, &keys, 1, &mut rngs, None).unwrap();
+    // BIP32-style additive tweak: x′ = x + τ, with z′ = γ⁻¹(z + τ·u) — the
+    // §9.4 apply_tweak update folded into the γ⁻¹ scaling (combined
+    // formula, matching the sign_share_rerand doc).
+    let tau = Scalar::from(999u64);
+    let msg = b"re-randomized child-key signature (experimental)";
+    let sig = sim::run_sign_rerand(
+        &params,
+        &presigs,
+        msg,
+        Some(tau),
+        b"rerand-sid/61",
+        &pubkey(&keys).to_affine(),
+        None,
+    )
+    .unwrap();
+    let x_child = pubkey(&keys) + ProjectivePoint::GENERATOR * tau;
+    assert_valid(&x_child, msg, &sig);
+}
+
+#[test]
+fn rerand_share_commitment_check_catches_cheater() {
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 62);
+    let keys = sim::run_keygen(&params, b"key/62", &mut rngs).unwrap();
+    let presigs = sim::run_presign(&params, &keys, 1, &mut rngs, None).unwrap();
+    // Party 2 broadcasts a garbage share; the SCALED commitment check
+    // (m·A[u′] + r′·A[z′]) must still reject it and blame the sender.
+    let err = sim::run_sign_rerand(
+        &params,
+        &presigs,
+        b"m",
+        None,
+        b"rerand-sid/62",
+        &pubkey(&keys).to_affine(),
+        Some((2, Scalar::from(0xdeadu64))),
+    )
+    .unwrap_err();
+    match err {
+        Error::Abort { abort } => {
+            assert_eq!(abort.phase, Phase::Sign);
+            assert_eq!(abort.blamed, vec![2]);
+        }
+        other => panic!("expected identifiable abort, got {other:?}"),
+    }
+}
+
+#[test]
+fn rerand_gamma_is_deterministic_and_domain_separated() {
+    let x = (ProjectivePoint::GENERATOR * Scalar::from(7u64)).to_affine();
+    let m = Scalar::from(42u64);
+    let tau = Scalar::from(9u64);
+    let gamma = sign::rerand_gamma(b"sid", 1, &m, Some(&tau), &x);
+    assert_eq!(gamma, sign::rerand_gamma(b"sid", 1, &m, Some(&tau), &x));
+    assert_ne!(gamma, Scalar::ZERO);
+    // Every input field domain-separates the output.
+    assert_ne!(gamma, sign::rerand_gamma(b"sid2", 1, &m, Some(&tau), &x));
+    assert_ne!(gamma, sign::rerand_gamma(b"sid", 2, &m, Some(&tau), &x));
+    assert_ne!(
+        gamma,
+        sign::rerand_gamma(b"sid", 1, &Scalar::from(43u64), Some(&tau), &x)
+    );
+    assert_ne!(gamma, sign::rerand_gamma(b"sid", 1, &m, None, &x));
+    assert_ne!(
+        gamma,
+        sign::rerand_gamma(b"sid", 1, &m, Some(&Scalar::from(10u64)), &x)
+    );
+    let x2 = (ProjectivePoint::GENERATOR * Scalar::from(8u64)).to_affine();
+    assert_ne!(gamma, sign::rerand_gamma(b"sid", 1, &m, Some(&tau), &x2));
+    // The zero-rejection counter path is NOT exercised here: a zero digest
+    // occurs with probability ~2^-256 per attempt, so no test input can
+    // reach it; it exists by construction (counter byte in the hash input)
+    // and is documented on `rerand_gamma`.
 }
 
 #[test]

@@ -449,6 +449,7 @@ out-of-band bundle exchange itself (ops, not code), key rotation
 * Patent design-around analysis → SPEC §12
 * Deployment, transport, and hardening checklists → SPEC §13
 * Deployment topologies (who holds which share, blame-token evidence flow, storage duties) → SPEC Appendix A
+* Operator runbook (ceremony, running a node, pools, monitoring, incident response, backup/upgrade, security checklist) → `docs/runbook.md`
 * References (GJKR96, Beaver, Groth–Shoup, DJNPO20, KU24, …) → SPEC §14
 * Contributor conventions (and guidance for AI agents) → `AGENTS.md`
 

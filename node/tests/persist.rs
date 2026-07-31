@@ -3,7 +3,16 @@
 //! Coverage: the durable presignature store (SPEC §8.6 — survives
 //! drop/reopen, a consumed id stays consumed across a simulated crash,
 //! duplicate inserts rejected, wrong-key reopen rejected, stray `.tmp`
-//! files dropped), the transcript archive (§4.7 accepted sets,
+//! files dropped), the A4 store journal and rollback detection (§13.3 —
+//! every mutation chained in `journal.log`; a tampered record, a deleted
+//! tombstone, or a tampered/truncated journal fails `open` with
+//! `PersistError::Integrity`; a crash between a tombstone fsync and the
+//! journal append heals in the safe direction; a store backup restored
+//! over an intact transcript archive is REFUSED as a detected rollback
+//! naming the spent id, downgraded to a loud warning by the
+//! `--allow-unverified-store` dev escape hatch; a whole-directory
+//! rollback stays undetectable — startup warns, the residual risk is
+//! demonstrated), the transcript archive (§4.7 accepted sets,
 //! dedup + decode), the blame-token archive and OFFLINE auditor (§10.2,
 //! §A.4 — F2 dealt-share and F6 sign-share tokens verify, a tampered
 //! token is rejected), and crash-recovery integration: a node signs
@@ -13,19 +22,20 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
-use k256::{AffinePoint, ProjectivePoint, SecretKey};
+use k256::{AffinePoint, ProjectivePoint, Scalar, SecretKey};
 use ohm_ecdsa::presign::Presignature;
 use ohm_ecdsa::sim;
 use ohm_ecdsa::transport::{Encode, Envelope, SignedEnvelope};
 use ohm_ecdsa::{session_id, Error, Params, PartyId, Phase};
 use ohm_ecdsa_node::persist::{
-    audit_token, read_transcript, Archive, DiskPresigStore, PersistError,
+    audit_token, load_keyshare, read_transcript, save_keyshare, Archive, DiskPresigStore,
+    PersistError,
 };
 use ohm_ecdsa_node::seal::StorageKey;
 use ohm_ecdsa_node::{Cheat, NodePayload, PartyNode};
@@ -59,10 +69,16 @@ fn tmpdir(name: &str) -> PathBuf {
 /// One ceremony-style presignature record (id 0) plus the joint key it
 /// is bound to, produced by the core's deterministic sim.
 fn test_presig() -> (Presignature, AffinePoint) {
+    test_presig_id(0)
+}
+
+/// [`test_presig`] with an explicit presignature id (the store does not
+/// validate the record cryptographically — any id works).
+fn test_presig_id(id: u64) -> (Presignature, AffinePoint) {
     let params = Params::new(3, 2).unwrap();
     let mut rngs = sim::make_rngs(3, 7);
     let keys = sim::run_keygen(&params, b"ohm-ecdsa-node/persist-test/keygen", &mut rngs).unwrap();
-    let presigs = sim::run_presign(&params, &keys, 0, &mut rngs, None).unwrap();
+    let presigs = sim::run_presign(&params, &keys, id, &mut rngs, None).unwrap();
     let first = presigs.into_iter().next().expect("one record per party");
     (first, keys[0].com.points[0].to_affine())
 }
@@ -84,6 +100,75 @@ fn disk_store_survives_reopen() {
     assert_eq!(back.id, presig.id);
     assert_eq!(back.r, presig.r);
     assert_eq!(back.u_share, presig.u_share);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn disk_store_burn_never_inserted_id() {
+    // A7: `burn` durably tombstones an id whose PRODUCTION session
+    // failed (the fault-tolerant pool loop): the id is covered by
+    // `max_seen_id` (a restarted manager never re-issues it), re-insert
+    // is rejected, the tombstone survives a reopen, and burning an id
+    // that already has state is refused.
+    let dir = tmpdir("burn");
+    let (presig, x) = test_presig();
+    {
+        let mut store = DiskPresigStore::open(&dir, &x, &sk()).unwrap();
+        assert!(store.burn(7).unwrap());
+        assert!(!store.burn(7).unwrap(), "double burn is a no-op");
+        assert_eq!(store.max_seen_id(), 7);
+        store.insert(&presig).unwrap();
+        assert!(!store.burn(0).unwrap(), "burning a live id is refused");
+        let (p7, _) = test_presig_id(7);
+        assert!(
+            store.insert(&p7).is_err(),
+            "insert at a burned id must be rejected"
+        );
+        assert!(dir.join("7.expired").exists());
+    }
+    let mut store = DiskPresigStore::open(&dir, &x, &sk()).unwrap();
+    assert_eq!(store.max_seen_id(), 7);
+    assert_eq!(store.expired_count(), 1);
+    let (p7, _) = test_presig_id(7);
+    assert!(
+        store.insert(&p7).is_err(),
+        "a burned id stays burned across a reopen"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn keyshare_seal_roundtrip_and_fail_closed() {
+    // A7: the sealed key-share file (the soak process-restart rejoin
+    // path) round-trips through the storage key; a missing file is
+    // `Ok(None)` (first boot), a tampered file or a wrong storage key
+    // fails CLOSED.
+    let params = Params::new(3, 2).unwrap();
+    let mut rngs = sim::make_rngs(3, 7);
+    let keys = sim::run_keygen(&params, b"ohm-ecdsa-node/persist-test/keygen", &mut rngs).unwrap();
+    let share = &keys[0];
+    let dir = tmpdir("keyshare");
+    assert!(load_keyshare(&dir).unwrap().is_none());
+    save_keyshare(&dir, share).unwrap();
+    let loaded = load_keyshare(&dir).unwrap().expect("saved above");
+    assert_eq!(loaded.index, share.index);
+    assert_eq!(loaded.share, share.share);
+    assert_eq!(loaded.com.points, share.com.points);
+    // Tamper: the AEAD must reject.
+    let sealed_path = dir.join(ohm_ecdsa_node::persist::KEYSHARE_FILE);
+    let mut bytes = fs::read(&sealed_path).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x01;
+    fs::write(&sealed_path, &bytes).unwrap();
+    assert!(load_keyshare(&dir).is_err(), "tampered key share opened");
+    // Wrong storage key: same rejection.
+    save_keyshare(&dir, share).unwrap();
+    let wrong: String = [9u8; 32].iter().map(|b| format!("{b:02x}")).collect();
+    fs::write(dir.join("storage.key"), wrong).unwrap();
+    assert!(
+        load_keyshare(&dir).is_err(),
+        "key share opened under a wrong storage key"
+    );
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -399,4 +484,251 @@ fn party_arc_restart_keeps_consumed_ids() {
         );
     }
     fs::remove_dir_all(&dir).ok();
+}
+
+// --- A4: the store journal + rollback detection (SPEC §8.6, §13.3) ------------
+
+/// Recursive directory copy (the ops-backup snapshot primitive).
+fn copy_dir(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir(&from, &to);
+        } else {
+            fs::copy(&from, &to).unwrap();
+        }
+    }
+}
+
+/// A signed Sign-phase envelope evidencing presignature `id` as spent —
+/// what a node's transcript archive holds after a sign session.
+fn sign_evidence(id: u64) -> SignedEnvelope<NodePayload> {
+    let sk = SecretKey::random(&mut StdRng::seed_from_u64(300 + id));
+    SignedEnvelope::sign(
+        Envelope::broadcast(
+            b"sid",
+            Phase::Sign,
+            1,
+            1,
+            NodePayload::SignShare {
+                presig: id,
+                s: Scalar::ONE,
+            },
+        ),
+        &SigningKey::from(&sk),
+    )
+}
+
+/// Build a store with journaled history: insert ids 0 and 1, consume 0,
+/// expire 1. Returns the store's bound key.
+fn store_with_history(dir: &Path) -> AffinePoint {
+    let (p0, x) = test_presig_id(0);
+    let (p1, _) = test_presig_id(1);
+    let mut store = DiskPresigStore::open(dir, &x, &sk()).unwrap();
+    store.insert(&p0).unwrap();
+    store.insert(&p1).unwrap();
+    store.consume(0).unwrap();
+    store.expire(1).unwrap();
+    x
+}
+
+/// The journal chains every mutation; tampering with any HISTORICAL
+/// state — an old record's bytes, a tombstone, the journal itself —
+/// breaks `open` with `PersistError::Integrity`.
+#[test]
+fn journal_tampering_fails_closed() {
+    // Flip one byte in an old (consumed) record file.
+    let dir = tmpdir("tamper-record");
+    let x = store_with_history(&dir);
+    let path = dir.join("0.consumed");
+    let mut bytes = fs::read(&path).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x01;
+    fs::write(&path, bytes).unwrap();
+    let err = DiskPresigStore::open(&dir, &x, &sk()).unwrap_err();
+    assert!(
+        matches!(err, PersistError::Integrity(_)),
+        "tampered record: {err:?}"
+    );
+    fs::remove_dir_all(&dir).ok();
+
+    // Delete the consume tombstone (the record is gone with it — this is
+    // the rollback shape without the journal's protection).
+    let dir = tmpdir("tamper-tombstone");
+    let x = store_with_history(&dir);
+    fs::remove_file(dir.join("0.consumed")).unwrap();
+    let err = DiskPresigStore::open(&dir, &x, &sk()).unwrap_err();
+    assert!(
+        matches!(err, PersistError::Integrity(ref m) if m.contains("tombstone")),
+        "deleted tombstone: {err:?}"
+    );
+    fs::remove_dir_all(&dir).ok();
+
+    // Flip one byte inside the journal (breaks the hash chain).
+    let dir = tmpdir("tamper-journal");
+    let x = store_with_history(&dir);
+    let path = dir.join("journal.log");
+    let mut bytes = fs::read(&path).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x01;
+    fs::write(&path, bytes).unwrap();
+    let err = DiskPresigStore::open(&dir, &x, &sk()).unwrap_err();
+    assert!(
+        matches!(err, PersistError::Integrity(_)),
+        "tampered journal: {err:?}"
+    );
+    fs::remove_dir_all(&dir).ok();
+
+    // Truncate the journal mid-entry (corrupt framing).
+    let dir = tmpdir("tamper-truncate");
+    let x = store_with_history(&dir);
+    let path = dir.join("journal.log");
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, &bytes[..bytes.len() - 3]).unwrap();
+    let err = DiskPresigStore::open(&dir, &x, &sk()).unwrap_err();
+    assert!(
+        matches!(err, PersistError::Integrity(ref m) if m.contains("truncated")),
+        "truncated journal: {err:?}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// A crash between the consume tombstone's fsync and the journal append
+/// (the record was never handed out) is HEALED at open: the id stays
+/// consumed — the safe direction, exactly like the M3b crash model.
+#[test]
+fn crash_mid_consume_heals_at_open() {
+    let dir = tmpdir("heal");
+    let (presig, x) = test_presig();
+    {
+        let mut store = DiskPresigStore::open(&dir, &x, &sk()).unwrap();
+        store.insert(&presig).unwrap();
+    }
+    // The tombstone rename happened; the journal append did not.
+    fs::rename(dir.join("0.presig"), dir.join("0.consumed")).unwrap();
+    let store = DiskPresigStore::open(&dir, &x, &sk()).unwrap();
+    assert!(!store.contains(0));
+    assert!(store.is_empty());
+    drop(store);
+    // The healed journal keeps the id consumed across further restarts.
+    let mut store = DiskPresigStore::open(&dir, &x, &sk()).unwrap();
+    let err = store.consume(0).unwrap_err();
+    assert!(matches!(err, PersistError::Protocol(Error::PresigStore(_))));
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// THE A4 scenario: the node's store directory is restored from a
+/// pre-sign backup while the transcript archive survives. The consumed
+/// presignature id shows LIVE again in the store, but the archive
+/// evidences it as spent — startup refuses, naming the id.
+#[test]
+fn store_rollback_is_detected_and_refused() {
+    let parent = tmpdir("rollback");
+    let store_dir = parent.join("store");
+    let archive_dir = parent.join("archive");
+    let (p0, x) = test_presig_id(0);
+    let (p1, _) = test_presig_id(1);
+    // Full flow: presign id 0, sign (consume) it — archived as spent.
+    {
+        let mut store = DiskPresigStore::open(&store_dir, &x, &sk()).unwrap();
+        store.insert(&p0).unwrap();
+        store.consume(0).unwrap();
+        let mut archive = Archive::create(&archive_dir).unwrap();
+        archive.log_accepted(&sign_evidence(0)).unwrap();
+    }
+    // A second presignature is produced; the ops backup is taken HERE.
+    {
+        let mut store = DiskPresigStore::open(&store_dir, &x, &sk()).unwrap();
+        store.insert(&p1).unwrap();
+    }
+    let snap = tmpdir("rollback-snap");
+    copy_dir(&store_dir, &snap);
+    // The second sign consumes id 1 (archived as spent).
+    {
+        let mut store = DiskPresigStore::open(&store_dir, &x, &sk()).unwrap();
+        store.consume(1).unwrap();
+        let mut archive = Archive::create(&archive_dir).unwrap();
+        archive.log_accepted(&sign_evidence(1)).unwrap();
+    }
+    // THE ATTACK: the pre-sign store backup replaces the live store.
+    fs::remove_dir_all(&store_dir).unwrap();
+    copy_dir(&snap, &store_dir);
+    // Startup refuses, naming the rolled-back id.
+    let err = DiskPresigStore::open(&store_dir, &x, &sk()).unwrap_err();
+    match err {
+        PersistError::Integrity(m) => {
+            assert!(m.contains("ROLLBACK DETECTED"), "{m}");
+            assert!(m.contains("id 1"), "{m}");
+        }
+        other => panic!("expected Integrity, got {other:?}"),
+    }
+    // The dev escape hatch downgrades the refusal to a loud warning —
+    // and the store really is in the dangerous state (id 1 LIVE again):
+    // this is exactly the path that must stay dev-only.
+    let store = DiskPresigStore::open_unverified(&store_dir, &x, &sk()).unwrap();
+    assert!(store.contains(1));
+    assert!(
+        store
+            .integrity_warnings()
+            .iter()
+            .any(|w| w.contains("ROLLBACK DETECTED") && w.contains("id 1")),
+        "warnings: {:?}",
+        store.integrity_warnings()
+    );
+    fs::remove_dir_all(&parent).ok();
+    fs::remove_dir_all(&snap).ok();
+}
+
+/// Whole-directory rollback (the archive rolls back WITH the store):
+/// every local artifact is self-consistent, so the journal check passes
+/// and the node opens — but the startup warning about unverifiable
+/// integrity fires, and the dangerous state (a spent id re-issuable) is
+/// real. True prevention needs state outside the directory (SPEC §13.3).
+#[test]
+fn whole_dir_rollback_passes_with_startup_warning() {
+    let parent = tmpdir("whole-dir");
+    let store_dir = parent.join("store");
+    let archive_dir = parent.join("archive");
+    let (p0, x) = test_presig_id(0);
+    let (p1, _) = test_presig_id(1);
+    {
+        let mut store = DiskPresigStore::open(&store_dir, &x, &sk()).unwrap();
+        store.insert(&p0).unwrap();
+        store.consume(0).unwrap();
+        let mut archive = Archive::create(&archive_dir).unwrap();
+        archive.log_accepted(&sign_evidence(0)).unwrap();
+    }
+    // Snapshot the WHOLE data dir (store AND archive).
+    let snap = tmpdir("whole-dir-snap");
+    copy_dir(&parent, &snap);
+    // More history: presign + sign id 1.
+    {
+        let mut store = DiskPresigStore::open(&store_dir, &x, &sk()).unwrap();
+        store.insert(&p1).unwrap();
+        store.consume(1).unwrap();
+        let mut archive = Archive::create(&archive_dir).unwrap();
+        archive.log_accepted(&sign_evidence(1)).unwrap();
+    }
+    // The whole-directory restore: EVERYTHING rolls back to an older
+    // self-consistent state — nothing local can contradict it.
+    fs::remove_dir_all(&parent).unwrap();
+    copy_dir(&snap, &parent);
+    let mut store = DiskPresigStore::open(&store_dir, &x, &sk()).unwrap();
+    assert!(
+        store
+            .integrity_warnings()
+            .iter()
+            .any(|w| w.contains("SAME rollback-able directory")),
+        "warnings: {:?}",
+        store.integrity_warnings()
+    );
+    // The residual risk, demonstrated: id 1 was rolled back to
+    // never-seen, so it is accepted AGAIN (nonce reuse is now possible).
+    assert!(!store.contains(1));
+    store.insert(&p1).unwrap();
+    fs::remove_dir_all(&parent).ok();
+    fs::remove_dir_all(&snap).ok();
 }

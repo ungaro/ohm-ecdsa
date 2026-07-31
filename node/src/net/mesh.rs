@@ -169,6 +169,15 @@ impl Default for ReconnectConfig {
 /// bug. Snapshot via [`Node::metrics`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MeshMetrics {
+    /// Frames written to a peer connection (per-peer sends; echoes
+    /// included). A send that fails and goes through the reconnect
+    /// re-sync is counted again when the re-send succeeds — this is a
+    /// wire-level counter, not a protocol-message count.
+    pub frames_sent: u64,
+    /// Frames that passed §10.2/echo signature verification (the drops
+    /// below count the rest; undecodable garbage kills its connection
+    /// before either counter).
+    pub frames_received: u64,
     /// Unknown sender or bad §10.2/echo signature.
     pub dropped_bad_signature: u64,
     /// P2P frame addressed to a different node.
@@ -185,6 +194,10 @@ pub struct MeshMetrics {
     pub handshake_rejects: u64,
     /// Successful reconnections of an outgoing connection.
     pub reconnects: u64,
+    /// Driver sessions whose send journal was retired (finished, any
+    /// outcome — success, abort, or timeout). Sub-sessions (derived
+    /// sids) count individually; compare `Node::sessions_active`.
+    pub sessions_completed: u64,
 }
 
 /// A framed-message stream: plain TCP, or TLS 1.3 over TCP (M3c). The
@@ -377,17 +390,38 @@ impl<M: Clone + Encode + Decode + FrameBound + Send + 'static> Node<M> {
         *self.shared.metrics.lock().expect("mesh mutex poisoned")
     }
 
+    /// Sessions with in-flight journaled traffic right now (distinct
+    /// sids in the H2 send journal, including derived sub-session sids)
+    /// — the gauge next to `MeshMetrics::sessions_completed`.
+    pub fn sessions_active(&self) -> usize {
+        self.shared
+            .journal
+            .lock()
+            .expect("mesh mutex poisoned")
+            .len()
+    }
+
+    /// Whether this node runs M3c mTLS on its connections.
+    pub fn tls_enabled(&self) -> bool {
+        self.shared.tls.is_some()
+    }
+
     /// Drop the journal entries of a FINISHED session (H2): `sid_prefix`
     /// matches the session's sid and every derived sub-session sid (the
     /// drivers build them by suffix concatenation, e.g. `sid ‖ "/t1"`).
     /// In-flight sessions must NOT be retired — their journal is the
     /// reconnect re-sync state.
     pub(crate) fn retire_session(&self, sid_prefix: &[u8]) {
-        self.shared
-            .journal
-            .lock()
-            .expect("mesh mutex poisoned")
-            .retain(|sid, _| !sid.starts_with(sid_prefix));
+        let mut journal = self.shared.journal.lock().expect("mesh mutex poisoned");
+        let before = journal.len();
+        journal.retain(|sid, _| !sid.starts_with(sid_prefix));
+        // Count the completion only when the session actually had
+        // in-flight state: a prefix retire after the sub-sessions'
+        // own retires must not double count them.
+        if journal.len() < before {
+            drop(journal);
+            self.shared.bump(|m| m.sessions_completed += 1);
+        }
     }
 
     /// Open the outgoing connection to every peer in `addrs` (skipping
@@ -709,6 +743,8 @@ fn send_raw<M: Clone + Encode + Decode + FrameBound + Send + 'static>(
                 if let Err(e) = write_frame(&mut *s, msg) {
                     eprintln!("[node {}] send to {to} failed: {e}", shared.id);
                     kick_reconnect(shared, to);
+                } else {
+                    shared.bump(|m| m.frames_sent += 1);
                 }
             }
             Err(_) => kick_reconnect(shared, to),
@@ -733,6 +769,8 @@ fn send_raw<M: Clone + Encode + Decode + FrameBound + Send + 'static>(
                 if let Err(e) = s.write_all(&frame) {
                     eprintln!("[node {id}] send to {to} failed: {e}");
                     kick_reconnect(&task, to);
+                } else {
+                    task.bump(|m| m.frames_sent += 1);
                 }
             }
             Err(_) => kick_reconnect(&task, to),
@@ -925,6 +963,7 @@ fn handle<M: Clone + Encode + Decode + FrameBound + Send + 'static>(
         );
         return;
     }
+    shared.bump(|m| m.frames_received += 1);
     let deliver = |received: Received<M>| {
         if shared.inbox.try_send(received).is_err() {
             shared.bump(|m| m.dropped_inbox_full += 1);

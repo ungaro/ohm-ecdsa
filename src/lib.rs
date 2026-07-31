@@ -150,6 +150,7 @@ pub mod tags {
     pub const REFRESH_COMMIT: &[u8] = b"OHM-ECDSA/v0.1/refresh-commit";
     pub const RESHARE_COMMIT: &[u8] = b"OHM-ECDSA/v0.1/reshare-commit";
     pub const TRANSPORT_SIGN: &[u8] = b"OHM-ECDSA/v0.1/transport-sign";
+    pub const RERAND_GAMMA: &[u8] = b"OHM-ECDSA/v0.1/rerand-gamma";
 }
 
 /// Hash a Feldman commitment vector into a transcript digest.

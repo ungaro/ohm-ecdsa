@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use k256::ecdsa::Signature;
-use k256::Scalar;
+use k256::{AffinePoint, Scalar};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use sha2::{Digest, Sha256};
@@ -498,6 +498,52 @@ pub fn run_sign_robust(
     let ((r, s), blamed) = sign::combine_robust(params, &presigs[0], &m, &shares)?;
     let sig = Signature::from_scalars(r, s)?;
     Ok((sig.normalize_s().unwrap_or(sig), blamed))
+}
+
+/// **EXPERIMENTAL — candidate mitigation, security lemma open (SPEC
+/// §11.3(8)); not for production use.** Off by default: nothing else in
+/// the crate calls this.
+///
+/// Online signing with the multiplicative re-randomization CANDIDATE
+/// (SPEC §9.4): `γ` is derived at signing time via [`sign::rerand_gamma`]
+/// from `(sid, presig-id, m, τ, X)`, every party computes its local share
+/// with [`sign::sign_share_rerand`] (`u′ = γ⁻¹u`, `z′ = γ⁻¹z`, tweaked:
+/// `z′ = γ⁻¹(z + τu)`), and [`sign::combine_rerand`] verifies each share
+/// against the publicly scaled commitments and interpolates — the
+/// one-round online structure and the point-equality identifiable abort
+/// are unchanged. `x_point` is the committee's joint public key `X`
+/// (affine); with `tweak = Some(τ)` the signature verifies under the
+/// child key `X + τ·G`. Low-`s` normalization as in [`run_sign`].
+/// `tamper` replaces one party's broadcast share (fault injection for
+/// tests).
+///
+/// Signing needs no randomness, so unlike the offline drivers this takes
+/// no `rngs`.
+pub fn run_sign_rerand(
+    params: &Params,
+    presigs: &[Presignature],
+    msg: &[u8],
+    tweak: Option<Scalar>,
+    sid: &[u8],
+    x_point: &AffinePoint,
+    tamper: Option<(PartyId, Scalar)>,
+) -> Result<Signature> {
+    let m = message_scalar(msg);
+    let gamma = sign::rerand_gamma(sid, presigs[0].id, &m, tweak.as_ref(), x_point);
+    let mut shares: Vec<SignShare> = presigs
+        .iter()
+        .map(|p| sign::sign_share_rerand(p, &m, &gamma, tweak.as_ref()))
+        .collect();
+    if let Some((party, fake)) = tamper {
+        for sh in shares.iter_mut() {
+            if sh.from == party {
+                sh.s = fake;
+            }
+        }
+    }
+    let (r, s) = sign::combine_rerand(params, &presigs[0], &m, &gamma, tweak.as_ref(), &shares)?;
+    let sig = Signature::from_scalars(r, s)?;
+    Ok(sig.normalize_s().unwrap_or(sig))
 }
 
 /// Online signing with a KEY-INDEPENDENT pool record (SPEC §8.7): the

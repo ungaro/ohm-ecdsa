@@ -56,13 +56,13 @@
 //!
 //! Run `… --help`-less: wrong usage prints the usage text.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::process::{Command, ExitCode, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use k256::ecdsa::signature::Verifier;
@@ -73,12 +73,14 @@ use ohm_ecdsa::presign::{KeyShare, Presignature};
 use ohm_ecdsa::transport::{drive_dkg_signed, SigningTransport};
 use ohm_ecdsa::{session_id, Error, Params, PartyId, Phase};
 use ohm_ecdsa_node::ceremony::{self, PubBundle};
+use ohm_ecdsa_node::metrics::{self, MetricsReporter};
 use ohm_ecdsa_node::persist::{self, PersistError};
-use ohm_ecdsa_node::pool::{PoolConfig, PoolManager};
+use ohm_ecdsa_node::pool::{PoolConfig, PoolCounters, PoolManager};
 use ohm_ecdsa_node::seed::{self, CommitteeInfo};
 use ohm_ecdsa_node::tls::{self, CommitteeTls};
 use ohm_ecdsa_node::{Cheat, MeshTransport, PartyNode, DEFAULT_ROUND_TIMEOUT};
-use rand::rngs::OsRng;
+use rand::rngs::{OsRng, StdRng};
+use rand::{Rng, SeedableRng};
 
 /// Genesis anchor for the demo sids (SPEC §13.1).
 const GENESIS: &[u8] = b"ohm-ecdsa-node/m2-demo";
@@ -94,6 +96,11 @@ const FACTORY_MESSAGES: [&[u8]; 3] = [
 ];
 /// DKG commit tag for the per-node keygen driver.
 const DKG_TAG: &[u8] = b"ohm-ecdsa-node/dkg";
+/// A7 soak: the (unused-by-drivers) broadcast round of the MESH-CHECK
+/// probe — a no-op session the rejoined node runs to force the
+/// survivors' write-triggered H2 reconnect to complete before signs
+/// resume (see `run_soak_node`).
+const MESH_CHECK_ROUND: u8 = 250;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -115,9 +122,14 @@ fn main() -> ExitCode {
                  ohm-ecdsa-node node (--seed FILE | --identity FILE) --committee FILE --bind ADDR \\\n    \
                  [--rendezvous | --peers id@host:port,...] [--delay-ms D] [--seeded] [--ki] \\\n    \
                  [--round-timeout-secs S] [--cheat C] [--presig-id K] [--message MSG] \\\n    \
-                 [--data-dir DIR] [--tls CERT KEY --pinned DIR] [--factory N] [--pool-ttl SECS] [--restart]\n  \
+                 [--data-dir DIR] [--tls CERT KEY --pinned DIR] [--factory N] [--pool-ttl SECS] [--restart] \\\n    \
+                 [--metrics-file PATH] [--soak] [--soak-stats-every S] \\\n    \
+                 [--allow-unverified-store]   (A4 DEV escape hatch: rollback checks become warnings)\n  \
                  ohm-ecdsa-node spawn-demo [--dir DIR] [--delay-ms D] [--seeded] [--persist] \\\n    \
-                 [--tls] [--ki] [--factory N] [--pool-ttl SECS] [--restart] [--cheat-node K --cheat C]   (DEMO-ONLY)\n  \
+                 [--tls] [--ki] [--factory N] [--pool-ttl SECS] [--restart] [--metrics] \\\n    \
+                 [--soak SECS] [--fault-rate P] [--restart-every SECS] [--seed S] [--soak-stats-every S] \\\n    \
+                 [--allow-unverified-store] \\\n    \
+                 [--cheat-node K --cheat C]   (DEMO-ONLY)\n  \
                  ohm-ecdsa-node auditor TOKEN_FILE COMMITTEE_FILE\n  \
                  cheats: bad-deal:V | false-accuse:D | bad-sign-share | \\\n    \
                  bad-product-proof | bad-reshare:V | bad-nonce-point | bad-open-share"
@@ -411,6 +423,15 @@ fn node_mode(args: &[String]) -> ExitCode {
     let pool_ttl: u64 = flag_value(&mut args, "--pool-ttl")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // A7: `--soak` turns the node into a long-running soak worker driven
+    // by the demo parent over stdin commands (FACTORY-START / DRAIN /
+    // SIGN / STOP — see `run_soak_node`). Requires `--factory N` (the
+    // continuous pool is the soak's offline load). Faults are armed PER
+    // SESSION by the parent's SIGN commands, so `--cheat` is rejected.
+    let soak = has_flag(&mut args, "--soak");
+    let soak_stats_every: u64 = flag_value(&mut args, "--soak-stats-every")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
     let peers_arg = flag_value(&mut args, "--peers");
     let delay_ms: u64 = flag_value(&mut args, "--delay-ms")
         .and_then(|v| v.parse().ok())
@@ -425,6 +446,14 @@ fn node_mode(args: &[String]) -> ExitCode {
         .map(String::into_bytes)
         .unwrap_or_else(|| DEMO_MESSAGE.to_vec());
     let data_dir = flag_value(&mut args, "--data-dir").map(PathBuf::from);
+    // A6: `--metrics-file PATH` appends a greppable counter snapshot
+    // (mesh frames/drops, sessions, pool + store counts) every 15 s and
+    // one final block at shutdown — pull-based, no HTTP endpoint.
+    let metrics_file = flag_value(&mut args, "--metrics-file").map(PathBuf::from);
+    // A4 dev escape hatch (SPEC §13.3): downgrade the store rollback
+    // checks to warnings. Also settable via the environment.
+    let allow_unverified_store = has_flag(&mut args, "--allow-unverified-store")
+        || std::env::var_os("OHM_ALLOW_UNVERIFIED_STORE").is_some();
     let tls_args = tls_flag(&mut args);
     let pinned_dir = flag_value(&mut args, "--pinned").map(PathBuf::from);
     let cheat = flag_value(&mut args, "--cheat").and_then(|c| {
@@ -446,6 +475,22 @@ fn node_mode(args: &[String]) -> ExitCode {
     if restart && (seeded || ki || factory.is_some()) {
         eprintln!("node: --restart does not combine with --seeded, --ki, or --factory");
         return ExitCode::FAILURE;
+    }
+    if soak {
+        if seeded || ki || restart {
+            eprintln!("node: --soak does not combine with --seeded, --ki, or --restart");
+            return ExitCode::FAILURE;
+        }
+        if factory.is_none() {
+            eprintln!("node: --soak requires --factory N (the continuous pool is the soak's load)");
+            return ExitCode::FAILURE;
+        }
+        if cheat.is_some() {
+            eprintln!(
+                "node: --soak arms faults per session via the parent's SIGN commands — --cheat is rejected"
+            );
+            return ExitCode::FAILURE;
+        }
     }
 
     // This process reads ONLY its own secret material plus the public
@@ -538,13 +583,18 @@ fn node_mode(args: &[String]) -> ExitCode {
         Duration::from_secs(timeout_secs),
         tls,
     ) {
-        Ok(n) => n,
+        Ok(n) => Arc::new(n),
         Err(e) => {
             eprintln!("node {me}: bind failed: {e}");
             return ExitCode::FAILURE;
         }
     };
     node.set_send_delay(Duration::from_millis(delay_ms));
+
+    // A6: the metrics reporter snapshots on its interval and writes one
+    // final block when it drops (every exit path below). It only reads.
+    let reporter = metrics_file
+        .map(|path| MetricsReporter::start(path, Arc::clone(&node), metrics::DEFAULT_INTERVAL));
 
     // M3b (§10.2, §A.4): with `--data-dir`, archive every accepted
     // signed envelope (the §4.7 transcript) plus blame tokens, from the
@@ -600,6 +650,24 @@ fn node_mode(args: &[String]) -> ExitCode {
         .to_encoded_point(true)
         .as_bytes()
         .to_vec();
+
+    // A7: the soak worker runs its OWN arc — keygen (or a key-share
+    // reload on a process restart into the same committee), then the
+    // parent-driven command loop (factory + scheduled signs). It never
+    // reaches the one-shot arc below.
+    if soak {
+        return run_soak_node(
+            node,
+            me,
+            &anchor_x,
+            factory.expect("validated above"),
+            pool_ttl,
+            soak_stats_every,
+            data_dir.clone(),
+            allow_unverified_store,
+            reporter.as_ref(),
+        );
+    }
 
     // Phase 1: fresh keygen through the per-node driver (§6 + §6.1
     // complaints/defenses over the wire). With `--restart` (H4 §10.3) a
@@ -662,7 +730,7 @@ fn node_mode(args: &[String]) -> ExitCode {
         // down cleanly at the end.
         if let Some(target) = factory {
             return run_factory_demo(
-                Arc::new(node),
+                node,
                 me,
                 share,
                 x_bytes,
@@ -670,6 +738,8 @@ fn node_mode(args: &[String]) -> ExitCode {
                 pool_ttl,
                 data_dir.clone(),
                 cheat,
+                allow_unverified_store,
+                reporter.as_ref(),
             );
         }
 
@@ -719,7 +789,12 @@ fn node_mode(args: &[String]) -> ExitCode {
         // driver consumes durably (fsync'd tombstone BEFORE the share is
         // broadcast).
         let stored = if let Some(dir) = &data_dir {
-            if let Err(e) = node.set_store(&dir.join("store"), &share.com.points[0].to_affine()) {
+            let opened = if allow_unverified_store {
+                node.set_store_unverified(&dir.join("store"), &share.com.points[0].to_affine())
+            } else {
+                node.set_store(&dir.join("store"), &share.com.points[0].to_affine())
+            };
+            if let Err(e) = opened {
                 eprintln!("node {me}: opening the presignature store failed: {e}");
                 return ExitCode::FAILURE;
             }
@@ -835,7 +910,12 @@ fn node_mode(args: &[String]) -> ExitCode {
     };
     let mut stored = false;
     if let Some(dir) = &data_dir {
-        if let Err(e) = node.set_store(&dir.join("store"), &info.x.to_affine()) {
+        let opened = if allow_unverified_store {
+            node.set_store_unverified(&dir.join("store"), &info.x.to_affine())
+        } else {
+            node.set_store(&dir.join("store"), &info.x.to_affine())
+        };
+        if let Err(e) = opened {
             eprintln!("node {me}: opening the presignature store failed: {e}");
             return ExitCode::FAILURE;
         }
@@ -980,6 +1060,8 @@ fn run_factory_demo(
     pool_ttl: u64,
     data_dir: Option<PathBuf>,
     cheat: Option<Cheat>,
+    allow_unverified_store: bool,
+    metrics: Option<&MetricsReporter>,
 ) -> ExitCode {
     // H5: the pool lives in the durable store (§8.6 — sealed, 0600).
     let (store_dir, cleanup) = match &data_dir {
@@ -989,7 +1071,12 @@ fn run_factory_demo(
             true,
         ),
     };
-    if let Err(e) = node.set_store(&store_dir, &share.com.points[0].to_affine()) {
+    let opened = if allow_unverified_store {
+        node.set_store_unverified(&store_dir, &share.com.points[0].to_affine())
+    } else {
+        node.set_store(&store_dir, &share.com.points[0].to_affine())
+    };
+    if let Err(e) = opened {
         eprintln!("[node {me}] opening the pool store failed: {e}");
         return ExitCode::FAILURE;
     }
@@ -1027,6 +1114,10 @@ fn run_factory_demo(
         }
     };
     let counters = manager.counters();
+    if let Some(reporter) = metrics {
+        // A6: snapshots carry the pool lines from now on.
+        reporter.set_pool(target, Arc::clone(&counters));
+    }
     let factory = {
         let stop = Arc::clone(&stop);
         let failed = Arc::clone(&failed);
@@ -1125,6 +1216,565 @@ fn run_factory_demo(
     }
 }
 
+// --- A7: soak-test tooling (--soak) ------------------------------------------
+//
+// The "pilot topology in a box": a committee runs CONTINUOUSLY — a
+// factory keeps each node's pool at target while the demo parent drives
+// jittered sign ticks, per-session fault injection, and process
+// kill/restart cycles — shaking out liveness, persistence, and leak
+// issues the unit tests cannot see. The node side is a stdin-driven
+// worker (the parent is `spawn-demo --soak`, below):
+//
+// * boot: keygen — or, when `--data-dir` holds a `keyshare.sealed`
+//   from a previous life, reload the SAME share and skip keygen (the
+//   process-restart rejoin path; the store's records stay valid under
+//   the unchanged X). Then `SOAK-READY`.
+// * `FACTORY-START` — build a fresh pool manager (id allocation
+//   re-seeds from the store's `max_seen_id`) and run the FAULT-TOLERANT
+//   maintenance loop (`PoolManager::tick_tolerant`): a failed
+//   production session (injected abort, peer-down timeout) burns the id
+//   durably and retries, instead of stopping the pool.
+// * `SIGN <seq> <cheat|->` — consume the OLDEST live record (the same
+//   order at every node) and sign the deterministic message
+//   `soak_message(seq)`; a `bad-sign-share` token applies to THIS sign,
+//   any other cheat is armed into a one-shot slot consumed by the next
+//   factory production (that is how the presign/triples fault classes
+//   get exercised). Answers `SIG <seq> <r> <s>` (plus `BLAME` lines) or
+//   `SIGN-FAIL <seq> <why>`.
+// * `DRAIN` — park the factory (parent uses it before a kill/restart so
+//   no session is in flight) and report the store's `max_seen_id` for
+//   the parent's cross-node consistency check.
+// * `STOP` (or stdin EOF — the parent dying closes the pipe) — drain,
+//   print `SOAK-SUMMARY`, clean H2 shutdown.
+//
+// Exit status: FAILURE iff any sign failed (the parent also judges
+// independently from the line protocol).
+
+/// The deterministic message of soak sign tick `seq` (parent and
+/// children compute it independently — reproducibility, §13.1).
+fn soak_message(seq: u64) -> Vec<u8> {
+    format!("ohm-ecdsa-node soak: message {seq}").into_bytes()
+}
+
+/// The soak worker's shared counters (main thread = SIGN commands,
+/// factory thread, stats thread).
+struct SoakShared {
+    signs_ok: AtomicU64,
+    signs_failed: AtomicU64,
+    /// Parties this node has seen blamed (any phase), for the summary.
+    blamed: Mutex<BTreeSet<PartyId>>,
+    /// The one-shot armed fault: consumed by the NEXT factory
+    /// production (presign-phase cheats); `bad-sign-share` never lands
+    /// here (it applies directly to its SIGN tick).
+    cheat_slot: Mutex<Option<Cheat>>,
+    /// The current factory's pool counters (`None` while parked).
+    pool: Mutex<Option<Arc<PoolCounters>>>,
+    /// Cumulative counters of PAST managers (a drained factory's counts
+    /// are folded in so the summary survives DRAIN/restart cycles).
+    cum_produced: AtomicU64,
+    cum_expired: AtomicU64,
+    cum_failed: AtomicU64,
+    /// Set when the factory thread dies on a store error (SIGN fails
+    /// fast instead of waiting out the record deadline).
+    factory_dead: AtomicBool,
+}
+
+impl SoakShared {
+    fn note_blamed(&self, blamed: &[PartyId]) {
+        self.blamed
+            .lock()
+            .expect("soak mutex poisoned")
+            .extend(blamed);
+    }
+
+    fn blamed_str(&self) -> String {
+        let blamed = self.blamed.lock().expect("soak mutex poisoned");
+        if blamed.is_empty() {
+            "-".to_string()
+        } else {
+            blamed
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    }
+
+    /// One `SOAK-STATS`/`SOAK-SUMMARY` line (the caller picks the tag).
+    /// Pool counts are cumulative across the process's managers (the
+    /// current factory's live counters plus the folded-in past ones).
+    fn stats_line(&self, tag: &str, node: &PartyNode, me: PartyId) -> String {
+        let (produced, expired, pfailed) = {
+            let pool = self.pool.lock().expect("soak mutex poisoned");
+            let cur = pool
+                .as_ref()
+                .map(|c| (c.produced(), c.expired(), c.failed()))
+                .unwrap_or((0, 0, 0));
+            (
+                cur.0 + self.cum_produced.load(Ordering::SeqCst),
+                cur.1 + self.cum_expired.load(Ordering::SeqCst),
+                cur.2 + self.cum_failed.load(Ordering::SeqCst),
+            )
+        };
+        let stored = node
+            .store_handle()
+            .lock()
+            .expect("store mutex poisoned")
+            .as_ref()
+            .map_or(0, |s| s.len());
+        format!(
+            "{tag} node={me} signs_ok={} signs_failed={} produced={produced} stored={stored} \
+             expired={expired} pfailed={pfailed} reconnects={} equivocations={} blames={}",
+            self.signs_ok.load(Ordering::SeqCst),
+            self.signs_failed.load(Ordering::SeqCst),
+            node.metrics().reconnects,
+            node.equivocation_count(),
+            self.blamed_str(),
+        )
+    }
+}
+
+/// A running soak factory (parked = `None` in the command loop).
+struct SoakFactory {
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+/// Start the soak factory thread: a fresh [`PoolManager`] (id
+/// allocation re-seeds from the store — the DRAIN/restart path relies
+/// on every node's manager converging to `max_seen_id + 1`) driven by
+/// the FAULT-TOLERANT tick.
+#[allow(clippy::too_many_arguments)] // soak wiring: node + arc state + shared counters
+fn soak_factory_start(
+    node: &Arc<PartyNode>,
+    me: PartyId,
+    share: &KeyShare,
+    x_bytes: &[u8],
+    target: usize,
+    pool_ttl: u64,
+    shared: &Arc<SoakShared>,
+    reporter: Option<&MetricsReporter>,
+) -> Result<SoakFactory, PersistError> {
+    let store = node.store_handle();
+    let produce = {
+        let node = Arc::clone(node);
+        let x_bytes = x_bytes.to_vec();
+        let shared = Arc::clone(shared);
+        let share = KeyShare {
+            index: share.index,
+            share: share.share,
+            com: share.com.clone(),
+        };
+        move |id: u64| -> Result<Presignature, PersistError> {
+            // One-shot fault: the parent's armed cheat applies to the
+            // NEXT production session (presign/triples fault classes).
+            let cheat = {
+                let mut slot = shared.cheat_slot.lock().expect("soak mutex poisoned");
+                match *slot {
+                    Some(c) if c != Cheat::BadSignShare => slot.take(),
+                    _ => None,
+                }
+            };
+            let sid = session_id(GENESIS, &x_bytes, Some(id), b"presign");
+            let mut rng = OsRng;
+            node.presign(&sid, id, &share, &mut rng, cheat)
+                .map_err(|e| {
+                    if let Error::Abort { abort } = &e {
+                        println!("BLAME {} {}", abort.phase, ids_str(&abort.blamed));
+                        shared.note_blamed(&abort.blamed);
+                    }
+                    eprintln!("[node {me}] factory presign failed: {e}");
+                    e.into()
+                })
+        }
+    };
+    let mut cfg = PoolConfig::new(target, pool_ttl);
+    cfg.label = format!("pool node-{me}");
+    let mut manager = PoolManager::with_system_clock(store, cfg, produce)?;
+    let counters = manager.counters();
+    *shared.pool.lock().expect("soak mutex poisoned") = Some(Arc::clone(&counters));
+    if let Some(reporter) = reporter {
+        // A6: snapshots carry the pool lines from now on.
+        reporter.set_pool(target, counters);
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = {
+        let stop = Arc::clone(&stop);
+        let shared = Arc::clone(shared);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                if let Err(e) = manager.tick_tolerant() {
+                    eprintln!("[pool node-{me}] pool maintenance failed: {e}");
+                    shared.factory_dead.store(true, Ordering::SeqCst);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    Ok(SoakFactory { stop, handle })
+}
+
+fn soak_factory_stop(factory: &mut Option<SoakFactory>, shared: &SoakShared) {
+    if let Some(f) = factory.take() {
+        f.stop.store(true, Ordering::SeqCst);
+        let _ = f.handle.join();
+    }
+    // Fold the drained manager's counters into the cumulative totals.
+    let mut pool = shared.pool.lock().expect("soak mutex poisoned");
+    if let Some(c) = pool.as_ref() {
+        shared
+            .cum_produced
+            .fetch_add(c.produced(), Ordering::SeqCst);
+        shared.cum_expired.fetch_add(c.expired(), Ordering::SeqCst);
+        shared.cum_failed.fetch_add(c.failed(), Ordering::SeqCst);
+    }
+    *pool = None;
+}
+
+/// The A7 soak worker (`node --soak`): see the section docs above.
+#[allow(clippy::too_many_arguments)] // soak wiring: node + arc state + config
+fn run_soak_node(
+    node: Arc<PartyNode>,
+    me: PartyId,
+    anchor_x: &[u8],
+    target: usize,
+    pool_ttl: u64,
+    stats_every: u64,
+    data_dir: Option<PathBuf>,
+    allow_unverified_store: bool,
+    reporter: Option<&MetricsReporter>,
+) -> ExitCode {
+    let mut rng = OsRng;
+    // Key share: reload on a process restart into the same committee
+    // (the sealed file binds to the storage key and decodes to exactly
+    // the share the first keygen produced — X is unchanged, so the
+    // store's records stay valid), else a fresh keygen, persisted for
+    // the next rejoin. The reload path is what makes the kill/restart
+    // soak cycle possible; without `--data-dir` a restart simply
+    // re-runs keygen (and stalls — the peers moved on).
+    let share = match &data_dir {
+        Some(dir) => match persist::load_keyshare(dir) {
+            Ok(Some(share)) => {
+                if share.index != me {
+                    eprintln!(
+                        "[node {me}] the persisted key share belongs to party {} — refusing to rejoin",
+                        share.index
+                    );
+                    return ExitCode::FAILURE;
+                }
+                eprintln!("[node {me}] key share reloaded — rejoining without keygen");
+                share
+            }
+            Ok(None) => {
+                let kg_sid = session_id(GENESIS, anchor_x, None, b"keygen");
+                let share = match node.keygen(&kg_sid, DKG_TAG, &mut rng, None) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if let Error::Abort { abort } = &e {
+                            println!("BLAME {} {}", abort.phase, ids_str(&abort.blamed));
+                        }
+                        eprintln!("[node {me}] keygen failed: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if let Err(e) = persist::save_keyshare(dir, &share) {
+                    eprintln!("[node {me}] persisting the key share failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+                share
+            }
+            Err(e) => {
+                eprintln!("[node {me}] loading the key share failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            let kg_sid = session_id(GENESIS, anchor_x, None, b"keygen");
+            match node.keygen(&kg_sid, DKG_TAG, &mut rng, None) {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Error::Abort { abort } = &e {
+                        println!("BLAME {} {}", abort.phase, ids_str(&abort.blamed));
+                    }
+                    eprintln!("[node {me}] keygen failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+    let x_bytes = share.com.points[0]
+        .to_affine()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+    println!("X {}", hex(&x_bytes));
+
+    // The pool lives in the durable store (§8.6 — sealed, 0600); a
+    // per-process temp dir when `--data-dir` is not given (no rejoin
+    // possible then — the parent only cycles processes with --persist).
+    let (store_dir, cleanup) = match &data_dir {
+        Some(d) => (d.join("store"), false),
+        None => (
+            std::env::temp_dir().join(format!("ohm-soak-store-{}-{me}", std::process::id())),
+            true,
+        ),
+    };
+    let opened = if allow_unverified_store {
+        node.set_store_unverified(&store_dir, &share.com.points[0].to_affine())
+    } else {
+        node.set_store(&store_dir, &share.com.points[0].to_affine())
+    };
+    if let Err(e) = opened {
+        eprintln!("[node {me}] opening the pool store failed: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let shared = Arc::new(SoakShared {
+        signs_ok: AtomicU64::new(0),
+        signs_failed: AtomicU64::new(0),
+        blamed: Mutex::new(BTreeSet::new()),
+        cheat_slot: Mutex::new(None),
+        pool: Mutex::new(None),
+        cum_produced: AtomicU64::new(0),
+        cum_expired: AtomicU64::new(0),
+        cum_failed: AtomicU64::new(0),
+        factory_dead: AtomicBool::new(false),
+    });
+
+    // Periodic stats (default 60 s; `--soak-stats-every`): one
+    // greppable line with signs, pool, and mesh counters.
+    let stats_stop = Arc::new(AtomicBool::new(false));
+    let stats_thread = {
+        let node = Arc::clone(&node);
+        let shared = Arc::clone(&shared);
+        let stop = Arc::clone(&stats_stop);
+        std::thread::spawn(move || {
+            let mut waited = Duration::ZERO;
+            let interval = Duration::from_secs(stats_every.max(1));
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                if waited >= interval {
+                    println!("{}", shared.stats_line("SOAK-STATS", &node, me));
+                    let _ = std::io::stdout().flush();
+                    waited = Duration::ZERO;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                waited += Duration::from_millis(100);
+            }
+        })
+    };
+
+    println!("SOAK-READY");
+    let _ = std::io::stdout().flush();
+
+    // The command loop: the demo parent drives signs, factory parking,
+    // and shutdown over stdin. EOF (parent died) is STOP.
+    let mut factory: Option<SoakFactory> = None;
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    while let Some(Ok(line)) = lines.next() {
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("FACTORY-START") => {
+                if factory.is_none() {
+                    match soak_factory_start(
+                        &node, me, &share, &x_bytes, target, pool_ttl, &shared, reporter,
+                    ) {
+                        Ok(f) => factory = Some(f),
+                        Err(e) => {
+                            eprintln!("[node {me}] starting the pool manager failed: {e}");
+                            break;
+                        }
+                    }
+                }
+                println!("FACTORY-STARTED");
+                let _ = std::io::stdout().flush();
+            }
+            Some("DRAIN") => {
+                soak_factory_stop(&mut factory, &shared);
+                let store = node.store_handle();
+                let guard = store.lock().expect("store mutex poisoned");
+                let max_seen = guard.as_ref().map_or(0, |s| s.max_seen_id());
+                println!("DRAINED max_seen={max_seen}");
+                let _ = std::io::stdout().flush();
+            }
+            Some("POOL-STATUS") => {
+                let stored = node
+                    .store_handle()
+                    .lock()
+                    .expect("store mutex poisoned")
+                    .as_ref()
+                    .map_or(0, |s| s.len());
+                println!("POOL stored={stored} target={target}");
+                let _ = std::io::stdout().flush();
+            }
+            Some("MESH-CHECK") => {
+                // The rejoin heal probe (see MESH_CHECK_ROUND): broadcast
+                // a no-op and wait for THIS node's own slot to reach the
+                // §4.7 echo quorum — acceptance needs one echo from a
+                // survivor, and a survivor's echo only lands once its
+                // write-triggered reconnect to this node has completed
+                // (the probe's journal is never retired before then).
+                // Several rounds are probed: a survivor's FIRST echo
+                // write into the stale connection can vanish without an
+                // error (the peer's FIN fails the NEXT write, not the
+                // first) — the follow-up rounds are what trip the
+                // reconnect whose journal re-sync then delivers every
+                // probe's echoes. Answers MESH-OK / MESH-FAIL.
+                let seq: u64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                let sid = session_id(GENESIS, &x_bytes, Some(seq), b"mesh-check");
+                for r in 0..3u8 {
+                    node.broadcast(
+                        &sid,
+                        Phase::Sign,
+                        MESH_CHECK_ROUND + r,
+                        ohm_ecdsa_node::NodePayload::SignShare {
+                            presig: u64::MAX,
+                            s: k256::Scalar::ZERO,
+                        },
+                    );
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                let mut healed = false;
+                for r in 0..3u8 {
+                    let set = node.accepted_broadcasts_over(
+                        &sid,
+                        Phase::Sign,
+                        MESH_CHECK_ROUND + r,
+                        &[me],
+                    );
+                    if set.len() == 1 {
+                        healed = true;
+                        break;
+                    }
+                }
+                if healed {
+                    println!("MESH-OK");
+                } else {
+                    println!("MESH-FAIL");
+                }
+                let _ = std::io::stdout().flush();
+            }
+            Some("SIGN") => {
+                let seq: Option<u64> = it.next().and_then(|v| v.parse().ok());
+                let cheat = it.next().filter(|t| *t != "-").and_then(parse_cheat);
+                let Some(seq) = seq else {
+                    eprintln!("[node {me}] malformed SIGN command: {line:?}");
+                    continue;
+                };
+                // bad-sign-share applies to THIS sign; every other
+                // cheat arms the one-shot slot for the next factory
+                // production (the presign/triples fault classes).
+                let mut direct = None;
+                match cheat {
+                    Some(Cheat::BadSignShare) => direct = cheat,
+                    Some(c) => {
+                        *shared.cheat_slot.lock().expect("soak mutex poisoned") = Some(c);
+                    }
+                    None => {}
+                }
+                soak_sign(&node, me, &x_bytes, &shared, seq, direct);
+            }
+            Some("STOP") => break,
+            _ => eprintln!("[node {me}] unknown soak command: {line:?}"),
+        }
+    }
+
+    // Shutdown: drain, summarize, clean H2 shutdown (mesh + threads).
+    soak_factory_stop(&mut factory, &shared);
+    stats_stop.store(true, Ordering::SeqCst);
+    let _ = stats_thread.join();
+    println!("{}", shared.stats_line("SOAK-SUMMARY", &node, me));
+    let _ = std::io::stdout().flush();
+    node.shutdown();
+    if cleanup {
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+    if shared.signs_failed.load(Ordering::SeqCst) == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// One `SIGN <seq>` command: wait for the OLDEST live record (the same
+/// drain order at every node), consume it, and sign the tick's
+/// deterministic message. Prints `SIG <seq> …` (+ `BLAME` lines) or
+/// `SIGN-FAIL <seq> …`.
+fn soak_sign(
+    node: &PartyNode,
+    me: PartyId,
+    x_bytes: &[u8],
+    shared: &Arc<SoakShared>,
+    seq: u64,
+    cheat: Option<Cheat>,
+) {
+    // The factory keeps the pool filled; wait for a record to consume.
+    // A dead factory or a 3-minute drought fails the tick loudly.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let id = loop {
+        if shared.factory_dead.load(Ordering::SeqCst) {
+            break None;
+        }
+        let oldest = node
+            .store_handle()
+            .lock()
+            .expect("store mutex poisoned")
+            .as_ref()
+            .and_then(|s| s.oldest_live_id());
+        if oldest.is_some() {
+            break oldest;
+        }
+        if Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let Some(id) = id else {
+        println!("SIGN-FAIL {seq} no live presignature (factory dead or pool dry)");
+        shared.signs_failed.fetch_add(1, Ordering::SeqCst);
+        return;
+    };
+    let msg = soak_message(seq);
+    let sign_sid = session_id(GENESIS, x_bytes, Some(id), b"sign");
+    match node.sign_stored(&sign_sid, id, &msg, cheat) {
+        Ok((sig, blamed)) => {
+            if !blamed.is_empty() {
+                println!("BLAME sign {}", ids_str(&blamed));
+                shared.note_blamed(&blamed);
+            }
+            // Local sanity: the delivered signature must verify under
+            // this node's own X (the parent verifies independently).
+            let ok = VerifyingKey::from_sec1_bytes(x_bytes)
+                .map(|vk| vk.verify(&msg, &sig).is_ok())
+                .unwrap_or(false);
+            if ok {
+                let (r, s) = sig.split_bytes();
+                println!("SIG {seq} {} {}", hex(&r), hex(&s));
+                shared.signs_ok.fetch_add(1, Ordering::SeqCst);
+            } else {
+                println!("SIGN-FAIL {seq} delivered signature does not verify under X");
+                shared.signs_failed.fetch_add(1, Ordering::SeqCst);
+            }
+            let _ = std::io::stdout().flush();
+            eprintln!("[node {me}] soak sign {seq} (presignature {id}) done");
+        }
+        Err(PersistError::Protocol(Error::Abort { abort })) => {
+            println!("BLAME {} {}", abort.phase, ids_str(&abort.blamed));
+            shared.note_blamed(&abort.blamed);
+            println!("SIGN-FAIL {seq} aborted: {}", abort.detail);
+            shared.signs_failed.fetch_add(1, Ordering::SeqCst);
+        }
+        Err(e) => {
+            println!("SIGN-FAIL {seq} {e}");
+            shared.signs_failed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 // --- auditor: offline blame-token verification (SPEC §10.2, §A.4) -------------
 
 /// `auditor TOKEN_FILE COMMITTEE_FILE` — the §A.4 evidence flow: load a
@@ -1193,6 +1843,8 @@ fn spawn_demo(args: &[String]) -> ExitCode {
     let persist = has_flag(&mut args, "--persist");
     let with_tls = has_flag(&mut args, "--tls");
     let ki = has_flag(&mut args, "--ki");
+    // A4 dev escape hatch, passed through to the children.
+    let allow_unverified_store = has_flag(&mut args, "--allow-unverified-store");
     // H4: `--restart` runs the children on the §10.4 robust drivers with
     // the §10.3 expel-and-restart policy.
     let restart = has_flag(&mut args, "--restart");
@@ -1203,11 +1855,75 @@ fn spawn_demo(args: &[String]) -> ExitCode {
     let pool_ttl: u64 = flag_value(&mut args, "--pool-ttl")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    if factory.is_some() && (seeded || ki || persist || with_tls || cheat.is_some()) {
+    // A7: `--soak SECS` — the long-running soak (0 = until killed; the
+    // children take the H2 clean-shutdown path when the dying parent
+    // closes their stdin). Continuous factory + parent-driven jittered
+    // sign ticks; `--fault-rate P` arms one per-session cheat per tick
+    // with probability P; `--restart-every SECS` (0 = never) cycles one
+    // child process through a kill/restart/rejoin. All randomized
+    // choices come from `--seed` (reproducible runs).
+    let soak: Option<u64> = flag_value(&mut args, "--soak").and_then(|v| v.parse().ok());
+    let fault_rate: f64 = flag_value(&mut args, "--fault-rate")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    let restart_every: u64 = flag_value(&mut args, "--restart-every")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let soak_seed: u64 = flag_value(&mut args, "--seed")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0xa7);
+    let soak_stats_every: u64 = flag_value(&mut args, "--soak-stats-every")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    // A6: `--metrics` gives each child a `--metrics-file` under its
+    // per-node dir (DIR/node-i/metrics.log).
+    let with_metrics = has_flag(&mut args, "--metrics");
+    if factory.is_some()
+        && (seeded || ki || (persist && soak.is_none()) || with_tls || cheat.is_some())
+    {
         eprintln!(
-            "spawn-demo: --factory does not combine with --seeded/--ki/--persist/--tls/--cheat"
+            "spawn-demo: --factory does not combine with --seeded/--ki/--tls/--cheat (nor --persist outside --soak)"
         );
         return ExitCode::FAILURE;
+    }
+    if let Some(duration) = soak {
+        // A7 validation: the soak needs the continuous factory; fault
+        // injection is per-session (no --cheat-node/--cheat); the
+        // kill/restart cycle needs durable state to rejoin into (--persist).
+        if factory.is_none() {
+            eprintln!("spawn-demo: --soak requires --factory N");
+            return ExitCode::FAILURE;
+        }
+        if seeded || ki || with_tls || restart || cheat.is_some() || cheat_node.is_some() {
+            eprintln!(
+                "spawn-demo: --soak does not combine with --seeded/--ki/--tls/--restart/--cheat"
+            );
+            return ExitCode::FAILURE;
+        }
+        if !(0.0..=1.0).contains(&fault_rate) {
+            eprintln!("spawn-demo: --fault-rate must be in [0, 1]");
+            return ExitCode::FAILURE;
+        }
+        if restart_every > 0 && !persist {
+            eprintln!(
+                "spawn-demo: the soak restart cycle needs --persist (the rejoining node reloads its sealed key share and store)"
+            );
+            return ExitCode::FAILURE;
+        }
+        return run_soak_demo(
+            &dir,
+            duration,
+            factory.expect("validated above"),
+            pool_ttl,
+            fault_rate,
+            restart_every,
+            soak_seed,
+            soak_stats_every,
+            persist,
+            with_metrics,
+            allow_unverified_store,
+            delay_ms,
+        );
     }
     if pool_ttl > 0 && factory.is_none() {
         eprintln!("spawn-demo: --pool-ttl only makes sense with --factory N");
@@ -1325,6 +2041,13 @@ fn spawn_demo(args: &[String]) -> ExitCode {
         if persist {
             cmd.arg("--data-dir").arg(dir.join(format!("node-{i}")));
         }
+        if with_metrics {
+            cmd.arg("--metrics-file")
+                .arg(dir.join(format!("node-{i}")).join("metrics.log"));
+        }
+        if allow_unverified_store {
+            cmd.arg("--allow-unverified-store");
+        }
         if with_tls {
             cmd.arg("--tls")
                 .arg(tls::cert_file(&dir, i))
@@ -1439,6 +2162,845 @@ fn cheat_arg(c: Cheat) -> String {
         Cheat::BadReshare { victim } => format!("bad-reshare:{victim}"),
         Cheat::BadNoncePoint => "bad-nonce-point".into(),
         Cheat::BadOpenShare => "bad-open-share".into(),
+    }
+}
+
+// --- A7: the soak parent (spawn-demo --soak) ---------------------------------
+
+/// One soak child process and the handles the parent drives it with.
+struct SoakChild {
+    child: Child,
+    stdin: std::process::ChildStdin,
+    addr: SocketAddr,
+    /// The stdout reader the READY line came from — it may hold buffered
+    /// lines past READY, so the forwarder must keep reading THIS one.
+    reader: Option<BufReader<std::process::ChildStdout>>,
+}
+
+/// Spawn one soak child (`node --factory N --soak …`), read its READY
+/// line, and return the handles. `bind` is `127.0.0.1:0` on first boot
+/// and the child's ORIGINAL address on a restart — the survivors' H2
+/// reconnection dials the address they know, so a rejoining node must
+/// rebind it. A bind failure exits the child (the EOF surfaces here as
+/// a missing READY); the caller retries — a just-vacated localhost port
+/// can linger briefly.
+#[allow(clippy::too_many_arguments)] // demo wiring: every flag the child takes
+fn soak_spawn_child(
+    exe: &Path,
+    dir: &Path,
+    id: PartyId,
+    bind: &str,
+    target: usize,
+    pool_ttl: u64,
+    stats_every: u64,
+    persist: bool,
+    with_metrics: bool,
+    allow_unverified_store: bool,
+    delay_ms: u64,
+) -> Option<SoakChild> {
+    for attempt in 1..=5 {
+        let mut cmd = Command::new(exe);
+        cmd.arg("node")
+            .arg("--seed")
+            .arg(seed::seed_file(dir, id))
+            .arg("--committee")
+            .arg(dir.join(seed::COMMITTEE_FILE))
+            .arg("--bind")
+            .arg(bind)
+            .arg("--rendezvous")
+            .arg("--delay-ms")
+            .arg(delay_ms.to_string())
+            .arg("--factory")
+            .arg(target.to_string())
+            .arg("--soak")
+            .arg("--soak-stats-every")
+            .arg(stats_every.to_string())
+            // Soak children run a shorter round timeout than the 30 s
+            // default: localhost rounds complete in ~1 s, and bounded
+            // waits keep DRAIN/probe/failure detection snappy.
+            .arg("--round-timeout-secs")
+            .arg("8");
+        if pool_ttl > 0 {
+            cmd.arg("--pool-ttl").arg(pool_ttl.to_string());
+        }
+        if persist {
+            cmd.arg("--data-dir").arg(dir.join(format!("node-{id}")));
+        }
+        if with_metrics {
+            cmd.arg("--metrics-file")
+                .arg(dir.join(format!("node-{id}")).join("metrics.log"));
+        }
+        if allow_unverified_store {
+            cmd.arg("--allow-unverified-store");
+        }
+        let mut child = match cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("spawn-demo: launching soak node {id} failed: {e}");
+                return None;
+            }
+        };
+        let stdout = child.stdout.take().expect("stdout piped");
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let ready = reader.read_line(&mut line).is_ok() && line.starts_with("READY");
+        if ready {
+            let addr: SocketAddr = line
+                .split_whitespace()
+                .nth(2)
+                .and_then(|a| a.parse().ok())
+                .expect("READY carries an address");
+            println!("[node {id}] {}", line.trim());
+            let stdin = child.stdin.take().expect("stdin piped");
+            return Some(SoakChild {
+                child,
+                stdin,
+                addr,
+                reader: Some(reader),
+            });
+        }
+        eprintln!(
+            "[node {id}] no READY (attempt {attempt}/5 — bind {bind} not free yet?); retrying"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    eprintln!("spawn-demo: soak node {id} never reported READY on {bind}");
+    None
+}
+
+/// Receive one forwarded child line (print it with the `[node K]`
+/// prefix, tally BLAME lines, stash it in the node's backlog). `false`
+/// on timeout or when every forwarder hung up.
+fn soak_recv(
+    rx: &mpsc::Receiver<(PartyId, String)>,
+    backlogs: &mut [VecDeque<String>],
+    blame_tally: &mut BTreeMap<PartyId, u64>,
+    deadline: Instant,
+) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match rx.recv_timeout(remaining) {
+        Ok((id, line)) => {
+            println!("[node {id}] {line}");
+            if let Some(rest) = line.strip_prefix("BLAME ") {
+                // "BLAME <phase> <id,id,…>"
+                if let Some(ids) = rest.split_whitespace().nth(1) {
+                    for i in ids.split(',') {
+                        if let Ok(p) = i.parse::<PartyId>() {
+                            *blame_tally.entry(p).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            backlogs[id - 1].push_back(line);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Wait (up to `deadline`) for one line matching `pred` from `node`,
+/// stashing everything else that arrives. `None` on timeout.
+fn soak_wait_line(
+    rx: &mpsc::Receiver<(PartyId, String)>,
+    backlogs: &mut [VecDeque<String>],
+    blame_tally: &mut BTreeMap<PartyId, u64>,
+    node: PartyId,
+    pred: impl Fn(&str) -> bool,
+    deadline: Instant,
+) -> Option<String> {
+    loop {
+        if let Some(pos) = backlogs[node - 1].iter().position(|l| pred(l)) {
+            return backlogs[node - 1].remove(pos);
+        }
+        if Instant::now() >= deadline || !soak_recv(rx, backlogs, blame_tally, deadline) {
+            return None;
+        }
+    }
+}
+
+/// Render the blame tally as `2:1,3:2` (party:count) or `-`.
+fn soak_blames_str(tally: &BTreeMap<PartyId, u64>) -> String {
+    if tally.is_empty() {
+        return "-".to_string();
+    }
+    tally
+        .iter()
+        .map(|(p, n)| format!("{p}:{n}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The kill/restart/rejoin cycle: drain every factory (no session in
+/// flight, and the DRAINED max_seen check proves the id spaces still
+/// agree), kill one child, restart it on its ORIGINAL address (the
+/// survivors' H2 reconnection dials the address they know), let it
+/// reload its sealed key share (same X — the store stays valid), and
+/// restart all factories. `false` on any divergence or timeout — that
+/// is exactly the kind of breakage the soak exists to surface.
+#[allow(clippy::too_many_arguments)] // the cycle touches every parent handle
+fn soak_restart_cycle(
+    victim: PartyId,
+    probe_seq: u64,
+    children: &mut [SoakChild],
+    rx: &mpsc::Receiver<(PartyId, String)>,
+    tx: &mpsc::Sender<(PartyId, String)>,
+    forwarders: &mut Vec<std::thread::JoinHandle<()>>,
+    backlogs: &mut [VecDeque<String>],
+    blame_tally: &mut BTreeMap<PartyId, u64>,
+    exe: &Path,
+    dir: &Path,
+    x_line: &str,
+    target: usize,
+    pool_ttl: u64,
+    stats_every: u64,
+    with_metrics: bool,
+    allow_unverified_store: bool,
+    delay_ms: u64,
+) -> bool {
+    println!("SOAK-RESTART node={victim} draining factories before the kill");
+    for c in children.iter_mut() {
+        let _ = writeln!(c.stdin, "DRAIN");
+    }
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut max_seen: BTreeMap<PartyId, u64> = BTreeMap::new();
+    for id in 1..=3usize {
+        let Some(line) = soak_wait_line(
+            rx,
+            backlogs,
+            blame_tally,
+            id,
+            |l| l.starts_with("DRAINED "),
+            deadline,
+        ) else {
+            eprintln!("spawn-demo: node {id} did not DRAIN in time");
+            return false;
+        };
+        let seen = line
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix("max_seen="))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        max_seen.insert(id, seen);
+    }
+    if max_seen.values().collect::<BTreeSet<_>>().len() != 1 {
+        // The id spaces diverged — a retried session could reuse a sid
+        // the wire still holds. Surface it as a soak failure, loudly.
+        println!("SOAK-RESTART node={victim} FAILED: store id spaces diverged ({max_seen:?})");
+        return false;
+    }
+    let pid = children[victim - 1].child.id();
+    let _ = children[victim - 1].child.kill();
+    let _ = children[victim - 1].child.wait();
+    println!("SOAK-RESTART node={victim} killed (pid {pid}); restarting on the same address");
+    let bind = children[victim - 1].addr.to_string();
+    let Some(mut spawned) = soak_spawn_child(
+        exe,
+        dir,
+        victim,
+        &bind,
+        target,
+        pool_ttl,
+        stats_every,
+        true, // the restart cycle only runs with --persist (validated)
+        with_metrics,
+        allow_unverified_store,
+        delay_ms,
+    ) else {
+        return false;
+    };
+    let peers_line = format!(
+        "PEERS {}\n",
+        children
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}@{}", i + 1, c.addr))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    if spawned.stdin.write_all(peers_line.as_bytes()).is_err() {
+        eprintln!("spawn-demo: writing PEERS to the restarted node {victim} failed");
+        return false;
+    }
+    // The restarted child's stdout needs a fresh forwarder.
+    let reader = spawned.reader.take().expect("READY reader handed over");
+    let fwd_tx = tx.clone();
+    forwarders.push(std::thread::spawn(move || {
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            if fwd_tx.send((victim, line)).is_err() {
+                break;
+            }
+        }
+    }));
+    children[victim - 1] = spawned;
+    // The rejoined node reloads its sealed key share: it must come back
+    // with the SAME X, or the committee forked.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let x = soak_wait_line(
+        rx,
+        backlogs,
+        blame_tally,
+        victim,
+        |l| l.starts_with("X "),
+        deadline,
+    );
+    if x.as_deref() != Some(x_line) {
+        println!(
+            "SOAK-RESTART node={victim} FAILED: rejoined with a different X ({x:?} vs {x_line:?})"
+        );
+        return false;
+    }
+    if soak_wait_line(
+        rx,
+        backlogs,
+        blame_tally,
+        victim,
+        |l| l == "SOAK-READY",
+        deadline,
+    )
+    .is_none()
+    {
+        eprintln!("spawn-demo: restarted node {victim} never became SOAK-READY");
+        return false;
+    }
+    // Heal the mesh BEFORE any session traffic: the rejoined node's
+    // MESH-CHECK probe only completes once a survivor's echo has landed
+    // over a re-established connection (the survivors' outgoing links to
+    // the victim are stale until a write triggers the H2 reconnect).
+    let probe = format!("MESH-CHECK {probe_seq}");
+    if writeln!(children[victim - 1].stdin, "{probe}").is_err()
+        || soak_wait_line(
+            rx,
+            backlogs,
+            blame_tally,
+            victim,
+            |l| l == "MESH-OK",
+            Instant::now() + Duration::from_secs(90),
+        )
+        .is_none()
+    {
+        eprintln!("spawn-demo: restarted node {victim} failed the mesh heal probe");
+        return false;
+    }
+    for c in children.iter_mut() {
+        let _ = writeln!(c.stdin, "FACTORY-START");
+    }
+    for id in 1..=3usize {
+        if soak_wait_line(
+            rx,
+            backlogs,
+            blame_tally,
+            id,
+            |l| l == "FACTORY-STARTED",
+            deadline,
+        )
+        .is_none()
+        {
+            eprintln!("spawn-demo: node {id} did not restart its factory");
+            return false;
+        }
+    }
+    // Wait for every factory to refill the pool before signs resume: a
+    // full production round-trip is what re-establishes the survivors'
+    // connections to the rejoined node (their write-triggered H2
+    // reconnect) — a sign racing ahead of the heal can see its session
+    // journal retired before the re-sync re-delivers it.
+    let refill_deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let mut full = true;
+        for c in children.iter_mut() {
+            let _ = writeln!(c.stdin, "POOL-STATUS");
+        }
+        for id in 1..=3usize {
+            let Some(line) = soak_wait_line(
+                rx,
+                backlogs,
+                blame_tally,
+                id,
+                |l| l.starts_with("POOL "),
+                refill_deadline,
+            ) else {
+                eprintln!("spawn-demo: node {id} did not answer POOL-STATUS");
+                return false;
+            };
+            let stored = line
+                .split_whitespace()
+                .find_map(|kv| kv.strip_prefix("stored="))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            if stored < target {
+                full = false;
+            }
+        }
+        if full {
+            break;
+        }
+        if Instant::now() >= refill_deadline {
+            eprintln!("spawn-demo: the pools did not refill after the restart");
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    println!("SOAK-RESTART node={victim} rejoined; signs resume");
+    true
+}
+
+/// A4 end-of-soak store audit (--persist): reopen every node's store
+/// OFFLINE (journal chain + transcript cross-check at `open`) and
+/// report. Integrity is `ok` iff no `WARNING`-level entry was collected
+/// (the standing whole-directory-rollback NOTE is informational — true
+/// prevention needs state outside the directory, SPEC §13.3).
+fn soak_store_check(dir: &Path, x_bytes: &[u8]) -> bool {
+    let mut ok = true;
+    let Ok(vk) = VerifyingKey::from_sec1_bytes(x_bytes) else {
+        println!("SOAK-STORE integrity=OPEN-FAILED (unparseable X)");
+        return false;
+    };
+    let x = *vk.as_affine();
+    for id in 1..=3usize {
+        let store_dir = dir.join(format!("node-{id}/store"));
+        let verdict = (|| -> Result<String, String> {
+            let key = ohm_ecdsa_node::seal::StorageKey::resolve(&store_dir)
+                .map_err(|e| format!("storage key: {e}"))?
+                .ok_or_else(|| "no storage key configured".to_string())?;
+            let store = persist::DiskPresigStore::open(&store_dir, &x, &key)
+                .map_err(|e| format!("open failed: {e}"))?;
+            let hard = store
+                .integrity_warnings()
+                .iter()
+                .filter(|w| w.starts_with("WARNING"))
+                .count();
+            Ok(format!(
+                "live={} consumed={} expired={} integrity={}",
+                store.len(),
+                store.consumed_count(),
+                store.expired_count(),
+                if hard == 0 {
+                    "ok".to_string()
+                } else {
+                    format!("WARNINGS({hard})")
+                }
+            ))
+        })();
+        match verdict {
+            Ok(line) => {
+                if line.contains("WARNINGS") {
+                    ok = false;
+                }
+                println!("SOAK-STORE node={id} {line}");
+            }
+            Err(e) => {
+                println!("SOAK-STORE node={id} integrity=OPEN-FAILED ({e})");
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
+/// The A7 soak parent (`spawn-demo --soak SECS`): see the section docs
+/// at `run_soak_node`. The parent owns the SCHEDULE (children are
+/// deterministic workers): jittered sign ticks of `soak_message(seq)`,
+/// per-session fault arming, and kill/restart cycles — every randomized
+/// choice drawn from a seeded RNG so a run reproduces from `--seed`.
+/// Exit 0 iff: no sign failed, no party was ever blamed without being
+/// armed, the end-of-soak A4 store audit passes, and every child
+/// exited cleanly.
+#[allow(clippy::too_many_arguments)] // the soak's full configuration
+fn run_soak_demo(
+    dir: &Path,
+    duration: u64,
+    target: usize,
+    pool_ttl: u64,
+    fault_rate: f64,
+    restart_every: u64,
+    seed: u64,
+    stats_every: u64,
+    persist: bool,
+    with_metrics: bool,
+    allow_unverified_store: bool,
+    delay_ms: u64,
+) -> ExitCode {
+    println!(
+        "== ohm-ecdsa-node A7 soak: 2-of-3 across 3 OS processes, {}s, factory target {}, \
+         fault-rate {}, restart-every {}s, seed {seed} ==",
+        if duration == 0 {
+            "until-killed".to_string()
+        } else {
+            duration.to_string()
+        },
+        target,
+        fault_rate,
+        restart_every,
+    );
+    println!(
+        "  DEMO-ONLY ceremony + parent-driven schedule; the children hold only their own seeds"
+    );
+    let params = Params::new(3, 2).expect("valid params");
+    let ceremony_seed = rand::RngCore::next_u64(&mut OsRng);
+    let (info, seeds) = seed::ceremony(&params, 1, ceremony_seed);
+    if let Err(e) = seed::write_all(dir, &info, &seeds) {
+        eprintln!("spawn-demo: writing seed files failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("spawn-demo: locating the node binary failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Boot the committee.
+    let mut children: Vec<SoakChild> = Vec::new();
+    for id in 1..=3usize {
+        match soak_spawn_child(
+            &exe,
+            dir,
+            id,
+            "127.0.0.1:0",
+            target,
+            pool_ttl,
+            stats_every,
+            persist,
+            with_metrics,
+            allow_unverified_store,
+            delay_ms,
+        ) {
+            Some(c) => children.push(c),
+            None => return ExitCode::FAILURE,
+        }
+    }
+    let peers_line = format!(
+        "PEERS {}\n",
+        children
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}@{}", i + 1, c.addr))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for c in &mut children {
+        if c.stdin.write_all(peers_line.as_bytes()).is_err() {
+            eprintln!("spawn-demo: writing PEERS failed");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // Forward every child's stdout into one channel; the parent's waits
+    // below print and stash from it (see `soak_recv`).
+    let (tx, rx) = mpsc::channel::<(PartyId, String)>();
+    let mut backlogs: Vec<VecDeque<String>> =
+        vec![VecDeque::new(), VecDeque::new(), VecDeque::new()];
+    let mut blame_tally: BTreeMap<PartyId, u64> = BTreeMap::new();
+    let mut forwarders = Vec::new();
+    for (i, c) in children.iter_mut().enumerate() {
+        let id = i + 1;
+        let reader = c.reader.take().expect("READY reader handed over");
+        let tx = tx.clone();
+        forwarders.push(std::thread::spawn(move || {
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if tx.send((id, line)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+    // Kept for the restart cycle's fresh forwarders; the initial
+    // forwarders hold their own clones.
+    let tx_restart = tx.clone();
+    drop(tx);
+
+    let mut ok = true;
+    let boot_deadline = Instant::now() + Duration::from_secs(180);
+    // Keygen (or reload): every child reports the same X.
+    let mut x_lines = Vec::new();
+    for id in 1..=3usize {
+        match soak_wait_line(
+            &rx,
+            &mut backlogs,
+            &mut blame_tally,
+            id,
+            |l| l.starts_with("X "),
+            boot_deadline,
+        ) {
+            Some(l) => x_lines.push(l),
+            None => {
+                eprintln!("spawn-demo: soak node {id} never reported X");
+                ok = false;
+            }
+        }
+    }
+    let x_line = x_lines.first().cloned().unwrap_or_default();
+    let consistent = ok && !x_lines.is_empty() && x_lines.iter().all(|x| *x == x_line);
+    if !consistent {
+        println!("RESULT soak: INCONSISTENT keygen (xs={x_lines:?})");
+        // Stop the children before returning.
+        for c in &mut children {
+            let _ = writeln!(c.stdin, "STOP");
+        }
+        for c in &mut children {
+            let _ = c.child.wait();
+        }
+        return ExitCode::FAILURE;
+    }
+    let x_bytes = hex_decode(x_line.trim_start_matches("X ")).unwrap_or_default();
+    let vk = VerifyingKey::from_sec1_bytes(&x_bytes).ok();
+    for id in 1..=3usize {
+        if soak_wait_line(
+            &rx,
+            &mut backlogs,
+            &mut blame_tally,
+            id,
+            |l| l == "SOAK-READY",
+            boot_deadline,
+        )
+        .is_none()
+        {
+            eprintln!("spawn-demo: soak node {id} never became SOAK-READY");
+            ok = false;
+        }
+    }
+    if ok {
+        for c in &mut children {
+            let _ = writeln!(c.stdin, "FACTORY-START");
+        }
+        for id in 1..=3usize {
+            if soak_wait_line(
+                &rx,
+                &mut backlogs,
+                &mut blame_tally,
+                id,
+                |l| l == "FACTORY-STARTED",
+                boot_deadline,
+            )
+            .is_none()
+            {
+                eprintln!("spawn-demo: soak node {id} never started its factory");
+                ok = false;
+            }
+        }
+    }
+    println!("RESULT keygen: all 3 processes agree on {x_line}");
+
+    // The soak loop: jittered sign ticks of the deterministic message
+    // sequence, fault arming at `--fault-rate`, kill/restart cycles at
+    // `--restart-every`.
+    let mut rng = StdRng::seed_from_u64(seed);
+    let started = Instant::now();
+    let deadline = (duration > 0).then(|| started + Duration::from_secs(duration));
+    let mut next_restart =
+        (restart_every > 0).then(|| started + Duration::from_secs(restart_every));
+    let mut tick = 0u64;
+    let mut probe_seq = 0u64;
+    let mut signs_ok = 0u64;
+    let mut signs_failed = 0u64;
+    let mut armed: BTreeSet<PartyId> = BTreeSet::new();
+    let mut last_stats = Instant::now();
+    while ok {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+        if let Some(t) = next_restart {
+            if Instant::now() >= t {
+                let victim = rng.gen_range(1..=3usize);
+                probe_seq += 1;
+                if !soak_restart_cycle(
+                    victim,
+                    probe_seq,
+                    &mut children,
+                    &rx,
+                    &tx_restart,
+                    &mut forwarders,
+                    &mut backlogs,
+                    &mut blame_tally,
+                    &exe,
+                    dir,
+                    &x_line,
+                    target,
+                    pool_ttl,
+                    stats_every,
+                    with_metrics,
+                    allow_unverified_store,
+                    delay_ms,
+                ) {
+                    ok = false;
+                    break;
+                }
+                next_restart = Some(Instant::now() + Duration::from_secs(restart_every));
+            }
+        }
+        if last_stats.elapsed() >= Duration::from_secs(60) {
+            println!(
+                "SOAK-STATS signs_ok={signs_ok} signs_failed={signs_failed} ticks={tick} blames={}",
+                soak_blames_str(&blame_tally)
+            );
+            last_stats = Instant::now();
+        }
+        // 2–5 s jittered ticks (seeded — reproducible), never sleeping
+        // past the deadline.
+        let wait = Duration::from_millis(rng.gen_range(2000..=5000));
+        if deadline.is_some_and(|d| Instant::now() + wait >= d) {
+            break;
+        }
+        std::thread::sleep(wait);
+        tick += 1;
+        let mut tokens = ["-".to_string(), "-".to_string(), "-".to_string()];
+        if rng.gen_bool(fault_rate) {
+            let who = rng.gen_range(1..=3usize);
+            let cheat = match rng.gen_range(0..4) {
+                0 => Cheat::BadSignShare,
+                1 => Cheat::BadOpenShare,
+                2 => Cheat::BadNoncePoint,
+                _ => Cheat::BadDeal {
+                    victim: 1 + (who % 3),
+                },
+            };
+            armed.insert(who);
+            tokens[who - 1] = cheat_arg(cheat);
+            println!("SOAK-FAULT seq={tick} node={who} cheat={}", tokens[who - 1]);
+        }
+        for (i, c) in children.iter_mut().enumerate() {
+            if writeln!(c.stdin, "SIGN {tick} {}", tokens[i]).is_err() {
+                eprintln!("spawn-demo: writing SIGN to node {} failed", i + 1);
+                ok = false;
+            }
+        }
+        if !ok {
+            break;
+        }
+        // Every node answers SIG or SIGN-FAIL for the tick (the tick
+        // deadline is generous — a silent node IS the soak failure).
+        let tick_deadline = Instant::now() + Duration::from_secs(240);
+        let mut answers: Vec<Option<String>> = Vec::new();
+        for id in 1..=3usize {
+            let sig_prefix = format!("SIG {tick} ");
+            let fail_prefix = format!("SIGN-FAIL {tick}");
+            let answer = soak_wait_line(
+                &rx,
+                &mut backlogs,
+                &mut blame_tally,
+                id,
+                |l| l.starts_with(&sig_prefix) || l.starts_with(&fail_prefix),
+                tick_deadline,
+            );
+            answers.push(answer);
+        }
+        let sigs: Vec<&str> = answers
+            .iter()
+            .filter_map(|a| a.as_deref())
+            .filter(|l| l.starts_with("SIG "))
+            .collect();
+        // "SIG <seq> <r> <s>" — r ‖ s is the signature.
+        let sig_bytes = sigs.first().and_then(|l| {
+            let parts: Vec<&str> = l.split_whitespace().collect();
+            (parts.len() == 4).then(|| hex_decode(&format!("{}{}", parts[2], parts[3])))?
+        });
+        let verified = sigs.len() == 3
+            && sigs.iter().all(|s| *s == sigs[0])
+            && match (vk, sig_bytes) {
+                (Some(vk), Some(bytes)) => Signature::from_slice(&bytes)
+                    .map(|sig| vk.verify(&soak_message(tick), &sig).is_ok())
+                    .unwrap_or(false),
+                _ => false,
+            };
+        if verified {
+            signs_ok += 1;
+        } else {
+            signs_failed += 1;
+        }
+        println!(
+            "SOAK-SIGN seq={tick} ok={verified} signs_ok={signs_ok} signs_failed={signs_failed}"
+        );
+    }
+
+    // Wrap up: STOP every child (the H2 clean-shutdown path), collect
+    // the per-node summaries, and audit the stores offline (A4).
+    for c in &mut children {
+        let _ = writeln!(c.stdin, "STOP");
+    }
+    let stop_deadline = Instant::now() + Duration::from_secs(120);
+    for id in 1..=3usize {
+        let _ = soak_wait_line(
+            &rx,
+            &mut backlogs,
+            &mut blame_tally,
+            id,
+            |l| l.starts_with("SOAK-SUMMARY "),
+            stop_deadline,
+        );
+    }
+    let mut children_ok = true;
+    for (i, c) in children.iter_mut().enumerate() {
+        // The child prints SOAK-SUMMARY and then finishes its H2 clean
+        // shutdown — give it a moment before declaring it stuck.
+        let exit_deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            match c.child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < exit_deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => break None,
+            }
+        };
+        match status {
+            Some(s) if s.success() => {}
+            Some(other) => {
+                eprintln!(
+                    "spawn-demo: soak node {} exited abnormally: {other:?}",
+                    i + 1
+                );
+                children_ok = false;
+            }
+            None => {
+                let _ = c.child.kill();
+                let _ = c.child.wait();
+                eprintln!("spawn-demo: soak node {} did not shut down cleanly", i + 1);
+                children_ok = false;
+            }
+        }
+    }
+    for f in forwarders {
+        let _ = f.join();
+    }
+    let store_ok = !persist || soak_store_check(dir, &x_bytes);
+    let honest_blamed = blame_tally.keys().any(|b| !armed.contains(b));
+    let armed_str = {
+        let s = armed
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        if s.is_empty() {
+            "-".to_string()
+        } else {
+            s
+        }
+    };
+    println!(
+        "SOAK-SUMMARY signs_ok={signs_ok} signs_failed={signs_failed} ticks={tick} armed={armed_str} blames={} honest_blamed={honest_blamed}",
+        soak_blames_str(&blame_tally),
+    );
+    println!(
+        "RESULT soak: signs_ok={signs_ok} signs_failed={signs_failed} honest_blamed={honest_blamed} store_integrity={}",
+        if store_ok { "ok" } else { "FAILED" },
+    );
+    let success = ok && signs_failed == 0 && !honest_blamed && store_ok && children_ok;
+    if success {
+        println!("RESULT demo: SUCCESS");
+        ExitCode::SUCCESS
+    } else {
+        println!("RESULT demo: FAILURE");
+        ExitCode::FAILURE
     }
 }
 
