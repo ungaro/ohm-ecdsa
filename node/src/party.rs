@@ -782,7 +782,10 @@ pub struct PartyNode {
     /// H2: set by [`PartyNode::shutdown`]; the collector exits.
     shutdown_flag: Arc<AtomicBool>,
     /// M3b: the durable presignature store (§8.6), configured per key.
-    store: Mutex<Option<DiskPresigStore>>,
+    /// Shared (Arc) with the H5 pool manager ([`crate::pool`]) — the
+    /// manager is the only WRITER (insert/expire), signing only
+    /// CONSUMES through the same instance.
+    store: Arc<Mutex<Option<DiskPresigStore>>>,
     /// M3b: the transcript + blame-token archive (§4.7, §10.2, §A.4).
     archive: Mutex<Option<Archive>>,
     /// §8.7: the IN-MEMORY key-free KI pool. Pool records carry no
@@ -875,7 +878,7 @@ impl PartyNode {
             timeout: round_timeout,
             collector: Mutex::new(Some(collector)),
             shutdown_flag,
-            store: Mutex::new(None),
+            store: Arc::new(Mutex::new(None)),
             archive: Mutex::new(None),
             ki_pool: Mutex::new(KiPool::new()),
         })
@@ -953,6 +956,15 @@ impl PartyNode {
         let store = DiskPresigStore::open(dir, public_key, &storage_key)?;
         *self.store.lock().expect("mesh mutex poisoned") = Some(store);
         Ok(())
+    }
+
+    /// H5: the shared store handle for the pool manager
+    /// ([`crate::pool::PoolManager`]) — the SAME instance
+    /// [`Self::sign_stored`] consumes from, so pool maintenance (the
+    /// single writer: insert/expire) and signing (atomic consume) share
+    /// one view of the directory. `None` until [`Self::set_store`] runs.
+    pub fn store_handle(&self) -> Arc<Mutex<Option<DiskPresigStore>>> {
+        Arc::clone(&self.store)
     }
 
     /// M3b: open (or create) the evidence archive at `dir`: every

@@ -173,6 +173,26 @@
 //!   --restart` run the arc; the default stays fail-fast (some
 //!   deployments prefer loud aborts).
 //!
+//! H5 (key-material protection + pool management — [`locked`], [`seal`],
+//! [`pool`]):
+//!
+//! * long-lived secrets at the node boundary (key shares, the transport
+//!   signing key, pooled records) are wrapped in page-locked buffers
+//!   ([`locked::LockedSecret`], `mlock`/`munlock` — FAIL-OPEN with a loud
+//!   warning when the OS refuses, the only fail-open path in H5); the
+//!   core's zeroize-on-drop is unchanged;
+//! * at-rest: every secret file (presignature records, seed/identity
+//!   files) is SEALED — canonical bytes inside a ChaCha20-Poly1305
+//!   envelope under a per-node storage key ([`seal::StorageKey`];
+//!   resolved from `OHM_STORAGE_KEY` / `OHM_STORAGE_KEY_FILE` / a
+//!   generated `0600` dev key file — the KMS/HSM integration point, not
+//!   a KMS), written `0600`, legacy cleartext rejected (fail closed);
+//! * [`pool::PoolManager`] — the §8.6 pool maintenance layer: keeps the
+//!   durable store filled to a target level (single writer; signing
+//!   only consumes), enforces a per-record TTL with secure erase
+//!   (§8.6(3) — expiry tombstone fsync'd first, id burned forever), and
+//!   survives crash/restart without re-issuing ids or over-producing.
+//!
 //! H2 is still NOT: crash recovery of finished rounds (the journal
 //! covers in-flight sessions only), reconnection of INCOMING
 //! connections (the dial side reconnects; the accept side just serves
@@ -191,6 +211,7 @@ pub mod locked;
 pub mod mesh;
 pub mod party;
 pub mod persist;
+pub mod pool;
 pub mod seal;
 pub mod seed;
 pub mod tls;
@@ -200,6 +221,7 @@ pub mod wire;
 pub use mesh::Node;
 pub use party::{Cheat, NodePayload, PartyNode};
 pub use persist::{Archive, AuditReport, BlameEvidence, DiskPresigStore, PersistError};
+pub use pool::{PoolConfig, PoolCounters, PoolManager, PoolStats};
 pub use tls::CommitteeTls;
 pub use transport::{MeshTransport, DEFAULT_ROUND_TIMEOUT};
 pub use wire::{Received, WireMessage};

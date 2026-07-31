@@ -1,6 +1,6 @@
 # OHM-ECDSA: Open Honest-Majority Threshold ECDSA from Public-Domain Components
 
-**Draft v0.2 — for IACR ePrint submission. Unreviewed. Not audited. Typeset version: `main.pdf` (from `main.tex`).**
+**Draft v0.3 — for IACR ePrint submission. Unreviewed. Not audited. Typeset version: `main.pdf` (from `main.tex`).**
 
 ## Abstract
 
@@ -88,7 +88,7 @@ Every broadcast value is one of: a hash that must match a later reveal, a share 
 
 ### 7.1 Implementation
 
-Two Rust crates. The **core** (`ohm-ecdsa`, ~5,400 LoC) is dependency-pure (`k256`, `sha2`, `thiserror`, `rand`, `zeroize`), MSRV 1.75, no unsafe, and implements every feature of §3: DKG with public complaint arbitration, triple factory (single/batch/packed), presignatures (key-dependent, batched, packed, key-independent pools), one-round signing, robustness, expel-and-restart, refresh/re-sharing, single-use stores, HD tweaks, signed envelopes with offline-verifiable blame tokens, and a canonical wire format. The **node crate** (`ohm-ecdsa-node`, std-only + rustls) runs the full protocol between separate OS processes — strict key separation by construction — over full-mesh TCP with per-message ECDSA-signed envelopes and echo broadcast, with durable crash-safe single-use stores, transcript archiving, an offline blame-token auditor, and optional mTLS with committee certificate pinning. Test suite: 127 tests (unit, integration, process-level with real child processes, and example smoke tests), deterministic throughout.
+Two Rust crates. The **core** (`ohm-ecdsa`, ~5,400 LoC) is dependency-pure (`k256`, `sha2`, `thiserror`, `rand`, `zeroize`), MSRV 1.75, no unsafe, and implements every feature of §3: DKG with public complaint arbitration, triple factory (single/batch/packed), presignatures (key-dependent, batched, packed, key-independent pools), one-round signing, robustness, expel-and-restart, refresh/re-sharing, single-use stores, HD tweaks, signed envelopes with offline-verifiable blame tokens, and a canonical wire format. The **node crate** (`ohm-ecdsa-node`) runs the full protocol between separate OS processes — strict key separation by construction — over full-mesh TCP with per-message ECDSA-signed envelopes and echo broadcast, with durable crash-safe single-use stores, transcript archiving, an offline blame-token auditor, and optional mTLS with committee certificate pinning. The node crate is hardened well beyond a demo: wire decoders are fuzzed (28M+ executions, zero crashes); connections self-heal via journaled reconnection with idempotent re-delivery; shutdown is clean (joined threads, deadlines on all blocking IO); DoS guards bound frame sizes and rates per peer; multiple protocol sessions run concurrently, demultiplexed by session id, behind a background presignature factory with target-level pooling and expiry; committee setup is a distributed ceremony in which no process ever holds another party's secret; robust continuation and expel-and-restart are available over the wire as opt-in modes; and key material is mlock-pinned in memory and AEAD-encrypted at rest with a KMS-pluggable storage key. Test suite: 169 tests (unit, integration, process-level with real child processes, and example smoke tests), deterministic throughout.
 
 ### 7.2 Measurements
 
@@ -114,7 +114,7 @@ KU23's 1.3 ms/presig is the amortization of key-independent batching at `m = 10,
 
 ## 8. Limitations and future work
 
-§5 is a proof *skeleton* — closing gaps L1 (rushing-adversary DKG extraction) and L2 (the hiding hybrid), plus a rigorous composition statement, is the main open theoretical work and a prerequisite to production use, alongside independent implementation review. Security is claimed against static corruptions only. The node crate is a reference transport, not production infrastructure (reconnection, clean shutdown, DoS hardening remain). PRSS-based randomness was analyzed and deliberately deferred: PRSS outputs carry no Feldman commitments, conflicting with unconditional identifiability. A UC restatement and proactive-adaptive security are further work.
+§5 is a proof *skeleton* — closing gaps L1 (rushing-adversary DKG extraction) and L2 (the hiding hybrid), plus a rigorous composition statement, is the main open theoretical work and a prerequisite to production use, alongside independent implementation review. Security is claimed against static corruptions only. The node crate is a hardened reference transport, not certified production infrastructure (crash recovery of finished rounds, committee rejoin after full restart, rollback defense, and HSM integration remain; an external audit is still required). PRSS-based randomness was analyzed and deliberately deferred: PRSS outputs carry no Feldman commitments, conflicting with unconditional identifiability. A UC restatement and proactive-adaptive security are further work.
 
 ## References
 

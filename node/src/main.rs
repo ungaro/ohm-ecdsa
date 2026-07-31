@@ -56,13 +56,13 @@
 //!
 //! Run `… --help`-less: wrong usage prints the usage text.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use k256::ecdsa::signature::Verifier;
@@ -74,6 +74,7 @@ use ohm_ecdsa::transport::{drive_dkg_signed, SigningTransport};
 use ohm_ecdsa::{session_id, Error, Params, PartyId, Phase};
 use ohm_ecdsa_node::ceremony::{self, PubBundle};
 use ohm_ecdsa_node::persist::{self, PersistError};
+use ohm_ecdsa_node::pool::{PoolConfig, PoolManager};
 use ohm_ecdsa_node::seed::{self, CommitteeInfo};
 use ohm_ecdsa_node::tls::{self, CommitteeTls};
 use ohm_ecdsa_node::{Cheat, MeshTransport, PartyNode, DEFAULT_ROUND_TIMEOUT};
@@ -114,9 +115,9 @@ fn main() -> ExitCode {
                  ohm-ecdsa-node node (--seed FILE | --identity FILE) --committee FILE --bind ADDR \\\n    \
                  [--rendezvous | --peers id@host:port,...] [--delay-ms D] [--seeded] [--ki] \\\n    \
                  [--round-timeout-secs S] [--cheat C] [--presig-id K] [--message MSG] \\\n    \
-                 [--data-dir DIR] [--tls CERT KEY --pinned DIR] [--factory N] [--restart]\n  \
+                 [--data-dir DIR] [--tls CERT KEY --pinned DIR] [--factory N] [--pool-ttl SECS] [--restart]\n  \
                  ohm-ecdsa-node spawn-demo [--dir DIR] [--delay-ms D] [--seeded] [--persist] \\\n    \
-                 [--tls] [--ki] [--factory N] [--restart] [--cheat-node K --cheat C]   (DEMO-ONLY)\n  \
+                 [--tls] [--ki] [--factory N] [--pool-ttl SECS] [--restart] [--cheat-node K --cheat C]   (DEMO-ONLY)\n  \
                  ohm-ecdsa-node auditor TOKEN_FILE COMMITTEE_FILE\n  \
                  cheats: bad-deal:V | false-accuse:D | bad-sign-share | \\\n    \
                  bad-product-proof | bad-reshare:V | bad-nonce-point | bad-open-share"
@@ -403,9 +404,13 @@ fn node_mode(args: &[String]) -> ExitCode {
     // deployments prefer loud aborts).
     let restart = has_flag(&mut args, "--restart");
     // H2 Phase 3: `--factory N` runs the concurrent-sessions demo — a
-    // background factory thread keeps N presignatures in an in-memory
-    // pool while the main thread signs.
+    // background H5 pool manager keeps N presignatures in the node's
+    // durable store while the main thread signs. `--pool-ttl SECS`
+    // (H5, §8.6(3)) expires records older than SECS (0 = never).
     let factory: Option<usize> = flag_value(&mut args, "--factory").and_then(|v| v.parse().ok());
+    let pool_ttl: u64 = flag_value(&mut args, "--pool-ttl")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let peers_arg = flag_value(&mut args, "--peers");
     let delay_ms: u64 = flag_value(&mut args, "--delay-ms")
         .and_then(|v| v.parse().ok())
@@ -432,6 +437,10 @@ fn node_mode(args: &[String]) -> ExitCode {
 
     if factory.is_some() && (seeded || ki) {
         eprintln!("node: --factory does not combine with --seeded or --ki");
+        return ExitCode::FAILURE;
+    }
+    if pool_ttl > 0 && factory.is_none() {
+        eprintln!("node: --pool-ttl only makes sense with --factory N");
         return ExitCode::FAILURE;
     }
     if restart && (seeded || ki || factory.is_some()) {
@@ -644,14 +653,24 @@ fn node_mode(args: &[String]) -> ExitCode {
             .as_bytes()
             .to_vec();
 
-        // H2 Phase 3 (concurrent sessions): `--factory N` — a background
-        // factory thread keeps N presignatures in an in-memory pool while
+        // H2 Phase 3 (concurrent sessions): `--factory N` — the H5 pool
+        // manager keeps N presignatures in the node's DURABLE store while
         // the main thread signs FACTORY_MESSAGES against consumed
-        // records. Every session (factory presign, online sign) is
-        // demultiplexed by sid in the acceptor and progresses
-        // concurrently; the node is shut down cleanly at the end.
+        // records (`--pool-ttl` expires aged records, §8.6(3)). Every
+        // session (factory presign, online sign) is demultiplexed by sid
+        // in the acceptor and progresses concurrently; the node is shut
+        // down cleanly at the end.
         if let Some(target) = factory {
-            return run_factory_demo(Arc::new(node), me, share, x_bytes, target, cheat);
+            return run_factory_demo(
+                Arc::new(node),
+                me,
+                share,
+                x_bytes,
+                target,
+                pool_ttl,
+                data_dir.clone(),
+                cheat,
+            );
         }
 
         // §8.7 KI mode: produce a KEY-FREE pool record (P1–P3 only — no
@@ -933,91 +952,111 @@ fn ids_str(ids: &[PartyId]) -> String {
         .join(",")
 }
 
-/// H2 Phase 3 proving ground (`node --factory N`, concurrent sessions):
-/// a BACKGROUND factory thread keeps `target` presignatures in an
-/// in-memory pool (per-node §7.2/§8 over the wire) while the main thread
-/// signs [`FACTORY_MESSAGES`] against the oldest records. All three node
-/// processes run the same deterministic session sequence (presign ids
-/// `1..` in pool order; sign id = the consumed record's id), so their
-/// sids line up without any extra coordination; a sign session starting
-/// while another node's factory session is mid-flight is exactly the
-/// overlap this demonstrates. Prints one `SIG` line per message and a
-/// final `FACTORY` line; the node is shut down cleanly before exit.
+/// H2 Phase 3 proving ground (`node --factory N`, concurrent sessions)
+/// on the H5 POOL MANAGER: a background [`PoolManager`] thread keeps
+/// `target` presignatures in the node's DURABLE store (M3b sealed
+/// records, §8.6 — the manager is the single writer) while the main
+/// thread signs [`FACTORY_MESSAGES`], consuming the OLDEST live record
+/// per message via `sign_stored` (the consume tombstone is fsync'd
+/// before the share is broadcast). `--pool-ttl SECS` (H5, §8.6(3))
+/// expires aged records (erased, never served, ids burned). All three
+/// node processes run the same deterministic session sequence (presign
+/// ids `1..` in pool order — re-seeded from the persisted store after a
+/// restart, never re-issued; sign id = the consumed record's id), so
+/// their sids line up without any extra coordination; a sign session
+/// starting while another node's factory session is mid-flight is
+/// exactly the overlap this demonstrates. Prints one `SIG` line per
+/// message and a final `FACTORY` line (target/produced/stored/expired/
+/// signed); the node is shut down cleanly before exit. Without
+/// `--data-dir` the pool store lives in a per-process temp dir removed
+/// at the end.
+#[allow(clippy::too_many_arguments)] // demo wiring: node + arc state + pool config
 fn run_factory_demo(
     node: Arc<PartyNode>,
     me: PartyId,
     share: KeyShare,
     x_bytes: Vec<u8>,
     target: usize,
+    pool_ttl: u64,
+    data_dir: Option<PathBuf>,
     cheat: Option<Cheat>,
 ) -> ExitCode {
-    let pool: Arc<Mutex<VecDeque<Presignature>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let produced = Arc::new(AtomicU64::new(0));
+    // H5: the pool lives in the durable store (§8.6 — sealed, 0600).
+    let (store_dir, cleanup) = match &data_dir {
+        Some(d) => (d.join("store"), false),
+        None => (
+            std::env::temp_dir().join(format!("ohm-factory-store-{}-{me}", std::process::id())),
+            true,
+        ),
+    };
+    if let Err(e) = node.set_store(&store_dir, &share.com.points[0].to_affine()) {
+        eprintln!("[node {me}] opening the pool store failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    let store = node.store_handle();
     let stop = Arc::new(AtomicBool::new(false));
     let failed = Arc::new(AtomicBool::new(false));
 
-    // The factory thread: refill the pool up to `target`, one presign
-    // session per record (ids `1..`, fresh id on the ~2⁻¹²⁸ ZeroValue).
-    let factory = {
+    // The pool manager thread (H5): refill to `target`, expire records
+    // older than `pool_ttl` (0 = never). Production is the ordinary
+    // per-node §8 presign over the wire — concurrent with the sign
+    // sessions below (H2 sid demultiplexing).
+    let mut manager = {
         let node = Arc::clone(&node);
-        let pool = Arc::clone(&pool);
-        let produced = Arc::clone(&produced);
+        let x_bytes = x_bytes.clone();
+        let produce = move |id: u64| -> Result<Presignature, PersistError> {
+            let sid = session_id(GENESIS, &x_bytes, Some(id), b"presign");
+            let mut rng = OsRng;
+            node.presign(&sid, id, &share, &mut rng, cheat)
+                .map_err(|e| {
+                    if let Error::Abort { abort } = &e {
+                        println!("BLAME {} {}", abort.phase, ids_str(&abort.blamed));
+                    }
+                    eprintln!("[node {me}] factory presign failed: {e}");
+                    e.into()
+                })
+        };
+        let mut cfg = PoolConfig::new(target, pool_ttl);
+        cfg.label = format!("pool node-{me}");
+        match PoolManager::with_system_clock(store.clone(), cfg, produce) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[node {me}] starting the pool manager failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let counters = manager.counters();
+    let factory = {
         let stop = Arc::clone(&stop);
         let failed = Arc::clone(&failed);
-        let x_bytes = x_bytes.clone();
-        std::thread::spawn(move || {
-            let mut rng = OsRng;
-            let mut next_id = 1u64;
-            while !stop.load(Ordering::SeqCst) {
-                if pool.lock().expect("pool mutex").len() >= target {
-                    std::thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
-                let id = next_id;
-                next_id += 1;
-                let sid = session_id(GENESIS, &x_bytes, Some(id), b"presign");
-                match node.presign(&sid, id, &share, &mut rng, cheat) {
-                    Ok(p) => {
-                        pool.lock().expect("pool mutex").push_back(p);
-                        produced.fetch_add(1, Ordering::SeqCst);
-                        eprintln!("[node {me}] factory: presignature {id} produced");
-                    }
-                    Err(Error::ZeroValue(_)) => continue, // retry with the next id
-                    Err(Error::Abort { abort }) => {
-                        println!("BLAME {} {}", abort.phase, ids_str(&abort.blamed));
-                        eprintln!("[node {me}] factory presign aborted: {}", abort.detail);
-                        failed.store(true, Ordering::SeqCst);
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!("[node {me}] factory presign failed: {e}");
-                        failed.store(true, Ordering::SeqCst);
-                        return;
-                    }
-                }
-            }
-        })
+        std::thread::spawn(move || manager.run(&stop, &failed))
     };
 
-    // The sign loop: consume the pool's OLDEST record per message (the
-    // same order at every node) and sign while the factory keeps
+    // The sign loop: consume the store's OLDEST live record per message
+    // (the same order at every node) and sign while the manager keeps
     // producing — concurrent sessions over the same mesh.
     let mut ok = true;
     for msg in FACTORY_MESSAGES {
-        let presig = loop {
+        let id = loop {
             if failed.load(Ordering::SeqCst) {
                 ok = false;
                 break None;
             }
-            if let Some(p) = pool.lock().expect("pool mutex").pop_front() {
-                break Some(p);
+            let oldest = store
+                .lock()
+                .expect("store mutex poisoned")
+                .as_ref()
+                .and_then(|s| s.oldest_live_id());
+            if let Some(id) = oldest {
+                break Some(id);
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        let Some(presig) = presig else { break };
+        let Some(id) = id else { break };
         let started = Instant::now();
-        let sign_sid = session_id(GENESIS, &x_bytes, Some(presig.id), b"sign");
-        match node.sign(&sign_sid, &presig, msg, cheat) {
+        let sign_sid = session_id(GENESIS, &x_bytes, Some(id), b"sign");
+        match node.sign_stored(&sign_sid, id, msg, cheat) {
             Ok((sig, blamed)) => {
                 let (r, s) = sig.split_bytes();
                 println!("SIG {} {}", hex(&r), hex(&s));
@@ -1025,12 +1064,11 @@ fn run_factory_demo(
                     println!("BLAME sign {}", ids_str(&blamed));
                 }
                 eprintln!(
-                    "[node {me}] signature for presignature {} delivered in {:?}",
-                    presig.id,
+                    "[node {me}] signature for presignature {id} delivered in {:?}",
                     started.elapsed()
                 );
             }
-            Err(Error::Abort { abort }) => {
+            Err(PersistError::Protocol(Error::Abort { abort })) => {
                 println!("BLAME {} {}", abort.phase, ids_str(&abort.blamed));
                 eprintln!("[node {me}] signing aborted: {}", abort.detail);
                 ok = false;
@@ -1044,33 +1082,42 @@ fn run_factory_demo(
         }
     }
 
-    // The factory must have refilled everything the signs consumed
-    // (deterministic under honest completion) — factory progress WHILE
-    // signing is the property under test.
+    // The manager must have refilled everything the signs consumed
+    // (deterministic under honest completion) — production WHILE signing
+    // is the property under test.
     if ok {
         let want = target as u64 + FACTORY_MESSAGES.len() as u64;
         let deadline = Instant::now() + Duration::from_secs(60);
-        while produced.load(Ordering::SeqCst) < want && Instant::now() < deadline {
+        while counters.produced() < want && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        if produced.load(Ordering::SeqCst) < want {
+        if counters.produced() < want {
             eprintln!(
                 "[node {me}] factory made too little progress: {} < {want}",
-                produced.load(Ordering::SeqCst)
+                counters.produced()
             );
             ok = false;
         }
     }
     stop.store(true, Ordering::SeqCst);
     let _ = factory.join();
+    let stored = store
+        .lock()
+        .expect("store mutex poisoned")
+        .as_ref()
+        .map_or(0, |s| s.len());
     println!(
-        "FACTORY target={target} produced={} signed={}",
-        produced.load(Ordering::SeqCst),
+        "FACTORY target={target} produced={} stored={stored} expired={} signed={}",
+        counters.produced(),
+        counters.expired(),
         FACTORY_MESSAGES.len()
     );
     // H2 clean shutdown: stop the mesh and join every thread (Drop
     // would do it too — this demonstrates the programmatic API).
     node.shutdown();
+    if cleanup {
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
     if ok {
         ExitCode::SUCCESS
     } else {
@@ -1150,12 +1197,20 @@ fn spawn_demo(args: &[String]) -> ExitCode {
     // the §10.3 expel-and-restart policy.
     let restart = has_flag(&mut args, "--restart");
     // H2 Phase 3: `--factory N` — the concurrent-sessions demo (see
-    // `run_factory_demo`).
+    // `run_factory_demo`); `--pool-ttl SECS` (H5, §8.6(3)) sets the pool
+    // records' time-to-live (0 = never expire).
     let factory: Option<usize> = flag_value(&mut args, "--factory").and_then(|v| v.parse().ok());
+    let pool_ttl: u64 = flag_value(&mut args, "--pool-ttl")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     if factory.is_some() && (seeded || ki || persist || with_tls || cheat.is_some()) {
         eprintln!(
             "spawn-demo: --factory does not combine with --seeded/--ki/--persist/--tls/--cheat"
         );
+        return ExitCode::FAILURE;
+    }
+    if pool_ttl > 0 && factory.is_none() {
+        eprintln!("spawn-demo: --pool-ttl only makes sense with --factory N");
         return ExitCode::FAILURE;
     }
     if restart && (seeded || ki || factory.is_some()) {
@@ -1165,7 +1220,8 @@ fn spawn_demo(args: &[String]) -> ExitCode {
 
     if let Some(target) = factory {
         println!(
-            "== ohm-ecdsa-node H2 demo: 2-of-3 keygen, then a background presig factory (target {target}) + {} concurrent signatures across 3 OS processes ==",
+            "== ohm-ecdsa-node H2/H5 demo: 2-of-3 keygen, then a background pool manager (target {target}, ttl {}s) + {} concurrent signatures across 3 OS processes ==",
+            pool_ttl,
             FACTORY_MESSAGES.len()
         );
     } else if seeded {
@@ -1256,6 +1312,9 @@ fn spawn_demo(args: &[String]) -> ExitCode {
         }
         if let Some(target) = factory {
             cmd.arg("--factory").arg(target.to_string());
+            if pool_ttl > 0 {
+                cmd.arg("--pool-ttl").arg(pool_ttl.to_string());
+            }
         }
         if ki {
             cmd.arg("--ki");

@@ -69,6 +69,14 @@ mTLS layer). Milestones:
   committee owns — including keys generated after the pool was filled.
   Records live in a per-node in-memory key-free pool (`KiPool`); the M3b
   durable store stays per-key. `spawn-demo --ki` runs the arc.
+* **H5** — key-material protection + pool management (SPEC §8.6, §13.3):
+  page-locked secrets at the node boundary (`src/locked.rs`, `mlock`,
+  fail-open with a loud warning), AEAD encryption at rest for every
+  secret file (`src/seal.rs`, ChaCha20-Poly1305 under a per-node storage
+  key, `0600`, legacy cleartext rejected), and the presignature pool
+  manager (`src/pool.rs`) keeping the durable store filled to a target
+  level with per-record TTL expiry (§8.6(3) secure erase). Details
+  below.
 
 ## What M2/M3a is
 
@@ -180,11 +188,15 @@ child `DIR/node-i`) gets three artifacts, all in the core's canonical
   used, so a killed-and-restarted node can never sign twice with the
   same presignature (§8.6(1) atomic consume across a crash). A crash
   between the rename and the return loses the record — the safe
-  direction. Duplicate inserts (live OR consumed ids) are rejected with
-  the core store's error semantics; stray `.tmp` files (crash
-  mid-insert, never acknowledged) are deleted on open. The presign
-  driver persists every record it produces; the sign driver consumes
-  from the store.
+  direction. Duplicate inserts (live, consumed, OR expired ids) are
+  rejected with the core store's error semantics; stray `.tmp` files
+  (crash mid-insert, never acknowledged) are deleted on open. Records
+  are key-equivalent (§8.6(2)), so every file is H5-SEALED
+  (ChaCha20-Poly1305 under the node's storage key, `0600`, legacy
+  cleartext rejected — see H5 below) and carries a created-at timestamp
+  for the pool manager's TTL expiry (`<id>.expired` tombstones, ids
+  never re-issued). The presign driver persists every record it
+  produces; the sign driver consumes from the store.
 * **Transcript archive (SPEC §4.7)** at `DIR/archive/transcript.log`:
   every ACCEPTED signed envelope appended as `u32 BE length ‖ canonical
   SignedEnvelope bytes`, fsync'd per entry. Append-only, deduped per
@@ -204,9 +216,10 @@ child `DIR/node-i`) gets three artifacts, all in the core's canonical
 
 Durability model, honestly: this survives process kill and — on a
 cooperating filesystem/OS — machine crash at exactly the fsync points
-above. It is NOT `mlock`/HSM-backed secret storage (presignatures are
-key-equivalent, §8.6/§13.3), does no wear leveling, and does not defend
-against a malicious host rolling back the directory.
+above. At-rest confidentiality reduces to the H5 storage key (wire it to
+a KMS in real deployments — `src/seal.rs` is the interface, not a KMS);
+it is not HSM-backed share storage, it does no wear leveling, and it
+does not defend against a malicious host rolling back the directory.
 
 ## What M3c adds (optional mTLS)
 
@@ -317,9 +330,9 @@ drops/delays: signature and commitment verification is never weakened.
   discipline: CONCURRENT sessions must not have prefix-related sids
   (journal retirement is a prefix match); the demo's
   `session_id`-derived sids are digests and never prefix-related. The
-  proving ground is `node --factory N` / `spawn-demo --factory N`: a
-  background factory thread keeps N presignatures in a pool while the
-  main thread signs 3 messages against consumed records.
+  proving ground is `node --factory N` / `spawn-demo --factory N`: the
+  H5 pool manager keeps N presignatures in the node's durable store
+  while the main thread signs 3 messages against consumed records.
 
 ## What H4 adds (robust continuation + expel-and-restart, §10.4 + §10.3)
 
@@ -389,7 +402,69 @@ interpolated share is still commitment-checked.
   uses `sign_over` / `sign_stored_over` (rounds wait only for the
   survivors).
 
-## What M3b/M3c/H2/H4 is still NOT
+## What H5 adds (key-material protection + pool management, §8.6 + §13.3)
+
+H5 is the node-side hardening of how SECRETS live — in memory, on disk,
+and over time. It changes no protocol message and weakens no check.
+
+* **Page-locked secrets in memory (`src/locked.rs`).** Long-lived secret
+  material at the node boundary — key shares, the transport signing key,
+  pooled presignature records — is wrapped in `mlock`'d buffers so the
+  kernel cannot swap it to disk while it lives (the core's zeroize-on-drop
+  erasure on free is unchanged and applies underneath). Policy:
+  **FAIL-OPEN WITH A LOUD WARNING** — when the OS refuses wiring
+  (`RLIMIT_MEMLOCK` too small, no `CAP_IPC_LOCK`), the node logs a WARNING
+  and continues unlocked; failing closed would make every default dev
+  machine unable to run a node at all. This is the ONLY fail-open path in
+  H5; deployments that require the guarantee treat the warning as fatal
+  at the ops level.
+* **AEAD at rest (`src/seal.rs`).** Every secret file — presignature
+  store records (key-equivalent, §8.6(2)), seed/identity files — is the
+  canonical `Encode` bytes inside a ChaCha20-Poly1305 envelope under a
+  per-node storage key (derived `SHA-256(tag ‖ secret)`, held
+  page-locked, erased on drop). The sealed format is versioned and
+  purpose-bound (a renamed or repurposed file fails authentication);
+  legacy CLEARTEXT files are rejected, fail closed, no silent downgrade.
+  Key resolution, in order: `OHM_STORAGE_KEY` (64 hex chars in the
+  environment), `OHM_STORAGE_KEY_FILE` (path of a hex key file), or a
+  generated `storage.key` (`0600`) beside the secret material — the DEV
+  default, loudly warned about. **This is the KMS/HSM integration
+  interface, not a KMS**: real deployments set the env var from their
+  secrets agent; key custody, rotation, and rollback defense stay
+  deployment concerns.
+* **File permissions.** Every secret file the node writes is `0600`
+  (enforced even when the file pre-existed looser); readers warn loudly
+  on startup when an existing secret file is group/world-accessible
+  (fail-open for availability, like `mlock` — the contents stay
+  authenticated regardless).
+* **The pool manager (`src/pool.rs`, SPEC §8.6).** A per-node
+  maintenance layer over the durable store and the H2 concurrent-session
+  machinery:
+  - *Target level*: keeps `target` live records in the store, one
+    production session per tick (the `--factory N` demo wires it to
+    `PartyNode::presign` over the wire). Signing drains via the store's
+    atomic consume — unchanged; the manager only ADDS, never consumes
+    (**single-writer invariant: exactly one manager per node**).
+  - *Expiry (§8.6(3))*: records carry a created-at timestamp (v2 sealed
+    payload, stamped from the manager's injectable clock; legacy v1
+    sealed records fall back to the file mtime). With `--pool-ttl SECS`
+    (> 0), an aged record is ERASED — the empty `<id>.expired` tombstone
+    is fsync'd FIRST (the id is durably burned, never re-issuable — the
+    same discipline as the consume tombstone), then the sealed file is
+    removed — and never served to sign. `0` = never expire (default).
+    Expiry is a LOCAL per-node policy: nothing synchronizes the nodes'
+    clocks, so a sign racing expiry fails loudly (unknown id) rather
+    than serving a stale record.
+  - *Crash/restart*: ids are re-seeded from the persisted
+    `max(live ∪ consumed ∪ expired) + 1`, so an id is never re-issued;
+    a crash mid-production loses at most the never-persisted in-flight
+    session (safe direction), and the retried session's insert dedups
+    against the persisted record — a restart never over-produces.
+  - *Visibility*: the `--factory N` demo prints produced/stored/expired
+    counts per node (`FACTORY target=… produced=… stored=… expired=…
+    signed=…`).
+
+## What M3b/M3c/H2/H4/H5 is still NOT
 
 * **Not everything is robust.** TLS handshake faults, connection-level
   misbehavior, and crash-stop are NOT covered by H4's continuation (an
@@ -407,6 +482,15 @@ interpolated share is still commitment-checked.
   reconnection of a node that fully RESTARTS (a restarted node re-binds
   and the peers' reconnectors re-dial it only if it keeps its address —
   rejoining a committee after a full restart is out of scope).
+* **H5 is an interface, not a vault.** The storage-key resolution is
+  where a KMS/HSM plugs in — no KMS is implemented; key custody and
+  rotation are ops. `mlock` is fail-open (a warning, not a guarantee).
+  There is NO rollback defense (a malicious host restoring deleted
+  sealed files or replaying an old store directory), no wear leveling
+  (filesystem block reuse is not guaranteed — "secure erase" means
+  removed from service), and side channels (timing, cache, swap beyond
+  the locked pages) remain out of scope. Pool expiry skew across nodes
+  is a documented liveness trade-off, not a safety issue.
 * **Not audited, not production anything.** localhost-scale demo and
   test scaffolding only.
 
@@ -493,7 +577,8 @@ cargo run -p ohm-ecdsa-node -- spawn-demo --delay-ms 50   # simulated WAN links
 cargo run -p ohm-ecdsa-node -- spawn-demo --persist # M3b: durable stores + transcript/blame archive
 cargo run -p ohm-ecdsa-node -- spawn-demo --tls     # M3c: the full arc over mTLS (rcgen certs, committee-pinned)
 cargo run -p ohm-ecdsa-node -- spawn-demo --ki      # §8.7: keygen → KEY-FREE pool record → 2-round KI sign
-cargo run -p ohm-ecdsa-node -- spawn-demo --factory 2  # H2: background presig factory + 3 concurrent signatures
+cargo run -p ohm-ecdsa-node -- spawn-demo --factory 2  # H2/H5: pool manager (durable store) + 3 concurrent signatures
+cargo run -p ohm-ecdsa-node -- spawn-demo --factory 2 --pool-ttl 600   # + §8.6(3) TTL expiry (erased, never served)
 cargo run -p ohm-ecdsa-node -- spawn-demo --restart    # H4: §10.4 robust + §10.3 expel-and-restart drivers
 cargo run -p ohm-ecdsa-node -- spawn-demo --restart --cheat-node 2 --cheat bad-open-share
 #   → the cheater is named by every process AND the presign + signature still complete
@@ -659,6 +744,17 @@ cargo test -p ohm-ecdsa-node
   concurrent sessions — a background factory keeping 2 presignatures
   in the pool per node while signing 3 messages, signatures verifying
   under the fresh X, factory progress asserted at every node.
+* `node/tests/pool.rs` (H5, 5 tests, deterministic — sim-produced
+  records, injectable clock, no mesh): the pool manager refills to the
+  target under drain (consumed records are replaced with FRESH ids,
+  production pauses at target); TTL expiry erases aged records (the
+  sealed file removed, the `<id>.expired` tombstone fsync'd, the id
+  burned — consume rejected, re-insert rejected, double-expire a
+  no-op) while fresh refills survive; ttl 0 never expires; a simulated
+  restart counts persisted records toward the target and resumes id
+  allocation above the persisted max; and a legacy v1 SEALED record
+  (pre-TTL format) is accepted with the file-mtime fallback, stays
+  consumable, and expires under a TTL like any other record.
 
 ## Layout
 
@@ -669,8 +765,11 @@ cargo test -p ohm-ecdsa-node
 | `src/tls.rs` | M3c: `CommitteeTls` (own cert/key + the pinned committee cert set), committee-pinned TLS 1.3 client/server configs and blocking handshakes (rustls + ring) under the H2 `HANDSHAKE_TIMEOUT` (socket-timeout strategy), rcgen cert generation for tests/demos, the PEM file layout (`party-<id>.crt.pem` / `.key.pem`) |
 | `src/transport.rs` | `MeshTransport` (M1): echo-broadcast acceptor + the core `Transport` trait impl over `DkgMessage` (+ the M1 family's H2 `FrameBound` impl) |
 | `src/party.rs` | `PartyNode` + `NodePayload` (M2/M3a): per-node keygen driver with §6.1 complaints/defenses on the wire (factored as `joint_vss` + the wire complaint subprotocol), per-node §7.2 triple and §8 presign drivers (the M3a offline factory), per-node §9/§10.4 sign driver, per-node §8.7 KI drivers (`presign_ki` — P1–P3 verbatim, P4 omitted — and the 2-round `sign_ki`, plus the in-memory key-free pool wrappers `presign_ki_pooled` / `sign_ki_pooled`), per-node echo-broadcast acceptor, `Cheat` fault injection; M3b store/archive wiring (`presign_stored`, `sign_stored`, `store_offer`); M3c `bind_with_tls`; H2: the collector thread + condvar acceptor (MULTIPLE concurrent sessions demultiplexed by sid), acceptor-level caps (distinct-sid, per-slot equivocation), per-session journal retirement, `PartyNode::shutdown`, `metrics`/`set_reconnect`/`debug_drop_outgoing`; H4: the OPT-IN §10.4-robust drivers (`presign_robust`, `triple_robust` with the `ReshareRequests`/`ReshareSupply` reconstruction rounds, `sign_ki_robust`) and the §10.3 expel-and-restart wrappers (`keygen_with_restart`, `presign_with_restart` + `sign_over`/`sign_stored_over` over the surviving committee, original ids, poisoned sid/id, zero-slack refusal) — every driver is committee-aware (`*_over` id sets) so restart sessions run over survivors |
-| `src/persist.rs` | M3b: `DiskPresigStore` (§8.6 durable single-use store, write-tmp-rename + fsync, consume tombstone fsync'd before the record is handed out), `Archive` (§4.7 accepted-envelope transcript + `aborts.log`), `BlameEvidence` token files (F2 dealt-share, F6 sign-share; other classes `token: none`), `audit_token` offline verifier (§A.4) |
+| `src/persist.rs` | M3b: `DiskPresigStore` (§8.6 durable single-use store, write-tmp-rename + fsync, consume tombstone fsync'd before the record is handed out; H5: sealed records with the versioned v2 payload — created-at stamp for the pool TTL — `<id>.expired` tombstones burning expired ids forever, legacy v1 sealed records accepted with the mtime fallback, legacy cleartext rejected), `Archive` (§4.7 accepted-envelope transcript + `aborts.log`), `BlameEvidence` token files (F2 dealt-share, F6 sign-share; other classes `token: none`), `audit_token` offline verifier (§A.4) |
+| `src/locked.rs` | H5 (§13.3): `LockedSecret<T>` / `LockedBytes` — page-locked (`mlock`) wrappers for long-lived secrets at the node boundary (key shares, transport key, pooled records, the storage key); FAIL-OPEN with a loud WARNING when the OS refuses wiring (the only fail-open path in H5) |
+| `src/seal.rs` | H5 (§8.6(2)): `StorageKey` — ChaCha20-Poly1305 AEAD at rest for every secret file (versioned + purpose-bound sealed format, legacy cleartext rejected fail-closed), storage-secret resolution (`OHM_STORAGE_KEY` / `OHM_STORAGE_KEY_FILE` / generated `0600` dev key — the KMS interface, not a KMS), `0600` enforcement + looseness warnings |
+| `src/pool.rs` | H5 (§8.6): `PoolManager` — the per-node pool maintenance layer over the durable store: refill-to-target (single writer; signing only consumes), per-record TTL expiry with secure erase (§8.6(3), injectable clock), crash/restart discipline (ids re-seeded from the persisted max, insert dedup — never over-produces), `PoolConfig`/`PoolStats`/`PoolCounters` |
 | `src/seed.rs` | the DEMO-ONLY one-process ceremony + seed/committee files (the `--seeded` fallback for presignature distribution; transport keys come from the seed files in that mode) |
 | `src/ceremony.rs` | H3: the DISTRIBUTED committee ceremony — the standard setup path: per-party `init` (own keypair + M3c cert on its own machine; SECRET `party-<id>.identity`, PUBLIC `party-<id>.pub` with id/verifying key/addr hint/cert), short hex `fingerprint` for out-of-band verification, and the PUBLIC `assemble` (validates bundles — ids exactly `1..=n`, uniform TLS posture — and writes the unchanged `committee.hex` format + the pinned cert set; committee `x` is the identity point: no ceremony key) |
-| `src/main.rs` | `node` / `setup` (DEMO-ONLY) / `init` / `assemble` / `spawn-demo` (DEMO-ONLY) / `auditor` / `m1-demo` subcommands (`--tls` on `setup`/`init`/`node`/`spawn-demo` for M3c, `--ki` on `node`/`spawn-demo` for the §8.7 KI arc, `--factory N` on `node`/`spawn-demo` for the H2 concurrent-sessions demo, `--restart` on `node`/`spawn-demo` for the H4 §10.4-robust + §10.3-restart arc, `--identity` on `node` for the H3 distributed ceremony; a node fails closed at startup when its own key/cert does not match the committee registry/pins) |
+| `src/main.rs` | `node` / `setup` (DEMO-ONLY) / `init` / `assemble` / `spawn-demo` (DEMO-ONLY) / `auditor` / `m1-demo` subcommands (`--tls` on `setup`/`init`/`node`/`spawn-demo` for M3c, `--ki` on `node`/`spawn-demo` for the §8.7 KI arc, `--factory N` + `--pool-ttl SECS` on `node`/`spawn-demo` for the H2/H5 concurrent-sessions pool-manager demo, `--restart` on `node`/`spawn-demo` for the H4 §10.4-robust + §10.3-restart arc, `--identity` on `node` for the H3 distributed ceremony; a node fails closed at startup when its own key/cert does not match the committee registry/pins) |
 | `examples/mesh_perf.rs` | the latency benchmark described above |

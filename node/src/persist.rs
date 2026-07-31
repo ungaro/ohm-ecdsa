@@ -21,15 +21,28 @@
 //!     return loses the record — safe direction (a lost presignature,
 //!     never a reused one).
 //!   - `open` replays the directory: `.presig` files are live,
-//!     `.consumed` files stay consumed, stray `.tmp` files are deleted.
-//!     A `key.bin` file (canonical bytes of `X`) written and fsync'd on
-//!     first open binds the directory to one long-term key (§8.6(4));
-//!     reopening under a different key is rejected.
+//!     `.consumed` files stay consumed, `.expired` files are expiry
+//!     tombstones (H5 pool TTL — the id stays burned, never re-issuable),
+//!     stray `.tmp` files are deleted. A `key.bin` file (canonical bytes
+//!     of `X`) written and fsync'd on first open binds the directory to
+//!     one long-term key (§8.6(4)); reopening under a different key is
+//!     rejected.
 //!   - H5: records are key-equivalent (§8.6(2)), so every `.presig`
 //!     file is SEALED — canonical bytes inside a ChaCha20-Poly1305
 //!     envelope under the node's storage key ([`crate::seal`]), written
 //!     `0600`. `open` rejects a legacy cleartext record and any record
 //!     this storage key cannot authenticate (fail closed).
+//!   - H5 pool TTL (§8.6(3)): the sealed payload is versioned — v2
+//!     prepends a version byte and a created-at timestamp (unix
+//!     seconds). A legacy SEALED v1 record (no version byte) is still
+//!     accepted, with the created-at taken from the file mtime (records
+//!     are immutable after the atomic rename, so mtime ≈ insert time);
+//!     an unreadable mtime stamps 0, expiring FIRST under any TTL — the
+//!     safe direction. Legacy CLEARTEXT stays rejected. [`DiskPresigStore::expire`]
+//!     erases an aged record: the empty `<id>.expired` tombstone is
+//!     fsync'd FIRST (the id is durably burned before the record leaves
+//!     the filesystem — the same discipline as the consume tombstone),
+//!     then the sealed file is removed; the id can never be re-issued.
 //!
 //!   Limits, honestly: this survives process kill and — on a
 //!   cooperating filesystem/OS — machine crash at exactly the fsync
@@ -54,10 +67,11 @@
 //!   the recomputed commitment check — reusing the core's
 //!   `BlameToken::verify` where the shape fits (the `Core` variant).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use k256::ecdsa::VerifyingKey;
 use k256::{AffinePoint, ProjectivePoint, Scalar};
@@ -149,6 +163,35 @@ fn put_presig(out: &mut Vec<u8>, p: &Presignature) {
     p.z_share.encode(out);
     p.u_com.encode(out);
     p.z_com.encode(out);
+}
+
+/// Store-record payload version 2 (H5 pool TTL, §8.6(3)): a version byte
+/// plus the created-at timestamp (unix seconds) prepended to the v1
+/// fields. The version byte rides INSIDE the sealed payload; the outer
+/// AEAD envelope format is unchanged.
+const RECORD_V2: u8 = 2;
+
+fn put_record(out: &mut Vec<u8>, p: &Presignature, created_at: u64) {
+    out.push(RECORD_V2);
+    put_u64(out, created_at);
+    put_presig(out, p);
+}
+
+/// Decode a store record, exactly (no trailing bytes): v2 (`RECORD_V2`
+/// byte + created-at + v1 fields) yields `Some(created_at)`; a legacy
+/// SEALED v1 payload (no version byte) yields `None` (the caller falls
+/// back to the file mtime). A payload that starts with the v2 byte but
+/// does not parse as v2 exactly is CORRUPT, not a v1 record (a v1
+/// payload's first byte is the top byte of the u64 id — `2` there would
+/// mean an id ≥ 2^57, which the id allocation never produces).
+fn take_record(b: &[u8]) -> Option<(Presignature, Option<u64>)> {
+    if b.first() == Some(&RECORD_V2) {
+        let (created_at, u) = take_u64(b.get(1..)?)?;
+        let (p, used) = take_presig(b.get(1 + u..)?)?;
+        return (1 + u + used == b.len()).then_some((p, Some(created_at)));
+    }
+    let (p, used) = take_presig(b)?;
+    (used == b.len()).then_some((p, None))
 }
 
 fn take_presig(b: &[u8]) -> Option<(Presignature, usize)> {
@@ -309,6 +352,14 @@ fn record_purpose(id: u64) -> Vec<u8> {
     p
 }
 
+/// The current unix time in seconds (the default created-at stamp).
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// File-backed single-use presignature store: one directory per node
 /// per long-term key, one file per record. Records are KEY-EQUIVALENT
 /// (§8.6(2)), so every file on disk is H5-SEALED — the canonical bytes
@@ -326,6 +377,11 @@ pub struct DiskPresigStore {
     storage_key: StorageKey,
     live: BTreeSet<u64>,
     consumed: BTreeSet<u64>,
+    /// H5 pool TTL (§8.6(3)): ids expired via [`Self::expire`] — burned
+    /// forever (an expiry tombstone on disk), never re-issuable.
+    expired: BTreeSet<u64>,
+    /// H5 pool TTL: created-at (unix seconds) per LIVE record.
+    created: BTreeMap<u64, u64>,
 }
 
 impl std::fmt::Debug for DiskPresigStore {
@@ -369,6 +425,9 @@ impl DiskPresigStore {
         }
         let mut live = BTreeSet::new();
         let mut consumed = BTreeSet::new();
+        let mut expired = BTreeSet::new();
+        let mut created = BTreeMap::new();
+        let mut entries = Vec::new();
         for entry in fs::read_dir(dir)? {
             let name = entry?.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -376,8 +435,29 @@ impl DiskPresigStore {
                 continue;
             };
             let Ok(id) = id.parse::<u64>() else { continue };
-            match kind {
+            entries.push((id, kind.to_string(), name.to_string()));
+        }
+        // Tombstones first: a crash mid-expire (tombstone durable, sealed
+        // file not yet removed) leaves BOTH — the tombstone wins and the
+        // stray record is deleted in the second pass (never served).
+        for (id, kind, _) in &entries {
+            match kind.as_str() {
+                "consumed" => {
+                    consumed.insert(*id);
+                }
+                "expired" => {
+                    expired.insert(*id);
+                }
+                _ => {}
+            }
+        }
+        for (id, kind, name) in &entries {
+            match kind.as_str() {
                 "presig" => {
+                    if expired.contains(id) {
+                        fs::remove_file(dir.join(name))?;
+                        continue;
+                    }
                     // H5: reject a legacy cleartext record at STARTUP
                     // (fail closed — the error names the file), and any
                     // record this storage key cannot authenticate.
@@ -385,13 +465,28 @@ impl DiskPresigStore {
                     if !StorageKey::is_sealed(&bytes) {
                         return Err(PersistError::Seal(SealError::LegacyCleartext));
                     }
-                    storage_key
-                        .open(&record_purpose(id), &bytes)
+                    let plain = storage_key
+                        .open(&record_purpose(*id), &bytes)
                         .map_err(PersistError::Seal)?;
-                    live.insert(id);
-                }
-                "consumed" => {
-                    consumed.insert(id);
+                    let (_, stamped) = take_record(&plain)
+                        .ok_or(Error::PresigStore("corrupt presignature file"))?;
+                    let created_at = match stamped {
+                        Some(ts) => ts,
+                        // Legacy v1 SEALED record (pre-TTL, no timestamp
+                        // inside): fall back to the file mtime (records
+                        // are immutable after the atomic rename, so
+                        // mtime ≈ insert time); an unreadable mtime
+                        // stamps 0 — expires FIRST under any TTL, the
+                        // safe direction.
+                        None => fs::metadata(dir.join(name))
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    };
+                    live.insert(*id);
+                    created.insert(*id, created_at);
                 }
                 "tmp" => {
                     // Crash between write and rename: the insert was
@@ -407,6 +502,8 @@ impl DiskPresigStore {
             storage_key: storage_key.clone(),
             live,
             consumed,
+            expired,
+            created,
         })
     }
 
@@ -417,16 +514,28 @@ impl DiskPresigStore {
 
     /// Persist a presignature (the caller keeps the in-memory record —
     /// the file is the durable copy); rejects a duplicate id, including
-    /// an id that was already CONSUMED (nonce-reuse guard, §8.6(1)).
-    /// The record is SEALED (H5) and written `0600`. fsync points:
-    /// file, then directory after the rename.
+    /// an id that was already CONSUMED or EXPIRED (nonce-reuse guard,
+    /// §8.6(1)). The record is SEALED (H5, v2 payload stamped with the
+    /// current time) and written `0600`. fsync points: file, then
+    /// directory after the rename.
     pub fn insert(&mut self, presig: &Presignature) -> Result<(), PersistError> {
+        self.insert_at(presig, unix_now())
+    }
+
+    /// [`Self::insert`] with an explicit created-at timestamp (unix
+    /// seconds) — the H5 pool manager stamps records from its injectable
+    /// clock so TTL expiry is deterministic in tests.
+    pub fn insert_at(
+        &mut self,
+        presig: &Presignature,
+        created_at: u64,
+    ) -> Result<(), PersistError> {
         let id = presig.id;
-        if self.live.contains(&id) || self.consumed.contains(&id) {
+        if self.live.contains(&id) || self.consumed.contains(&id) || self.expired.contains(&id) {
             return Err(Error::PresigStore("duplicate presignature id").into());
         }
         let mut bytes = Vec::new();
-        put_presig(&mut bytes, presig);
+        put_record(&mut bytes, presig, created_at);
         let sealed = self.storage_key.seal(&record_purpose(id), &bytes);
         write_atomic(
             &self.dir,
@@ -436,6 +545,7 @@ impl DiskPresigStore {
             true,
         )?;
         self.live.insert(id);
+        self.created.insert(id, created_at);
         Ok(())
     }
 
@@ -454,15 +564,15 @@ impl DiskPresigStore {
             .storage_key
             .open(&record_purpose(id), &sealed)
             .map_err(PersistError::Seal)?;
-        let (presig, _) = take_presig(&bytes)
-            .filter(|(_, used)| *used == bytes.len())
-            .ok_or(Error::PresigStore("corrupt presignature file"))?;
+        let (presig, _) =
+            take_record(&bytes).ok_or(Error::PresigStore("corrupt presignature file"))?;
         fs::rename(
             self.dir.join(format!("{id}.presig")),
             self.dir.join(format!("{id}.consumed")),
         )?;
         sync_dir(&self.dir)?;
         self.live.remove(&id);
+        self.created.remove(&id);
         self.consumed.insert(id);
         Ok(presig)
     }
@@ -480,6 +590,73 @@ impl DiskPresigStore {
     /// Whether `id` is present and unconsumed.
     pub fn contains(&self, id: u64) -> bool {
         self.live.contains(&id)
+    }
+
+    /// The created-at stamp (unix seconds) of a LIVE record (H5 pool
+    /// TTL); `None` for unknown/consumed/expired ids.
+    pub fn created_at(&self, id: u64) -> Option<u64> {
+        self.created.get(&id).copied()
+    }
+
+    /// The smallest live id — the FIFO drain order for signing (oldest
+    /// record first, the same order at every node).
+    pub fn oldest_live_id(&self) -> Option<u64> {
+        self.live.iter().next().copied()
+    }
+
+    /// The largest id this store has EVER seen (live, consumed, or
+    /// expired) — the H5 pool manager restarts id allocation above it,
+    /// so an id is never re-issued across a crash/restart.
+    pub fn max_seen_id(&self) -> u64 {
+        self.live
+            .iter()
+            .chain(&self.consumed)
+            .chain(&self.expired)
+            .max()
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Live ids stamped at or before `threshold` (unix seconds) — the
+    /// TTL expiry candidates (§8.6(3)): with `threshold = now − ttl`,
+    /// exactly the records older than the TTL.
+    pub fn expired_before(&self, threshold: u64) -> Vec<u64> {
+        self.created
+            .iter()
+            .filter(|(_, ts)| **ts <= threshold)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Erase a live record (§8.6(3) secure erase on expiry): the empty
+    /// `<id>.expired` tombstone is written and fsync'd FIRST — the id is
+    /// durably burned before the record leaves the filesystem (the same
+    /// discipline as the consume tombstone; a crash between the two
+    /// steps is resolved in favor of the tombstone at `open`) — then the
+    /// sealed file is removed and the directory fsync'd. The id is never
+    /// re-issuable and the record is never served again; the caller's
+    /// in-memory copy erases itself on drop (zeroize). `Ok(false)` when
+    /// `id` is not live (unknown, consumed, or already expired). Note on
+    /// "secure": at-rest confidentiality reduces to the AEAD key (the
+    /// tombstone is empty, but filesystem block reuse is not guaranteed
+    /// — no wear leveling, no rollback defense; see the module docs).
+    pub fn expire(&mut self, id: u64) -> Result<bool, PersistError> {
+        if !self.live.contains(&id) {
+            return Ok(false);
+        }
+        write_atomic(
+            &self.dir,
+            &format!("{id}.tmp"),
+            &format!("{id}.expired"),
+            &[],
+            false,
+        )?;
+        fs::remove_file(self.dir.join(format!("{id}.presig")))?;
+        sync_dir(&self.dir)?;
+        self.live.remove(&id);
+        self.created.remove(&id);
+        self.expired.insert(id);
+        Ok(true)
     }
 }
 

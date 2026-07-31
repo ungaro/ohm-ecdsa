@@ -139,11 +139,14 @@ Rust 1.75+ (MSRV), no system dependencies:
 cargo test
 ```
 
-64 tests (18 unit + 46 integration): end-to-end signing verified by
-`k256`'s ECDSA verifier, cheater identification in every phase, robust
-continuation, expel-and-restart, refresh/re-sharing, batch and packed
-generation, single-use enforcement — plus smoke tests that run the four
-narrative examples below and check their guarantee lines. Everything is
+169 tests workspace-wide (core: unit + integration + example smoke
+tests; node: thread- and process-level suites covering the mesh,
+persistence, ceremony, resilience, robustness, TLS, and the pool
+manager): end-to-end signing verified by `k256`'s ECDSA verifier,
+cheater identification in every phase, robust continuation,
+expel-and-restart, refresh/re-sharing, batch and packed generation,
+single-use enforcement — plus smoke tests that run the four narrative
+examples below and check their guarantee lines. Everything is
 deterministic — no OS randomness in tests.
 
 ```bash
@@ -360,6 +363,10 @@ sets, issuers, auditors.
   verified δ/ε openings, R2 verified shares); one in-memory key-free
   pool signs under ANY key the committee owns (`spawn-demo --ki`;
   thread-level proof: one pool, two different keys)
+* H1 fuzzed wire decoders (`fuzz/`, cargo-fuzz + committed corpora):
+  every canonical `Decode` impl proven panic-free on arbitrary input
+  (28M+ execs, zero crashes); a memory-amplification vector in
+  `FeldmanCommitment::decode` found and fixed with a regression test
 * H2 network resilience (`node/src/mesh.rs`, `node/src/party.rs`):
   reconnection with capped exponential backoff + jitter and a
   journal-based re-sync of in-flight sessions, clean shutdown
@@ -393,6 +400,15 @@ sets, issuers, auditors.
   `policy::restart_committee`, poisoned sid/id per §10.3(2), survivors'
   ORIGINAL ids preserved, retries bounded, zero-slack refusal — `t`
   never lowered; `node --restart` / `spawn-demo --restart`)
+* H5 key-material protection (`node/src/locked.rs`, `node/src/seal.rs`,
+  `node/src/pool.rs`): mlock-pinned secrets (fail-open with a loud
+  warning when the OS refuses), AEAD (ChaCha20-Poly1305) encryption at
+  rest for the durable store with a KMS-pluggable storage key
+  (`OHM_STORAGE_KEY`/`OHM_STORAGE_KEY_FILE`; legacy cleartext rejected,
+  fail closed), `0600` enforcement on secret files, and a pool manager
+  that keeps the presignature pool at a target level with fsync-first
+  expiry tombstones (`--factory N --pool-ttl SECS`; ids are monotonic
+  across restarts, never re-issued)
 
 **Not yet** (roadmap): production-hardened transport beyond the node
 crate's H2 (crash recovery of finished rounds, committee rejoin after a
