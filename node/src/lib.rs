@@ -206,17 +206,18 @@
 //! [`Decode`]: ohm_ecdsa::transport::Decode
 //! [`PartyId`]: ohm_ecdsa::PartyId
 
-pub mod ceremony;
-pub mod locked;
-pub mod mesh;
+pub mod net;
 pub mod party;
-pub mod persist;
-pub mod pool;
-pub mod seal;
-pub mod seed;
-pub mod tls;
-pub mod transport;
-pub mod wire;
+pub mod setup;
+pub mod store;
+
+// Flat re-exports: every public module path from before the layering
+// (`ohm_ecdsa_node::mesh`, `ohm_ecdsa_node::party::NodePayload`, …) is
+// unchanged — internal `crate::…` references resolve through these too.
+pub use net::{mesh, tls, transport, wire};
+pub use party::pool;
+pub use setup::{ceremony, seed};
+pub use store::{locked, persist, seal};
 
 pub use mesh::Node;
 pub use party::{Cheat, NodePayload, PartyNode};

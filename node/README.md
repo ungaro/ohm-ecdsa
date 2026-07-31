@@ -15,19 +15,19 @@ mTLS layer). Milestones:
   signed envelopes verified on receipt, §4.7 echo broadcast
   (`MeshTransport` implementing the core `Transport` trait), keygen
   through `drive_dkg_signed`. One process holds every party's key.
-* **M2** — per-party node drivers (`src/party.rs`): the orchestrator
+* **M2** — per-party node drivers (`src/party/party.rs`): the orchestrator
   model is gone. A `PartyNode` holds ONLY its own material — its own
   transport secret key, its own party id, the peers' verifying keys, its
   own mesh connections — and runs only its own protocol logic. Each
   party runs as its own OS process (see the demo below).
-* **M3a** — the per-node OFFLINE FACTORY over the wire (`src/party.rs`):
+* **M3a** — the per-node OFFLINE FACTORY over the wire (`src/party/party.rs`):
   per-node triple generation (SPEC §7.2) and per-node presign (SPEC §8)
   as `PartyNode` drivers, with every share verified and every cheater
   named consistently at every node. The demo's full arc — keygen →
   presign → sign — now runs under the key each process's OWN keygen
   produced; ceremony-seeded presignatures remain as a `--seeded`
   fallback.
-* **M3b** — persistence + blame-token archiving (`src/persist.rs`): a
+* **M3b** — persistence + blame-token archiving (`src/store/persist.rs`): a
   durable, crash-safe single-use presignature store per node per key
   (SPEC §8.6), an append-only transcript of every accepted signed
   envelope (§4.7), blame-token files for the fault classes that leave
@@ -35,7 +35,7 @@ mTLS layer). Milestones:
   subcommand re-verifying a token against the committee's public keys
   (§A.4). Everything on disk is the core's canonical `Encode`/`Decode`
   wire format; std only.
-* **M3c** — OPTIONAL mTLS on the mesh (`src/tls.rs`): every connection
+* **M3c** — OPTIONAL mTLS on the mesh (`src/net/tls.rs`): every connection
   wrapped in mutually-authenticated TLS 1.3 (rustls + ring, blocking
   streams) with certificates **pinned to the committee** — no PKI, no
   system roots. Plain TCP remains the default for localhost dev; any
@@ -51,7 +51,7 @@ mTLS layer). Milestones:
   concurrent protocol sessions demultiplexed by sid (the
   `node --factory N` background presignature factory is the proving
   ground). Details below.
-* **H3** — the distributed committee ceremony (`src/ceremony.rs`): the
+* **H3** — the distributed committee ceremony (`src/setup/ceremony.rs`): the
   standard setup path for a real committee. Each party generates its
   OWN transport keypair (and M3c certificate) on its own machine
   (`init`); only PUBLIC `party-<id>.pub` bundles leave, exchanged out
@@ -70,11 +70,11 @@ mTLS layer). Milestones:
   Records live in a per-node in-memory key-free pool (`KiPool`); the M3b
   durable store stays per-key. `spawn-demo --ki` runs the arc.
 * **H5** — key-material protection + pool management (SPEC §8.6, §13.3):
-  page-locked secrets at the node boundary (`src/locked.rs`, `mlock`,
+  page-locked secrets at the node boundary (`src/store/locked.rs`, `mlock`,
   fail-open with a loud warning), AEAD encryption at rest for every
-  secret file (`src/seal.rs`, ChaCha20-Poly1305 under a per-node storage
+  secret file (`src/store/seal.rs`, ChaCha20-Poly1305 under a per-node storage
   key, `0600`, legacy cleartext rejected), and the presignature pool
-  manager (`src/pool.rs`) keeping the durable store filled to a target
+  manager (`src/party/pool.rs`) keeping the durable store filled to a target
   level with per-record TTL expiry (§8.6(3) secure erase). Details
   below.
 
@@ -84,7 +84,7 @@ mTLS layer). Milestones:
   one `SecretKey` (this node's) plus the public registry; no `PartyNode`
   API accepts another party's secret material. A node process reads
   exactly its own secret file (demo seed or H3 identity) plus the public
-  committee file (`src/seed.rs`, `src/ceremony.rs`).
+  committee file (`src/setup/seed.rs`, `src/setup/ceremony.rs`).
 * **Per-node keygen (SPEC §6)** over the mesh: commit → reveal + P2P
   shares → **§6.1 complaint subprotocol on the wire** — round 3 carries
   signed `Complaints` broadcasts, round 4 signed `Defenses` broadcasts,
@@ -211,13 +211,13 @@ child `DIR/node-i`) gets three artifacts, all in the core's canonical
   message, `r`, `A[u]`, `A[z]`). Other classes (false accusations, bad
   DLEQ proofs, bad nonce points, bad opening shares, bad re-shares) are
   logged to `aborts.log` with `token: none` — documented in
-  `src/persist.rs`. The `auditor` subcommand verifies a token OFFLINE
+  `src/store/persist.rs`. The `auditor` subcommand verifies a token OFFLINE
   against the public committee file (see below).
 
 Durability model, honestly: this survives process kill and — on a
 cooperating filesystem/OS — machine crash at exactly the fsync points
 above. At-rest confidentiality reduces to the H5 storage key (wire it to
-a KMS in real deployments — `src/seal.rs` is the interface, not a KMS);
+a KMS in real deployments — `src/store/seal.rs` is the interface, not a KMS);
 it is not HSM-backed share storage, it does no wear leveling, and it
 does not defend against a malicious host rolling back the directory.
 
@@ -257,7 +257,7 @@ still no async runtime):
   per-party self-signed certs (`party-<id>.crt.pem` public,
   `party-<id>.key.pem` SECRET) — a development ceremony. Real
   deployments substitute their own PKI/certificate issuance and cert
-  distribution (SPEC §13.1); the pinning verifiers in `src/tls.rs` are
+  distribution (SPEC §13.1); the pinning verifiers in `src/net/tls.rs` are
   the reference. TLS is mandatory for any non-localhost deployment;
   plain TCP is for localhost dev and tests only.
 * **MSRV note.** The pinned dependency tree (rustls 0.23.43 + ring,
@@ -302,7 +302,7 @@ drops/delays: signature and commitment verification is never weakened.
   `HANDSHAKE_TIMEOUT` via the simplest strategy compatible with
   blocking rustls: the socket gets short read/write timeouts and the
   `complete_io` loop treats `WouldBlock`/`TimedOut` as a tick until the
-  deadline (see `src/tls.rs`). Reader threads poll with a 250 ms
+  deadline (see `src/net/tls.rs`). Reader threads poll with a 250 ms
   `READ_POLL` — NOT a liveness timeout, just shutdown responsiveness.
   Read stalls are bounded by the drivers' ROUND timeout: a peer that
   accepts but never sends fails its round loudly (partial accepted set,
@@ -407,7 +407,7 @@ interpolated share is still commitment-checked.
 H5 is the node-side hardening of how SECRETS live — in memory, on disk,
 and over time. It changes no protocol message and weakens no check.
 
-* **Page-locked secrets in memory (`src/locked.rs`).** Long-lived secret
+* **Page-locked secrets in memory (`src/store/locked.rs`).** Long-lived secret
   material at the node boundary — key shares, the transport signing key,
   pooled presignature records — is wrapped in `mlock`'d buffers so the
   kernel cannot swap it to disk while it lives (the core's zeroize-on-drop
@@ -418,7 +418,7 @@ and over time. It changes no protocol message and weakens no check.
   machine unable to run a node at all. This is the ONLY fail-open path in
   H5; deployments that require the guarantee treat the warning as fatal
   at the ops level.
-* **AEAD at rest (`src/seal.rs`).** Every secret file — presignature
+* **AEAD at rest (`src/store/seal.rs`).** Every secret file — presignature
   store records (key-equivalent, §8.6(2)), seed/identity files — is the
   canonical `Encode` bytes inside a ChaCha20-Poly1305 envelope under a
   per-node storage key (derived `SHA-256(tag ‖ secret)`, held
@@ -437,7 +437,7 @@ and over time. It changes no protocol message and weakens no check.
   on startup when an existing secret file is group/world-accessible
   (fail-open for availability, like `mlock` — the contents stay
   authenticated regardless).
-* **The pool manager (`src/pool.rs`, SPEC §8.6).** A per-node
+* **The pool manager (`src/party/pool.rs`, SPEC §8.6).** A per-node
   maintenance layer over the durable store and the H2 concurrent-session
   machinery:
   - *Target level*: keeps `target` live records in the store, one
@@ -496,12 +496,12 @@ and over time. It changes no protocol message and weakens no check.
 
 ## Committee ceremony (H3 — the standard setup path)
 
-The one-process ceremony (`setup`, `spawn-demo`, `src/seed.rs`) generates
+The one-process ceremony (`setup`, `spawn-demo`, `src/setup/seed.rs`) generates
 **every party's transport keypair in a single process** and distributes
 secret files: one machine momentarily holds the whole committee's
 transport secrets. That is **DEMO-ONLY** — fine for demos and tests,
 unacceptable for a real committee. The standard setup path is the
-**distributed ceremony** (`src/ceremony.rs`), where no secret ever
+**distributed ceremony** (`src/setup/ceremony.rs`), where no secret ever
 leaves its party's machine:
 
 ```sh
@@ -723,7 +723,7 @@ cargo test -p ohm-ecdsa-node
   record), "restarts" (a fresh store instance on the same directory),
   and a second sign with the same id fails.
 * `node/tests/mesh_tls.rs` (M3c, 3 tests, thread-level) plus 3 unit
-  tests in `src/tls.rs` and 1 process-level test in
+  tests in `src/net/tls.rs` and 1 process-level test in
   `node/tests/process_demo.rs`: the full arc keygen → presign → sign
   over mTLS (thread-level AND across child processes via
   `spawn-demo --tls`); an unpinned/rogue peer cert is rejected in both
@@ -758,18 +758,26 @@ cargo test -p ohm-ecdsa-node
 
 ## Layout
 
+`src/` is organized into four layers — `net/` (transport substrate),
+`party/` (per-node protocol drivers + pool manager), `setup/` (committee
+ceremonies), `store/` (durability + key protection) — with `lib.rs`
+flat-re-exporting every module, so all public paths
+(`ohm_ecdsa_node::mesh`, `ohm_ecdsa_node::party::PartyNode`, …) are
+unchanged by the layering.
+
 | Module | Role |
 |---|---|
-| `src/wire.rs` | `WireMessage<M>` (original / signed echo), canonical framing, signature validation — generic over the payload; H2 `FrameBound` (per-variant frame size bounds derived from protocol message sizes) |
-| `src/mesh.rs` | `Node<M>`: listener + full-mesh connections + reader threads, first-echo rule, verified-only bounded mailbox, self-echo loopback (M2 per-node acceptor), config-driven send delay (benchmarks), optional M3c mTLS wrapping (`bind_tls`); H2: `ReconnectConfig` + per-session send journal with reconnect re-sync, `Node::shutdown` (join-with-deadline, also on `Drop`), write/handshake timeouts, per-connection rate window, listener accept-rate window, mTLS handshake concurrency cap, `MeshMetrics` drop counters |
-| `src/tls.rs` | M3c: `CommitteeTls` (own cert/key + the pinned committee cert set), committee-pinned TLS 1.3 client/server configs and blocking handshakes (rustls + ring) under the H2 `HANDSHAKE_TIMEOUT` (socket-timeout strategy), rcgen cert generation for tests/demos, the PEM file layout (`party-<id>.crt.pem` / `.key.pem`) |
-| `src/transport.rs` | `MeshTransport` (M1): echo-broadcast acceptor + the core `Transport` trait impl over `DkgMessage` (+ the M1 family's H2 `FrameBound` impl) |
-| `src/party.rs` | `PartyNode` + `NodePayload` (M2/M3a): per-node keygen driver with §6.1 complaints/defenses on the wire (factored as `joint_vss` + the wire complaint subprotocol), per-node §7.2 triple and §8 presign drivers (the M3a offline factory), per-node §9/§10.4 sign driver, per-node §8.7 KI drivers (`presign_ki` — P1–P3 verbatim, P4 omitted — and the 2-round `sign_ki`, plus the in-memory key-free pool wrappers `presign_ki_pooled` / `sign_ki_pooled`), per-node echo-broadcast acceptor, `Cheat` fault injection; M3b store/archive wiring (`presign_stored`, `sign_stored`, `store_offer`); M3c `bind_with_tls`; H2: the collector thread + condvar acceptor (MULTIPLE concurrent sessions demultiplexed by sid), acceptor-level caps (distinct-sid, per-slot equivocation), per-session journal retirement, `PartyNode::shutdown`, `metrics`/`set_reconnect`/`debug_drop_outgoing`; H4: the OPT-IN §10.4-robust drivers (`presign_robust`, `triple_robust` with the `ReshareRequests`/`ReshareSupply` reconstruction rounds, `sign_ki_robust`) and the §10.3 expel-and-restart wrappers (`keygen_with_restart`, `presign_with_restart` + `sign_over`/`sign_stored_over` over the surviving committee, original ids, poisoned sid/id, zero-slack refusal) — every driver is committee-aware (`*_over` id sets) so restart sessions run over survivors |
-| `src/persist.rs` | M3b: `DiskPresigStore` (§8.6 durable single-use store, write-tmp-rename + fsync, consume tombstone fsync'd before the record is handed out; H5: sealed records with the versioned v2 payload — created-at stamp for the pool TTL — `<id>.expired` tombstones burning expired ids forever, legacy v1 sealed records accepted with the mtime fallback, legacy cleartext rejected), `Archive` (§4.7 accepted-envelope transcript + `aborts.log`), `BlameEvidence` token files (F2 dealt-share, F6 sign-share; other classes `token: none`), `audit_token` offline verifier (§A.4) |
-| `src/locked.rs` | H5 (§13.3): `LockedSecret<T>` / `LockedBytes` — page-locked (`mlock`) wrappers for long-lived secrets at the node boundary (key shares, transport key, pooled records, the storage key); FAIL-OPEN with a loud WARNING when the OS refuses wiring (the only fail-open path in H5) |
-| `src/seal.rs` | H5 (§8.6(2)): `StorageKey` — ChaCha20-Poly1305 AEAD at rest for every secret file (versioned + purpose-bound sealed format, legacy cleartext rejected fail-closed), storage-secret resolution (`OHM_STORAGE_KEY` / `OHM_STORAGE_KEY_FILE` / generated `0600` dev key — the KMS interface, not a KMS), `0600` enforcement + looseness warnings |
-| `src/pool.rs` | H5 (§8.6): `PoolManager` — the per-node pool maintenance layer over the durable store: refill-to-target (single writer; signing only consumes), per-record TTL expiry with secure erase (§8.6(3), injectable clock), crash/restart discipline (ids re-seeded from the persisted max, insert dedup — never over-produces), `PoolConfig`/`PoolStats`/`PoolCounters` |
-| `src/seed.rs` | the DEMO-ONLY one-process ceremony + seed/committee files (the `--seeded` fallback for presignature distribution; transport keys come from the seed files in that mode) |
-| `src/ceremony.rs` | H3: the DISTRIBUTED committee ceremony — the standard setup path: per-party `init` (own keypair + M3c cert on its own machine; SECRET `party-<id>.identity`, PUBLIC `party-<id>.pub` with id/verifying key/addr hint/cert), short hex `fingerprint` for out-of-band verification, and the PUBLIC `assemble` (validates bundles — ids exactly `1..=n`, uniform TLS posture — and writes the unchanged `committee.hex` format + the pinned cert set; committee `x` is the identity point: no ceremony key) |
+| `src/net/wire.rs` | `WireMessage<M>` (original / signed echo), canonical framing, signature validation — generic over the payload; H2 `FrameBound` (per-variant frame size bounds derived from protocol message sizes) |
+| `src/net/mesh.rs` | `Node<M>`: listener + full-mesh connections + reader threads, first-echo rule, verified-only bounded mailbox, self-echo loopback (M2 per-node acceptor), config-driven send delay (benchmarks), optional M3c mTLS wrapping (`bind_tls`); H2: `ReconnectConfig` + per-session send journal with reconnect re-sync, `Node::shutdown` (join-with-deadline, also on `Drop`), write/handshake timeouts, per-connection rate window, listener accept-rate window, mTLS handshake concurrency cap, `MeshMetrics` drop counters |
+| `src/net/tls.rs` | M3c: `CommitteeTls` (own cert/key + the pinned committee cert set), committee-pinned TLS 1.3 client/server configs and blocking handshakes (rustls + ring) under the H2 `HANDSHAKE_TIMEOUT` (socket-timeout strategy), rcgen cert generation for tests/demos, the PEM file layout (`party-<id>.crt.pem` / `.key.pem`) |
+| `src/net/transport.rs` | `MeshTransport` (M1): echo-broadcast acceptor + the core `Transport` trait impl over `DkgMessage` (+ the M1 family's H2 `FrameBound` impl) |
+| `src/party/party.rs` | `PartyNode` + `NodePayload` (M2/M3a): per-node keygen driver with §6.1 complaints/defenses on the wire (factored as `joint_vss` + the wire complaint subprotocol), per-node §7.2 triple and §8 presign drivers (the M3a offline factory), per-node §9/§10.4 sign driver, per-node §8.7 KI drivers (`presign_ki` — P1–P3 verbatim, P4 omitted — and the 2-round `sign_ki`, plus the in-memory key-free pool wrappers `presign_ki_pooled` / `sign_ki_pooled`), per-node echo-broadcast acceptor, `Cheat` fault injection; M3b store/archive wiring (`presign_stored`, `sign_stored`, `store_offer`); M3c `bind_with_tls`; H2: the collector thread + condvar acceptor (MULTIPLE concurrent sessions demultiplexed by sid), acceptor-level caps (distinct-sid, per-slot equivocation), per-session journal retirement, `PartyNode::shutdown`, `metrics`/`set_reconnect`/`debug_drop_outgoing`; H4: the OPT-IN §10.4-robust drivers (`presign_robust`, `triple_robust` with the `ReshareRequests`/`ReshareSupply` reconstruction rounds, `sign_ki_robust`) and the §10.3 expel-and-restart wrappers (`keygen_with_restart`, `presign_with_restart` + `sign_over`/`sign_stored_over` over the surviving committee, original ids, poisoned sid/id, zero-slack refusal) — every driver is committee-aware (`*_over` id sets) so restart sessions run over survivors |
+| `src/party/pool.rs` | H5 (§8.6): `PoolManager` — the per-node pool maintenance layer over the durable store: refill-to-target (single writer; signing only consumes), per-record TTL expiry with secure erase (§8.6(3), injectable clock), crash/restart discipline (ids re-seeded from the persisted max, insert dedup — never over-produces), `PoolConfig`/`PoolStats`/`PoolCounters` |
+| `src/setup/seed.rs` | the DEMO-ONLY one-process ceremony + seed/committee files (the `--seeded` fallback for presignature distribution; transport keys come from the seed files in that mode) |
+| `src/setup/ceremony.rs` | H3: the DISTRIBUTED committee ceremony — the standard setup path: per-party `init` (own keypair + M3c cert on its own machine; SECRET `party-<id>.identity`, PUBLIC `party-<id>.pub` with id/verifying key/addr hint/cert), short hex `fingerprint` for out-of-band verification, and the PUBLIC `assemble` (validates bundles — ids exactly `1..=n`, uniform TLS posture — and writes the unchanged `committee.hex` format + the pinned cert set; committee `x` is the identity point: no ceremony key) |
+| `src/store/persist.rs` | M3b: `DiskPresigStore` (§8.6 durable single-use store, write-tmp-rename + fsync, consume tombstone fsync'd before the record is handed out; H5: sealed records with the versioned v2 payload — created-at stamp for the pool TTL — `<id>.expired` tombstones burning expired ids forever, legacy v1 sealed records accepted with the mtime fallback, legacy cleartext rejected), `Archive` (§4.7 accepted-envelope transcript + `aborts.log`), `BlameEvidence` token files (F2 dealt-share, F6 sign-share; other classes `token: none`), `audit_token` offline verifier (§A.4) |
+| `src/store/locked.rs` | H5 (§13.3): `LockedSecret<T>` / `LockedBytes` — page-locked (`mlock`) wrappers for long-lived secrets at the node boundary (key shares, transport key, pooled records, the storage key); FAIL-OPEN with a loud WARNING when the OS refuses wiring (the only fail-open path in H5) |
+| `src/store/seal.rs` | H5 (§8.6(2)): `StorageKey` — ChaCha20-Poly1305 AEAD at rest for every secret file (versioned + purpose-bound sealed format, legacy cleartext rejected fail-closed), storage-secret resolution (`OHM_STORAGE_KEY` / `OHM_STORAGE_KEY_FILE` / generated `0600` dev key — the KMS interface, not a KMS), `0600` enforcement + looseness warnings |
+| `src/lib.rs` | crate docs (M1–M3c, §8.7, H2–H5) + the four layer modules with flat re-exports preserving every pre-layering public path |
 | `src/main.rs` | `node` / `setup` (DEMO-ONLY) / `init` / `assemble` / `spawn-demo` (DEMO-ONLY) / `auditor` / `m1-demo` subcommands (`--tls` on `setup`/`init`/`node`/`spawn-demo` for M3c, `--ki` on `node`/`spawn-demo` for the §8.7 KI arc, `--factory N` + `--pool-ttl SECS` on `node`/`spawn-demo` for the H2/H5 concurrent-sessions pool-manager demo, `--restart` on `node`/`spawn-demo` for the H4 §10.4-robust + §10.3-restart arc, `--identity` on `node` for the H3 distributed ceremony; a node fails closed at startup when its own key/cert does not match the committee registry/pins) |
 | `examples/mesh_perf.rs` | the latency benchmark described above |

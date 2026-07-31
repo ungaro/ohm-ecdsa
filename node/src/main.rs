@@ -271,7 +271,7 @@ fn setup(args: &[String]) -> ExitCode {
 // bundles travel out of band over an authenticated channel (the
 // fingerprints below exist for the second-channel cross-check), and
 // `assemble` — public data only, safe to run anywhere — writes the
-// shared committee file. See `node/src/ceremony.rs` for the trust model.
+// shared committee file. See `node/src/setup/ceremony.rs` for the trust model.
 
 fn init_mode(args: &[String]) -> ExitCode {
     let mut args = args.to_vec();
