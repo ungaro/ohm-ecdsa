@@ -1294,3 +1294,152 @@ simulators are the §5 games G2–G5, which are already straight-line and
 query-tape-based; the only UC-specific addition beyond U3 is the
 delivery-scheduling correspondence for the online phase, which is
 bookkeeping. **The UC proof has no remaining novel obstacle.**
+
+---
+
+## 12. Theorem U1 assembly — and the ε′-opening obstruction
+
+This section assembles the remaining phases (triples, presign, sign) around
+the U3 machinery into Theorem U1. The assembly was verified phase by phase
+before writing. **The result: every phase is simulatable except one scalar
+— the P4 opening `ε′ = x − β′` — which is blocked in the pure-Feldman
+setting. The obstruction, its proof, and the resolution paths are the
+content of this section.**
+
+### 12.1 The assembly inventory (verified simulatable)
+
+For each phase, the simulator's knowledge and the message-production
+mechanism:
+
+| Phase | Values | Simulatable? | Mechanism |
+|---|---|---|---|
+| KeyGen | `[x]`, `A[x]`, `X*` | **conditional** | U3: deferred-content programming; adversary-facing shares chosen by `S` as scalars |
+| Triples | `α, β, γ` | ✓ | joint VSS dealt with known coefficients + wire extraction; DLEQ via `ℱ_GRO` programming |
+| Presign P1 | `⟦u⟧, ` | ✓ | dealt with known constants |
+| Presign P2 | `δ, ε, v, ⟦k⟧` | ✓ | `u, a` known ⇒ all openings computable; `k = v⁻¹a` known ⇒ `R = k·G` computed by `S` (no oracle needed) |
+| Presign P3 | `R_j`, `R`, `r` | ✓ | `k` known; nonce-point checks are point equalities on public data |
+| **Presign P4** | **`ε′ = x* − β′(0)`** | **✗ — the obstruction** | see §12.2 |
+| Presign P4 (rest) | `z`, `A[z]` | conditional on `ε′` | `z = u·x*` needs `ε′` as a scalar in `z_j = γ′_j + δ′β′_j + ε′α′_j + δ′ε′` |
+| Sign S1–S3 | `s_j`, `s` | ✓ (given `ε′` flows) | honest `s_h` via Lagrange from oracle `s` and wire-known adversary `s_j`; the point checks pass automatically for consistent adversaries |
+
+The unforgeability plug-in (U2) and the blame machinery (C3) are
+unaffected. The obstruction is thus *exactly one opening* — the only place
+in the protocol where a scalar affine in `x*` with a nonzero coefficient
+must be broadcast by an honest party.
+
+### 12.2 The obstruction, stated and proved
+
+**Lemma (the honest-scalar obstruction).** *In the pure-Feldman setting,
+no simulator can complete the P4 `ε′`-opening against an adversary that
+checks honest shares against the fixed commitment `A[x]`, unless it knows
+`x*` (making the reduction vacuous) or the commitment is equivocable.*
+
+**Proof.** The opening (SPEC §8 P4) reveals `ε′ = x* − β′(0)`, where
+`β′(0)` is a jointly dealt uniform mask known to `S`. The adversary
+interpolates it from `T` shares: its own `T−1` shares `x_j − β′_j`
+(scalars known to `S`, since `S` chose `x_j`) plus at least one honest
+share `σ_h = p̃(h) − β′_h`, where `p̃` is the simulated key polynomial
+with `p̃(0) = x*`. The adversary checks `σ_h·G == EvalCom(A[x], h) −
+EvalCom(A[β′], h)`. By the Lagrange structure of the programmed
+Vandermonde system, `p̃(h) = α_h + β_h·x*` with `α_h, β_h` known scalars
+and `β_h ≠ 0` at every honest position `h` (evaluation at any position
+outside `{0} ∪ C` depends on the constant term — for `T = 2` explicitly:
+`p̃(h) = x*(1 − h/2) + (h/2)x_2`, and the `x*`-coefficient vanishes only
+at `h = 2`, the adversary's own position). Hence `σ_h = (α_h − β′_h) +
+β_h·x*` is affine in `x*` with a nonzero `x*`-coefficient, and producing
+`σ_h` as a scalar requires `x*`. The check is a point equality, so
+sending any other scalar fails with probability 1 (§3.1). Prescribing the
+opened value does not help: replacing `p̃(0)` by `ε̂ + β′(0)` for a
+chosen `ε̂` changes the constant, and the check at honest positions then
+requires `w_0(h)·(x* − ε̂ − β′(0)) = 0`, i.e. `ε̂` equal to the true
+(unknown) value. Restructuring the multiplication does not help either:
+any computation of `[u·x]` (Beaver) or `[k⁻¹x]` (GJKR-style local
+products) requires an honest party to compute a scalar involving `x*` —
+the masked opening `x − β′` in the first case, the local product
+`u_h·x_h` in the second. ∎
+
+**Corollary (the trade-off at the heart of the design).** *Perfect
+binding of the key commitment (Feldman) yields unconditional detection of
+bad shares — and makes the standard (non-equivocating) simulation of
+key-involving openings impossible. Unconditional identifiability and
+standard-model simulatability are in direct tension at exactly one point:
+the P4 `ε′`-opening.*
+
+**Remark (why the literature doesn't hit this).** Groth–Shoup's signing
+service [GS22svc] uses Pedersen VSS with a trapdoor `ζ = log_g h`
+precisely so the simulator can *equivocate* — produce honest shares for
+any prescribed opening without knowing the secret (their §9, Game 6).
+DJNPO20 instead opens only `[s] + [d] + m[e]` with zero-sharings `[d],
+[e]` dealt jointly: the oracle-known `s` plus the fully-known blinding
+make honest `(s+d)_h` computable by Lagrange — which is *also* why the
+zero-sharings are part of the '657 claim elements, and why our
+patent-driven removal of them pushes the simulation problem back to the
+`ε′`-opening. Both are simulation mechanisms; ours is the only protocol
+in the family without one.
+
+### 12.3 Resolution paths
+
+**Path A (recommended): equivocable key commitment.** Change the key
+sharing `⟦x⟧` (and only it) from Feldman to Pedersen commitments with a
+trapdoor `ζ = log_g h` held by the simulator in the proof. Everything
+else — `u, a`, triples, presignature sharings, the DLEQ proofs, the F1–F8
+blame machinery, the signed-echo broadcast — stays Feldman and keeps
+unconditional detection. The trade-off, stated plainly: **the key
+sharing's share checks in the DKG (§6 R3) become computationally binding
+rather than unconditionally binding**, so blame for DKG share faults
+moves from the "unconditional" column to the "computational" column —
+the same column that already holds all attribution (signatures, ROM
+binding). No other blame rule changes. This is exactly the [GS22svc]
+architecture and the only known clean path to a full simulation proof.
+
+**Path B: verify the GJKR96 mechanism.** GJKR96's threshold-DSS proof
+faces the same obstruction in its multiplication subprotocol and
+(apparently) resolves it without equivocation. The mechanism could not be
+reliably reconstructed during the U4 sprint; a literature check of
+GJKR96's signing simulation (their handling of honest shares in
+`[k⁻¹x]`) is a research item. If it contains a non-equivocation trick
+compatible with Feldman, it is preferable to Path A.
+
+**Path C: prove in the AGM end-to-end without a full simulator.** The
+obstruction is about `S`'s *production* of honest scalars, not about the
+adversary's capabilities. A non-simulation argument (privacy proved
+statistically — `ε′` is uniform, `x_j` are `T−1` Shamir shares,
+commitments L2-hidden — plus a direct algebraic unforgeability argument
+in the AGM) might avoid the simulator entirely. This is the least
+developed path and offers no UC statement.
+
+**Status of Theorem U1.** *Assembled modulo the obstruction of §12.2:
+all phases are simulatable as inventoried in §12.1; the unforgeability
+plug-in (U2) and blame machinery (C3) port; Theorem U1 becomes a theorem
+upon adoption of Path A (a protocol decision — it weakens the key
+sharing's binding from perfect to computational and therefore requires
+sign-off under the project's "never weaken verification checks" rule) or
+a successful outcome of Path B.*
+
+### 12.4 What the assembly already establishes without the decision
+
+Independently of the Path A/B choice, the assembly verifies:
+
+* **Correctness, blame soundness, framing-freeness** (C1, C3) — proved
+  unconditionally, no simulation needed.
+* **Privacy (C2)** — provable statistically: the adversary's view decomposes
+  into `T−1` Shamir shares (information-theoretically free of `x*`),
+  one-time-padded openings (`ε′` uniform), simulated proofs, and
+  commitments (L2-hidden). No honest-scalar production is needed to *show
+  the distribution is independent of `x*`* — only to *simulate it
+  operationally*, and the former is what privacy claims.
+* **Identifiable abort end-to-end** — real-protocol property, unaffected.
+* **The UC-DKG theorem (U3)** — KeyGen is fully UC-secure as proved in
+  §11.
+* **Unforgeability modulo the `ε′`-opening**: conditioned on the
+  adversary obtaining `ε′` correctly (which is what an honest execution
+  delivers), the plug-in (U2) gives the full bound. The obstruction is
+  not a *security* hole in the real protocol — it is a *proof* hole in
+  the simulation argument for the online-involving-key opening.
+
+**Recommendation.** Take Path A as a protocol decision (Pedersen
+commitment for `⟦x⟧` only, with the binding trade-off documented in
+SPEC §4.2/§6 and the blame taxonomy annotated accordingly), then the U1
+assembly completes with no further novel work. Path B is the cheaper
+alternative *if* the GJKR96 mechanism verifies; assign it a literature
+check first.
