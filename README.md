@@ -511,3 +511,5 @@ an FTO opinion for commercial custody use.
 ## License
 
 Apache-2.0 (with its express patent grant). See `LICENSE`.
+
+Maintained by **Alp Guneysel** (GitHub: [ungaro](https://github.com/ungaro)).

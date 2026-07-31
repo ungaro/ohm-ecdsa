@@ -1,5 +1,7 @@
 # OHM-ECDSA: Open Honest-Majority Threshold ECDSA from Public-Domain Components
 
+**Alp Guneysel** (GitHub: [ungaro](https://github.com/ungaro))
+
 **Draft v0.7 — for IACR ePrint submission. Unreviewed. Not audited. Typeset version: `main.pdf` (from `main.tex`). This paper is released under CC-BY-4.0; the code is Apache-2.0.**
 
 ## Abstract

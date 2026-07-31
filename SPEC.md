@@ -1,6 +1,7 @@
 # OHM-ECDSA — Open Honest-Majority Threshold ECDSA
 
 **Protocol Specification v0.1 (draft)**
+**Author:** Alp Guneysel (GitHub: [ungaro](https://github.com/ungaro))
 **Status:** unreviewed draft for open development. Not audited. Not legal advice. See §12 (patent design-around) and §13 (disclaimers) before any production use.
 
 ---

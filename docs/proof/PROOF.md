@@ -1,5 +1,7 @@
 # OHM-ECDSA — Security Proof (game-based)
 
+**Author:** Alp Guneysel (GitHub: [ungaro](https://github.com/ungaro))
+
 **Working document v0.2.** Companion to `SPEC.md` §11. Status per lemma is
 marked **[proved here]**, **[proof sketched]**, or **[open]**. The model is
 game-based security in the random-oracle model (ROM); no rewinding is used.
