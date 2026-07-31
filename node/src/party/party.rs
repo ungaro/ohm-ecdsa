@@ -706,6 +706,15 @@ impl Acceptor {
                     return; // sender already ⊥ in this session
                 }
                 self.insert_candidate(&key, payload.clone(), original);
+                // §4.7 rule (2): only echoes from parties OTHER than the
+                // sender count toward the quorum — the sender's own copy
+                // is never counted (its signature already satisfies
+                // rule (1); a self-echo adds nothing). The candidate is
+                // still inserted above (the sender-signed envelope is
+                // kept as evidence either way).
+                if echoer == key.3 {
+                    return;
+                }
                 if let Some(candidate) = self
                     .bcast
                     .get_mut(&key)
@@ -3467,5 +3476,63 @@ fn abort_with(abort: &IdentifiableAbort, extra: String) -> Error {
             blamed: abort.blamed.clone(),
             detail: format!("{}; {extra}", abort.detail),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ohm_ecdsa::dkg::DkgBcast1;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    /// §4.7 rule (2): a sender's self-echo never counts toward the
+    /// `T−1` echo quorum — the M2 per-node acceptor enforces the same
+    /// sender exclusion as M1's orchestrator acceptor (the accepting
+    /// node's OWN echo still counts: it is a non-sender echo for every
+    /// slot but its own).
+    #[test]
+    fn sender_self_echo_does_not_count_toward_quorum() {
+        let mut acc = Acceptor::new(3); // quorum = T−1 = 2 non-sender echoers
+        let key = SigningKey::random(&mut StdRng::seed_from_u64(901));
+        let original = SignedEnvelope::sign(
+            Envelope::broadcast(
+                b"sid/self-echo",
+                Phase::KeyGen,
+                1,
+                1,
+                NodePayload::Dkg(DkgMessage::Commit(DkgBcast1 {
+                    from: 1,
+                    hash: [0xAA; 32],
+                })),
+            ),
+            &key,
+        );
+        acc.process(Received::Original(original.clone()));
+
+        // Sender 1 self-echoes; one colluder (2) echoes: only {2} can
+        // count, so the quorum of 2 is NOT reached.
+        acc.process(Received::Echo {
+            echoer: 1,
+            original: original.clone(),
+        });
+        acc.process(Received::Echo {
+            echoer: 2,
+            original: original.clone(),
+        });
+        assert!(
+            !acc.bcast_set(b"sid/self-echo", Phase::KeyGen, 1, &[1])
+                .contains_key(&1),
+            "self-echo + one colluder must not reach the T−1 quorum"
+        );
+
+        // A second DISTINCT non-sender echoer reaches the quorum.
+        acc.process(Received::Echo {
+            echoer: 3,
+            original,
+        });
+        assert!(acc
+            .bcast_set(b"sid/self-echo", Phase::KeyGen, 1, &[1])
+            .contains_key(&1));
     }
 }

@@ -25,6 +25,9 @@
 //! protocol. It has not been audited. See SPEC.md §13 for the hardening
 //! checklist (zeroization, side channels, transport, policy).
 
+// The core crate is unsafe-free; keep it compiler-enforced.
+#![forbid(unsafe_code)]
+
 mod error;
 pub mod primitives;
 pub mod protocol;

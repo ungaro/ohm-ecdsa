@@ -176,9 +176,14 @@ impl Acceptor {
                 if self.equivocated.contains(&(key.0.clone(), key.3)) {
                     return; // sender already ⊥ in this session
                 }
-                self.insert_candidate(&key, payload, original)
-                    .echoers
-                    .insert(echoer);
+                let candidate = self.insert_candidate(&key, payload, original);
+                // §4.7 rule (2): only echoes from parties OTHER than the
+                // sender count toward the quorum — the sender's own copy
+                // is never counted (its signature already satisfies
+                // rule (1); a self-echo adds nothing).
+                if echoer != key.3 {
+                    candidate.echoers.insert(echoer);
+                }
             }
         }
     }
@@ -434,5 +439,64 @@ impl Transport<SignedEnvelope<DkgMessage>> for MeshTransport {
                 return acc.p2p_set(sid, phase, round, to, &self.ids).0;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ohm_ecdsa::dkg::DkgBcast1;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    fn signed_commit(seed: u64, from: PartyId, byte: u8) -> SignedEnvelope<DkgMessage> {
+        let key = SigningKey::random(&mut StdRng::seed_from_u64(seed));
+        SignedEnvelope::sign(
+            Envelope::broadcast(
+                b"sid/self-echo",
+                Phase::KeyGen,
+                1,
+                from,
+                DkgMessage::Commit(DkgBcast1 {
+                    from,
+                    hash: [byte; 32],
+                }),
+            ),
+            &key,
+        )
+    }
+
+    /// §4.7 rule (2): a sender's self-echo never counts toward the
+    /// `T−1` echo quorum — a malicious sender cannot fill the quorum
+    /// with itself plus fewer than `T−1` colluders.
+    #[test]
+    fn sender_self_echo_does_not_count_toward_quorum() {
+        let mut acc = Acceptor::new(3); // quorum = T−1 = 2 non-sender echoers
+        let original = signed_commit(900, 1, 0xAA);
+        acc.process(Received::Original(original.clone()));
+
+        // Sender 1 self-echoes; one colluder (2) echoes: only {2} can
+        // count, so the quorum of 2 is NOT reached.
+        acc.process(Received::Echo {
+            echoer: 1,
+            original: original.clone(),
+        });
+        acc.process(Received::Echo {
+            echoer: 2,
+            original: original.clone(),
+        });
+        let (set, complete) = acc.bcast_set(b"sid/self-echo", Phase::KeyGen, 1, &[1]);
+        assert!(
+            !complete && !set.contains_key(&1),
+            "self-echo + one colluder must not reach the T−1 quorum"
+        );
+
+        // A second DISTINCT non-sender echoer reaches the quorum.
+        acc.process(Received::Echo {
+            echoer: 3,
+            original,
+        });
+        let (set, complete) = acc.bcast_set(b"sid/self-echo", Phase::KeyGen, 1, &[1]);
+        assert!(complete && set.contains_key(&1));
     }
 }

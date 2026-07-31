@@ -222,11 +222,19 @@ fn accept_rate_cap_counts_poke_flood() {
             flood.push(s);
         }
     }
-    assert!(
-        nodes[0].metrics().accepts_rate_limited > 0,
-        "the accept-rate window counted the flood: {:?}",
-        nodes[0].metrics()
-    );
+    // The listener thread may be scheduled after the kernel has already
+    // completed the handshakes into the backlog (loaded/single-CPU
+    // machines) — poll the counter with a deadline instead of asserting
+    // immediately.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while nodes[0].metrics().accepts_rate_limited == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the accept-rate window never counted the flood: {:?}",
+            nodes[0].metrics()
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
     drop(flood);
     // The honest keygen completes regardless.
     let mut threads = Vec::new();
