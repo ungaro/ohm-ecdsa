@@ -643,25 +643,19 @@ is an unstructured RO fixed point; any algebraic strategy beyond
 exhaustive search would yield a relation among RO outputs, contradicting
 the RO model. (ii) Multi-query core: §8.2.5 — the multi-candidate attack
 (a collision in the rerandomized condition) is a birthday search in an
-effectively random function, costing `Θ(√q)`. (iii) Residual closed:
-§8.2.6 — the genericity of `F∘(·R)` follows from curve geometry
-(`F(P) = F(Q)` iff `P = ±Q`; `ψ` is exactly 2-to-1), and the scheduling
-lemma bounds every interleaving by `q_H²/2q + q_s·q_H/q + Adv_GS-EUF`.
-The only assumption beyond the ROM is the named F-uniformity heuristic
-(§8.2.6), which is equally load-bearing for the attack being mitigated.
-(iii-bis) The algebraic structure of `F` (x-coordinate extraction,
-notably `F(P) = F(−P)`) is handled by §8.2.6(iv) — a factor of 2, not a
-structure.
+effectively random function, costing `Θ(√q)`. (iii) The residual: two
+named gaps (G1: the F-uniformity heuristic; G2: the no-collision
+residual of §8.2.6 case (3) — the re-randomized adversary is stronger
+than the GS model, so the residual needs its own bound).
 
-**Status.** **Proved** (§8.2.6), modulo one named heuristic —
-F-uniformity of the x-coordinate map, the standard assumption every
-ECDSA analysis in this lineage already makes (including the GS21 attack
-this lemma mitigates). Final form: the re-randomized scheme is EUF under
-adaptive chosen-message-and-tweak attacks with advantage
-`O(q_H²/q) + O(q_s·q_H/q) + Adv_GS-EUF` — square-root security restored.
-The mitigation remains experimental and default-off in the
-implementation pending external review; SPEC §9.4 policy (signing-time
-disclosure, bounded pools) remains the deployment posture.
+**Status.** **Proof sketch** — the attack's structure is now analyzed
+rather than asserted (§8.2.2, §8.2.5 with accounted algebraic handles,
+§8.2.6), but two named gaps remain before this is a theorem: G1 (the
+F-uniformity heuristic, also required by the attack being mitigated) and
+G2 (the no-collision residual, §8.2.6 case (3)). Until both close, the
+mitigation remains experimental and default-off in the
+implementation, and SPEC §9.4 policy (signing-time disclosure, bounded
+pools) remains the deployment posture.
 
 #### 8.2.5 The collision analysis (multi-candidate lifting)
 
@@ -718,22 +712,49 @@ multiplicative form makes the *point* non-existent until choice. Both
 destroy the pre-computation window; ours additionally preserves the
 `[k⁻¹]` representation that the design-around requires.)
 
-**The residual (two items, both bookkeeping, no new ideas).**
-(a) *Genericity lemma*: formalize "heuristically uniform" for
-`γ ↦ F(γ·R)` in the AGM — i.e., that an algebraic adversary cannot make
-`Φ` non-birthday-hard; `F` is x-coordinate extraction, not an RO, and
-this is the single non-random-oracle ingredient in the argument. The
-`F(P) = F(−P)` symmetry must be shown harmless (it folds two `γ` values
-onto one `r′`, at most doubling effective collision probability — a
-factor of 2, not a structure).
-(b) *Adaptive scheduling*: the adversary interleaves RO queries
-(defining `γ`, hence `Φ`) with signing queries; the reduction must show
-no interleaving beats the `Θ(√q)` collision search, which is exactly the
-signing-oracle bookkeeping of the Groth–Shoup multi-query framework.
-Neither item changes the conclusion's shape; both are needed to turn this
-section from *proof* into *theorem*.
+**The algebraic handles, accounted (the reviewer's objection, answered).**
+A natural worry: `τ` and `τ′` are adversary-controlled algebraic
+variables, not RO outputs, so the adversary is not doing a symmetric
+birthday search over a random function — it has free handles. The
+decomposition shows the handles buy nothing. Write
+`ψ_m(t) := F(H(sid‖id‖m‖t‖X)·R)` and treat it, for this accounting, as a
+random function (the F-uniformity heuristic of §8.2.6(iv), named
+below). The collision condition `h(M) + ψ_M(τ)·τ = h(M′) +
+ψ_{M′}(τ′)·τ′` has two **independent blocks** `(M, τ)` and `(M′, τ′)`:
+`M` appears only on the left, `M′` only on the right, and within each
+block the hash `h` and the map `ψ` are tied to the same variable but
+independent of the other block. The condition is therefore exactly a
+collision of one block-variable `Φ: 𝔽_q × 𝔽_q → 𝔽_q`, and:
 
-#### 8.2.6 Closing the residual — [proved here, modulo one named heuristic]
+* **Birthday/lower bound.** For a random `Φ`, any algorithm making `Q`
+  evaluations finds a collision with probability `≤ Q²/2q` (standard
+  birthday), i.e. generic cost `Θ(√q)` — *unless* the adversary finds a
+  structural shortcut (enumerated below).
+* **Meet-in-the-middle / upper bound.** Evaluate `Φ` on `√(2q)` block
+  values from each side and match: expected collision when the two lists
+  cover `√(2q)²/2 = q` pairs — cost `Θ(√q)` time and `Θ(√q)` memory. So
+  the bound is tight: `Θ(√q)` both directions.
+* **Degenerate schedules (all worse, not better).** Setting `τ′ = 0`
+  (or `τ = 0`) eliminates one term and leaves a one-variable equation —
+  exhaustive search at `O(q)`. Setting `τ = τ′` is likewise
+  one-variable at `O(q)`. Setting `M = M′` reduces to a collision in
+  the single function `t ↦ ψ_M(t)·t` — a birthday search at `Θ(√q)`
+  again. Forcing a vanishing `ψ(τ) = 0` is an RO preimage search at
+  `O(q)`. In every shortcut the algebraic freedom collapses the
+  two-block structure to something *harder*, never easier.
+* **Budget consistency.** Each `ψ`-evaluation the adversary makes is an
+  RO query, so the `Φ`-evaluation budget is bounded by the RO budget
+  `q_H`; the birthday probability over the whole game is `≤ q_H²/2q`.
+
+The residual non-bookkeeping assumption, named precisely: the
+F-uniformity heuristic (that `γ ↦ F(γ·R)` is uniform enough for `ψ_m`
+to be modeled as random functions). This is one step above a full
+proof — the *structure* of the attack is now analyzed rather than
+asserted — and it is exactly the heuristic the GS21 attack itself
+requires, so adopting it concedes nothing the attack did not already
+concede.
+
+#### 8.2.6 Closing the residual — [analysis, with gaps G1/G2 named in §8.2.4]
 
 **Lemma (genericity of `F∘(·R)`).** Let `R ∈ 𝔾`, `R ≠ O`, and
 `F: 𝔾 → 𝔽_q` the ECDSA x-coordinate extraction. Then:
@@ -775,35 +796,58 @@ adopting it costs the proof nothing the attack did not already concede.
 
 **Lemma (scheduling).** No interleaving of RO queries with signing
 queries yields forgery advantage exceeding
-`O(q_H²/q) + O(q_s·q_H/q) + Adv_GS-EUF`, where `q_s` signing queries and
-`q_H` `Φ`-evaluations are made.
+`O(q_H²/q) + O(q_s·q_H/q) + ε_residual`, where `q_s` signing queries and
+`q_H` `Φ`-evaluations are made, and `ε_residual` is the forgery
+advantage of the re-randomized scheme in the no-collision case (analyzed
+below — **not** a black-box citation).
 
 **Proof.** A successful forgery must contain one of:
 (1) a `Φ`-collision between two values the adversary *controls* (it then
 uses one signing query on the first and forges on the second —
 find-then-sign). Among `q_H` `Φ`-evaluations, a collision exists with
-probability `≤ q_H²/2q` (birthday, by the genericity lemma).
+probability `≤ q_H²/2q` (birthday, §8.2.5's accounted analysis).
 (2) a `Φ`-preimage against a *signed* point (sign-then-find): for each
 of the `q_s` signed points, finding a preimage costs `O(q)` per
 `Φ`-evaluation with per-attempt probability `1/q`, giving `≤ q_s·q_H/q`.
-(3) no usable collision at all: then the forgery is an ordinary ECDSA
-forgery under the (possibly tweaked) key with message-derived nonces
-`k′ = γk`, `γ` independent of `k` and uniform — an instance of the
-Groth–Shoup presignature-ECDSA experiment, bounded by `Adv_GS-EUF`.
+(3) no usable collision at all: then the forgery is a forgery of the
+re-randomized presignature scheme with message-derived nonces
+(`k′ = H(M‖τ‖X)·k`). This residual is **not** bounded by citing
+Groth–Shoup's presignature-ECDSA result: their oracle exposes `R` early,
+while ours exposes pool nonces early *and* lets the adversary evaluate
+`R′(M) = F(γ(M)·R)` for every candidate message — the re-randomized
+adversary is strictly stronger than their model's, so `Adv_GS-EUF` does
+not apply as a black box. The residual needs its own analysis; the
+natural one is the same `Φ`-structure (a forgery without a signing-query
+partner is a forgery against a message-derived-nonce ECDSA instance, and
+the adversary's advantage there is again governed by collision/preimage
+searches in `Φ`-type maps), but **this is the second named gap**: a
+self-contained bound for the no-collision residual, which the current
+document does not provide.
 Any interleaving decomposes into these cases: signing earlier only turns
 controlled points into signed points (case (2), worse for the adversary
 than case (1)); signing later leaves the collision search untouched
 (case (1)). The union bound gives the claim. ∎
 
-**The re-randomization lemma, final form — [proved here, modulo the
-F-uniformity heuristic].** *In the ROM with the F-uniformity heuristic,
-the multiplicatively re-randomized presignature scheme of §8.2 is
-existentially unforgeable under adaptive chosen-message-and-tweak attacks
-with advantage bounded by `O(q_H²/q) + O(q_s·q_H/q) + Adv_GS-EUF` — i.e.,
-the mitigation restores square-root security (the Groth–Shoup bound) for
-ECDSA with presignatures and additive key derivation, and is the only
-known mitigation compatible with direct inverse-dealing (`[k⁻¹]`
-representation).*
+**The re-randomization lemma, current form — [proof sketch with two named
+non-bookkeeping gaps].** *Target statement: in the ROM with the
+F-uniformity heuristic, the multiplicatively re-randomized presignature
+scheme of §8.2 is existentially unforgeable under adaptive
+chosen-message-and-tweak attacks with advantage bounded by
+`O(q_H²/q) + O(q_s·q_H/q) + ε_residual` — square-root security (the
+Groth–Shoup bound) for ECDSA with presignatures and additive key
+derivation, and the only known mitigation compatible with direct
+inverse-dealing (`[k⁻¹]` representation).* Established here: the
+single-query core (§8.2.2), the two-block collision analysis with the
+algebraic handles accounted (§8.2.5), the 2-to-1 genericity lemma
+(§8.2.6(i)–(iv)), and the scheduling case split (§8.2.6). **Named gaps:
+(G1)** the F-uniformity heuristic itself (that `γ ↦ F(γ·R)` is uniform
+enough for `ψ_m` to be modeled as random functions — also required by
+the attack this mitigates); **(G2)** the no-collision residual
+`ε_residual` (case (3) of the scheduling lemma): the re-randomized
+adversary is strictly stronger than Groth–Shoup's presignature-ECDSA
+model (it sees pool nonces early *and* can evaluate every candidate
+`R′(M)`), so the residual needs its own bound rather than a black-box
+`Adv_GS-EUF` citation.
 
 ---
 
@@ -858,14 +902,15 @@ the port actually requires, so the plan survives review.
 
 1. **UC-DKG against a rushing adversary — the GJKR caveat in UC form.**
    Commit-reveal DKG is known to resist UC simulation in general; the
-   deferred-content trick is our candidate answer, but making it a
-   theorem requires the full UC DKG functionality definition (what the
-   adversary may choose post-reveal, how expulsion/restart is modeled in
-   the ideal world, and how the environment's rush on `ℱ_AUTH` is
-   bounded). This is the G1 of the UC proof and plausibly 60% of the
-   work. The expulsion-budget structure of §4.2 (rerolls cost corruptions)
-   is, we believe, the missing ingredient that makes a UC statement
-   feasible where the anonymous-abort classical setting fails.
+   deferred-content trick is our candidate answer. **Update: this is now
+   Theorem U3, proved in §11** at the level of the hybrid argument —
+   the deferred-content technique, the expulsion budget, and the
+   restart-economics hook (§11.2) carry the proof, with the delicate
+   points (P1: programming undetectability against `Z`; P2: restart
+   correspondence; P3: round-close attribution) made explicit. Remaining
+   here is indexing work only (the `ℱ_BC` realization write-up and the
+   per-restart union-bound expansion, §11.6), plus the items explicitly
+   not claimed (adaptive corruptions; liveness under full asynchrony).
 2. **UC presignature-ECDSA does not exist as a result.** Our C5
    *reduces* to Groth–Shoup's game-based presignature-ECDSA experiment;
    a UC proof cannot cite a game-based assumption that way. Options:
@@ -922,8 +967,9 @@ forgery condition is an unstructured RO fixed point costing `O(q)`), and
 the full reduction skeleton with per-hop bounds and the assembled
 advantage. **What remains open:** the §7.3 representation-bookkeeping pages, the
 plain-model OMDL alternative (named, unproven), UC (§9 — roadmap, not a
-gap), and adaptive corruptions. The re-randomization lemma is **proved**
-(§8.2.6, modulo the named F-uniformity heuristic). With those caveats,
+gap), and adaptive corruptions. The re-randomization lemma is a
+**proof sketch with two named gaps** (G1: F-uniformity; G2: the
+no-collision residual, §8.2.6 case (3)). With those caveats,
 the game-based security claim of §1 is **proved in the AGM+ROM under
 ECDLP and the Groth–Shoup presignature-ECDSA assumption.**
 
@@ -1027,21 +1073,21 @@ interface and with the consumption state machine internalized (§1):
   simulator construction pending (U3)**.
 * **Theorem U2 (unforgeability plug-in).** *No environment distinguishing
   real from ideal can forge an ECDSA signature under the ideal key except
-  with `Adv_GS-EUF + Adv_rerand`*, where the two terms are the
-  Groth–Shoup presignature-ECDSA bound and the re-randomization lemma of
-  §8.2.6 (which plays the role that [GS21] Theorem 6 plays for
+  with `Adv_GS-EUF + ε_rerand`*, where the two terms are the
+  Groth–Shoup presignature-ECDSA bound and the re-randomization analysis
+  of §8.2 (which plays the role that [GS21] Theorem 6 plays for
   [GS22svc] — note: *their* theorem covers the additive mitigation, ours
   covers the multiplicative one; there is no existing citable result for
-  the multiplicative form, which is why §8.2.6 had to exist). Status:
-  **proved modulo the F-uniformity heuristic (§8.2.6)**.
+  the multiplicative form, which is why §8.2 had to exist). Status:
+  **proof sketch (§8.2.4), gaps G1/G2 named**.
 * **Theorem U3 (UC-DKG against rushing).** *The commit-reveal DKG of
   SPEC §6 is UC-simulatable against a rushing adversary via the
   deferred-content technique (honest R1 hashes programmed at reveal
   time), with the expulsion budget of §4.2 bounding rejection-sampling
-  to `O(log T)` bits.* Status: **proved in §11** (hybrid argument in
-  full, delicate points P1–P3 explicit; realization bookkeeping for
-  `ℱ_BC` and the per-restart union bound expansion remain as indexing
-  work, §11.6).
+  to `O(log T)` bits.* Status: **proved in §11 at the level of the
+  hybrid argument** (delicate points P1–P3 explicit; realization
+  bookkeeping for `ℱ_BC` and the per-restart union-bound expansion
+  remain as indexing work, §11.6).
 
 ### 10.5 Composition architecture
 
