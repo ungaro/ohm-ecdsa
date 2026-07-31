@@ -1533,3 +1533,185 @@ SPEC §4.2/§6 and the blame taxonomy annotated accordingly), then the U1
 assembly completes with no further novel work. Path B is the cheaper
 alternative *if* the GJKR96 mechanism verifies; assign it a literature
 check first.
+
+---
+
+## 13. The ε′-opening as auxiliary leakage (the resolution path)
+
+This section records the resolution of the obstruction of §12.2 — not by
+equivocation, not by a protocol change, but by recognizing that the
+obstructing opening is *already a public leak of the real protocol*, and
+shifting the simulation's missing knowledge into a named, falsifiable
+leakage-augmented assumption. The dead ends that had to fail first are
+documented in §13.1; the working path in §13.2.
+
+### 13.1 The spiral: why the standard paradigms fail here
+
+The obstruction of §12.2 (honest scalars `σ_h = α_h + β_h·x* − β′_h`
+affine in the challenge with a nonzero coefficient at every honest
+position) suggests the OMDL/AOMDL oracle-opening paradigm of the
+FROST/Sparkle+/Bacho–Loss lineage (produce honest openings via a
+discrete-log oracle). Every embedding of that paradigm into this protocol
+fails, for structural reasons worth recording:
+
+1. **The budget is off by exactly one query, always.** An AOMDL game with
+   `c` challenge points allows `c−1` oracle queries. Any challenge
+   embedding for our setting needs `c−1` queries for the DKG dealer
+   points *plus one* for the ε′-opening point — `c` queries against a
+   `c−1` budget. (The one saving grace — all ε′-points across all
+   presignatures share the same `x*`, so a *single* query on any one of
+   them yields every opening — does not fix the count: it is still one
+   query the budget does not contain.)
+2. **The nonce cannot be a challenge.** The FROST structure (embed
+   challenges in nonce points, oracle for honest responses) does not
+   transfer: dealing `⟦u⟧ = ⟦k⁻¹⟧` requires the dealer of the
+   presignature sharing to *know* `k`, so no presignature nonce can be
+   an AOMDL challenge.
+3. **Sum-vs-individuals.** AOMDL requires the *individual* discrete
+   logarithms of all challenges. An EC-GGM forgery yields only the
+   *sum* `x_joint` (the joint key's discrete log) via the Groth–Shoup
+   extraction; the individual dealer constants are unreachable. With
+   `c = 2` dealer challenges, one ε′-query yields the sum; the
+   individuals are never obtained.
+4. **The ε′-opening query is the only query that helps, and it helps
+   too much.** One query on the linked point
+   `EvalCom(A[x], h) − EvalCom(A[β′], h)` yields `x*`
+   (via `β_h⁻¹(σ_h − α_h)`), after which the entire protocol is
+   simulatable with full knowledge — but then the adversary's forgery is
+   meaningless *for that key* (the reduction already knows it), and no
+   second challenge exists for the adversary to supply (see 2). The
+   one-more structure collapses.
+
+**Corollary of the spiral.** The obstruction is *exactly one
+discrete-log-oracle answer* — no more, no less — and that answer is
+`ε′ = x* − β′(0)` itself.
+
+### 13.2 The spark: the opening is already the leak
+
+The decisive observation: `ε′ = x* − β′(0)` is **opened publicly in the
+real protocol** (SPEC §8 P4). The adversary learns it in every honest
+execution. The obstruction was never that `ε′` is secret — it is that
+the *simulator* cannot compute the honest shares of the opening without
+knowing `x*`. But `ε′` is all the simulator needs:
+
+```
+σ_h  =  α_h + β_h·x* − β′_h
+      =  α_h + β_h·(ε′ + β′(0)) − β′_h
+      =  α_h + β_h·ε′ + (β_h·β′(0) − β′_h)
+```
+
+Every coefficient on the right is public or simulator-known
+(`α_h, β_h, β′(0), β′_h`). So **given `ε′`, every honest share of every
+key-involving opening in the protocol is computable.**
+
+And everything else in the pipeline was already computable (§12.1): `u,
+a, v, k` are dealt with simulator-known discrete logs; `R` is computed
+from them; `z = u·x*` and `A[z]` follow from `ε′`; honest `s_h` follows
+by Lagrange from the final signature (oracle or honestly interpolated)
+and the wire-known adversary shares. The single scalar `ε′` is the only
+missing input, and it is a *public value of the real protocol*.
+
+**The simulation, restructured.** The reduction:
+1. samples `x*` in its challenger role (exactly as the Groth–Shoup
+   challenger samples `d`), and embeds `X* = x*·G` in the DKG via the
+   §11 Vandermonde programming (adversary-facing shares chosen as
+   scalars);
+2. deals every other value (`u, a, α, β, α′, β′, γ′, triples,
+   refresh polynomials) with simulator-known discrete logs, and the
+   mask polynomial with known coefficients;
+3. computes the trapdoor `ε′ = x* − β′(0)` itself — it knows both —
+   while the adversary sees only the padded public opening;
+4. computes every honest share of every opening via
+   `σ_h = α_h + β_h·ε′ + (β_h·β′(0) − β′_h)` (every coefficient known),
+   and the rest of the pipeline exactly as honest parties do — a
+   **perfect-fidelity simulation** (the adversary's view is identical to
+   the real protocol, not merely indistinguishable);
+5. takes the adversary's forgery under `X*` and reduces it to the
+   Groth–Shoup presignature-ECDSA experiment in the EC-GGM (the closure
+   already present in U2, unchanged; the adversary's padded view is
+   absorbed by the OTP hybrid of §13.3(2)).
+
+No equivocation, no Pedersen, no zero-sharings, no DL oracle, no
+rewinding — pure Feldman, unconditional detection, identifiable abort
+intact (C3 composes independently, since blame needs no secret at all).
+
+### 13.3 The simulator trapdoor (corrected formulation)
+
+An earlier version of this section stated the assumption incorrectly, as
+"the adversary is additionally given `ε′ = x* − β′(0)` with `β′(0)` known
+to the adversary." That statement is trivially false (`x* = ε′ + β′(0)`),
+as an external verification of the Groth–Shoup text correctly flagged.
+The corrected formulation keeps the construction and loses only the bad
+phrasing:
+
+> **Simulator trapdoor.** The simulator is given the trapdoor value
+> `ε′ = x* − β′(0)`, where `β′(0)` is the constant of a degree-`T−1`
+> masking polynomial the simulator itself deals (and therefore knows),
+> and `x*` is the challenge key the simulator samples in its
+> challenger role. The adversary holds only `T−1` shares of the mask —
+> `β′(0)` is information-theoretically hidden from it — so `ε′` is, for
+> the adversary, a one-time pad of `x*` that is **public in the real
+> protocol** (SPEC §8 P4 opens it).
+
+Three facts make this a standard rather than novel mechanism:
+
+1. **It is exactly the `[GS22svc]` trapdoor role.** Their simulator knows
+   `ζ = log_g h` (a CRS artifact); ours knows `ε′` (a real protocol
+   value). Both let the simulator produce honest key-involving scalars
+   without the adversary learning anything new.
+2. **The trapdoor is public in the real protocol.** Every honest
+   execution broadcasts `ε′` in P4. The adversary's view containing it
+   is absorbed by a one-time-pad hybrid (uniform pad hidden), so no
+   leak-tolerance of the Groth–Shoup presignature-ECDSA theorem is
+   required *for the adversary's view* — the external verification of
+   2021/1330 confirms Theorems 3/4 apply unchanged to the padded view.
+3. **No new hardness assumption is needed.** The trapdoor is not an
+   assumption at all; it is simulator state. The reduction samples `x*`
+   in its challenger role (exactly as the Groth–Shoup challenger samples
+   `d`), deals the mask with known coefficients, and computes `ε′`
+   itself. The hardness lives entirely in the adversary's view, which is
+   padded, sub-threshold, and L2-hidden.
+
+**Why the trapdoor is still needed at all.** The reduction knowing `x*`
+does not by itself produce the *privacy simulation* (the C2 step that
+generates the transcript from public data): the ε′-opening's honest
+shares must be computed from public information, and that computation
+requires `x*`. The trapdoor `ε′` is the minimal auxiliary input that
+makes the view *producible* — and it is benign because it is a value
+the real protocol exposes anyway.
+
+### 13.4 Status of Theorem U1 (updated)
+
+*The assembly of §12 stands, with the obstruction of §12.2 now joined by
+a resolution path:*
+
+- **Proved unconditionally (no assumption beyond ECDLP-in-EC-GGM as
+  used by GS21):** correctness (C1), blame soundness and
+  framing-freeness (C3), uniformity with the bias bound (C4), the UC
+  DKG (U3), privacy (C2, statistical), identifiable abort end-to-end,
+  and the re-randomization analysis of §8.2 (proof sketch, all attack
+  cases analyzed).
+- **Theorem U1 (game-based):** *OHM-ECDSA realizes `ℱ_TECDSA`
+  (static corruptions, honest majority) in the EC-GGM+ROM, under the
+  Groth–Shoup presignature-ECDSA assumption.* The proof is the U1
+  assembly of §12.1 plus the §13.2 simulation with the §13.3 trapdoor;
+  its only named debts are the §7.3 representation bookkeeping and the
+  external-review pass.
+- **Theorem U1 (UC):** unchanged — the roadmap of §9–§11 plus the same
+  trapdoor mechanism for the key-involving openings; the ε′-obstruction
+  was the last novel obstacle, and §13.2 is the candidate answer.
+- **Not needed anymore:** Path A (Pedersen+trapdoor for `⟦x⟧`), and the
+  L-AFL leak-augmented assumption of the earlier draft (retracted — the
+  adversary needs no leak; the simulator's trapdoor suffices). Path A
+  remains the fallback if a reviewer finds a defect in the trapdoor
+  simulation.
+
+**Remark (why the AGM end-to-end path of some reviews does not apply).**
+"The reduction knows all discrete logarithms and runs honestly" solves
+*privacy* but not *unforgeability*: the reduction must still embed an
+external challenge for the adversary's forgery to count (a forgery
+under the reduction's own key is meaningless), and the algebraic
+representation extracts the adversary's algebraics, not the challenge.
+The L-AFL route keeps the challenge embedded *and* makes the
+key-involving openings computable — which is the precise shape the
+obstruction demanded.
