@@ -91,6 +91,26 @@ distributed ceremony below.
 The standard setup is the **distributed ceremony** — no secret ever
 leaves its party's machine:
 
+```mermaid
+sequenceDiagram
+    participant A as machine A (party 1)
+    participant B as machine B (party 2)
+    participant C as machine C (party 3)
+    Note over A,C: 1 — init: each party generates its OWN keys locally
+    A->>A: init → identity (secret), .pub, FINGERPRINT
+    B->>B: init
+    C->>C: init
+    Note over A,C: 2 — out-of-band exchange of PUBLIC bundles only<br/>+ fingerprint confirmation on a second channel
+    A-->>B: party-1.pub
+    A-->>C: party-1.pub
+    B-->>A: party-2.pub
+    B-->>C: party-2.pub
+    C-->>A: party-3.pub
+    C-->>B: party-3.pub
+    Note over A,C: 3 — assemble (public data, anywhere) → committee.hex
+    Note over A,C: 4 — each node boots with its own identity + committee.hex<br/>full-mesh TCP/mTLS; key separation by construction
+```
+
 ```sh
 # 1. Each party, on its OWN machine (party 1 shown; 2, 3 alike):
 cargo run -p ohm-ecdsa-node -- init --id 1 --dir ./party1 --addr 10.0.0.1:7700 --tls
@@ -132,7 +152,26 @@ Worth one paragraph, because everything else stands on it. A value `m`
 from sender `i` is *accepted* iff (1) the acceptor holds `i`'s valid
 signature on `m` (echoes carry the sender's signed message), (2) `m` was
 echoed by at least `T−1` distinct parties other than `i`, and (3) no
-conflicting sender-signed value was seen. A conflicting pair poisons the
+conflicting sender-signed value was seen.
+
+```mermaid
+sequenceDiagram
+    participant S as sender (honest)
+    participant E as echoer
+    participant V as verifier
+    S->>E: sign(m)
+    S->>V: sign(m)
+    E->>V: echo( sign(m) )
+    E->>S: echo( sign(m) )
+    V->>S: echo( sign(m) )
+    V->>E: echo( sign(m) )
+    Note over V: ACCEPT — sender signature ✓<br/>≥ T−1 echoes from others ✓<br/>no conflicting sender-signed value ✓
+    Note over S,E: equivocation: sender signs two values
+    S->>E: sign(m′)
+    Note over V: sees sign(m) AND sign(m′) from the same sender<br/>→ ⊥ for the sender this session<br/>+ blame token (the two signed envelopes<br/>are offline-verifiable evidence)
+```
+
+A conflicting pair poisons the
 sender for the session (its value is never delivered) and is archived as
 offline-verifiable blame evidence. The textbook rule it replaces —
 accept on a `⌈(n+1)/2⌉` majority of consistent echoes — is **inconsistent
@@ -143,6 +182,26 @@ the honest accepted sets (demonstrated at `n = 5, T = 3`; the
 attack over the wire).
 
 ## Architecture
+
+```mermaid
+flowchart TB
+    subgraph core["core crate (dependency-pure, no I/O)"]
+        L["protocol logic<br/>dkg · triples · presign · sign"]
+        T["Transport trait +<br/>canonical wire format"]
+        L --> T
+    end
+    subgraph node["node crate (this crate — sockets, files, processes)"]
+        C["setup/<br/>committee ceremony"]
+        P["party/<br/>per-node drivers · pool · metrics"]
+        N["net/<br/>mesh · echo broadcast · mTLS"]
+        S["store/<br/>durable stores · AEAD · blame tokens"]
+        C --> P
+        P --> N
+        P --> S
+    end
+    T --> N
+    N <-->|"signed envelopes over TCP / mTLS"| MESH["full-mesh network<br/>of per-party OS processes"]
+```
 
 ```
 node/src/
