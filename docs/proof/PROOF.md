@@ -1438,13 +1438,23 @@ the same column that already holds all attribution (signatures, ROM
 binding). No other blame rule changes. This is exactly the [GS22svc]
 architecture and the only known clean path to a full simulation proof.
 
-**Path B: verify the GJKR96 mechanism.** GJKR96's threshold-DSS proof
-faces the same obstruction in its multiplication subprotocol and
-(apparently) resolves it without equivocation. The mechanism could not be
-reliably reconstructed during the U4 sprint; a literature check of
-GJKR96's signing simulation (their handling of honest shares in
-`[k⁻¹x]`) is a research item. If it contains a non-equivocation trick
-compatible with Feldman, it is preferable to Path A.
+**Path B: verify the GJKR96 mechanism — DONE (outcome: negative).** A
+full primary-source check (GJKR96 LNCS conference version, GJKR99
+J. Cryptology, DJNPO20 ePrint, GS22svc) found that GJKR96 does not solve
+the obstruction because it does not have it: their signing simulation
+produces honest shares by free interpolation toward prescribed values,
+which works *only because opened shares are never point-checked against
+commitments* — their verification is Berlekamp–Welch error correction
+(hence `n ≥ 4t+1`), and key-involving secrets sit under equivocable
+(Pedersen/Feldman–Micali) commitments. DJNPO20 confirms from the other
+side: it deletes VSS checks entirely (final-signature verification only)
+and gives up identifiable abort for simulatability. Every verified
+instance of an honest scalar produced against a commitment check uses a
+trapdoor or Schnorr-specific RO programming (unavailable for ECDSA).
+GJKR99 §3 ("Why the Simulation Fails") is the closest analogue of §12.2's
+lemma, and nothing read contradicts it. The GJKR96 journal version (I&C
+2001) and Gennaro's thesis remain unread — a residual coverage caveat,
+noted.
 
 **Path C: prove in the AGM end-to-end without a full simulator.** The
 obstruction is about `S`'s *production* of honest scalars, not about the
@@ -1454,13 +1464,23 @@ commitments L2-hidden — plus a direct algebraic unforgeability argument
 in the AGM) might avoid the simulator entirely. This is the least
 developed path and offers no UC statement.
 
+**Path D (new, from the Path B research): drop the check at the
+`ε′`-opening only.** Verify `ε′`-shares by error correction or rely on
+the final ECDSA signature check (S3) instead of per-share point equality.
+This makes the phase simulatable by the DJNPO20 mechanism (prescribe +
+free interpolation), but costs **identifiable abort at P4**: a bad
+`ε′`-share would no longer be attributable, and the no-anonymous-abort
+property that the bias lemma of §4.2 depends on is lost. Not recommended;
+recorded for completeness.
+
 **Status of Theorem U1.** *Assembled modulo the obstruction of §12.2:
 all phases are simulatable as inventoried in §12.1; the unforgeability
 plug-in (U2) and blame machinery (C3) port; Theorem U1 becomes a theorem
 upon adoption of Path A (a protocol decision — it weakens the key
 sharing's binding from perfect to computational and therefore requires
-sign-off under the project's "never weaken verification checks" rule) or
-a successful outcome of Path B.*
+sign-off under the project's "never weaken verification checks" rule).
+Path B has been eliminated with evidence; Path D is documented at its
+cost.*
 
 ### 12.4 What the assembly already establishes without the decision
 
