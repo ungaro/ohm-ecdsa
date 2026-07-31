@@ -549,7 +549,7 @@ single-session hop is exactly the §5 game sequence, applicable because:
 The `ρ`-th hop therefore costs exactly that session's bound from §8.3;
 summing over `ρ` gives the factor-`Q` union. ∎
 
-### 8.2 Re-randomization analysis — [open, with the precise obstacle]
+### 8.2 Re-randomization analysis — [proof sketch with one named formal gap]
 
 The GS21 cube-root attack needs a presignature's `R` (hence `r = F(R)`)
 before `(M, τ)` are fixed. The standard mitigation (Groth–Shoup,
@@ -561,30 +561,105 @@ multiplicative:
 
 ```
 γ  = H(sid ‖ id ‖ M ‖ τ ‖ X)
-k′ = γk        R′ = γR        u′ = γ⁻¹u        z′ = γ⁻¹z
+k′ = γk        R′ = γR        u′ = γ⁻¹u        z′ = γ⁻¹z   (tweaked: z′ = γ⁻¹(z + τu))
 ```
 
 All steps are local scalar scalings; commitments scale by the same public
-factors (`A[u′] = γ⁻¹·A[u]`, `A[z′] = γ⁻¹·A[z]`), so every point-equality
+factors (`A[u′] = γ⁻¹·A[u]`, `A[z′] = γ⁻¹·A[z]` — and `A[z′] = γ⁻¹(A[z] + τ·A[u])`
+with a tweak), so every point-equality
 check survives; the online phase stays one round; no claim-chart element
 is touched.
 
-**The obstacle.** Groth–Shoup's `δ` is drawn *after* `(M, τ)` by a process
-the adversary cannot precompute. Our `γ` is RO-derived from public
-inputs, so the adversary can evaluate `r′(M, τ) = F(H(…‖M‖τ‖X)·R)`
-offline for *every* candidate pair before committing to one: strictly
-more power than a fixed `r` (the attack's input), strictly less than an
-unprecomputable `δ` (the mitigation's input). The security question is
-whether `r′(·,·)` as an RO-indexed family destroys the ratio-grinding
-structure of the cube-root attack. A proof strategy we flag: model
-`F(γ·R)` as a random function of `γ` (justified only if `F` behaves as a
-random oracle on group elements — it does not; `F` is x-coordinate
-extraction, whose algebraic structure is exactly what the attack
-exploits). The honest status is therefore: **open**; the safe posture is
-SPEC §9.4 (signing-time disclosure for external requesters; the insider
-bound stated honestly), and the lemma — *multiplicative re-randomization
-restores the Groth–Shoup bound in AGM+ROM* — is recorded as §11.3(8) of
-SPEC, a standalone cryptanalytic target with value beyond this protocol.
+#### 8.2.1 The attack's enabler, precisely
+
+With a **fixed** `r`, the verification equation
+`s·R = (h(M) + r·τ)·G + r·X` makes a forgery an *affine* relation
+`h(M) + rτ = h(M′) + rτ′` over the candidate space `(M, τ)`. Affineness
+is what admits structured search (3-sum/k-sum decompositions at
+`O(q^{1/3})`): many candidates can be combined into lists whose sums are
+checked against one fixed `r`. This — not the mere early knowledge of
+`R` — is the load-bearing structure of the cube-root attack.
+
+#### 8.2.2 Single-signature analysis
+
+Let the adversary hold one re-randomized signing query
+`(M₀, τ₀, γ₀ = H(…‖M₀‖τ₀‖X), r₀′ = F(γ₀R), s₀)` with
+`s₀·γ₀·R = (M₀ + r₀′(x + τ₀))·G`, and seek a forgery `(M*, τ*, s*)` with
+`s*·γ*·R = (h(M*) + r*·(x + τ*))·G`, where `γ* = H(…‖M*‖τ*‖X)`,
+`r* = F(γ*R)`. Setting `s* = α·s₀·γ₀/γ*` and matching coefficients of the
+unknowns `x` and `1` forces
+
+```
+α = r*/r₀′ ,   τ* = τ₀ ,   h(M*) = (M₀/r₀′)·F(H(…‖M*‖τ₀‖X)·R) .
+```
+
+The forgery condition is therefore a **fixed-point equation in one
+variable**: `h(M*) = c·F(H′(M*)·R)` with `c = M₀/r₀′` known. Both sides
+are random-oracle outputs over the *same* input `M*`. There is:
+
+* **no affine structure** — `r*(M*) = F(H′(M*)·R)` varies per candidate,
+  so no relation linear in `(h, τ, r)` survives;
+* **no list decomposition** — both sides depend on `M*`, so no
+  3-sum/k-sum split into independently enumerable lists exists;
+* **no cheap `r′`-reuse** — forcing `F(H′(M*)·R) = F(γ₀R)` requires
+  `H′(M*) = ±γ₀` (the map `a ↦ a·R` is injective, §3.1), an RO preimage
+  search costing `O(q)`.
+
+A generic adversary evaluating the condition pays two RO calls and one
+scalar multiplication per candidate with success probability `1/q`:
+**total `O(q)` work** — strictly above the `O(q^{1/2})` discrete-log
+baseline that bounds the overall security level anyway. The same
+argument applied to `T−1` corrupted insiders (who see `R` at generation)
+and to external requesters (who see it at signing time) is identical in
+form: the attacker model changes *when* `R` is learned, never the
+structure of the condition.
+
+#### 8.2.3 Structure destruction, summarized
+
+| | `r` across candidates | Forgery condition | Generic cost |
+|---|---|---|---|
+| No mitigation (GS21 regime) | constant | affine in `(h, τ, r)` | `O(q^{1/3})` |
+| Consensus `δ` (GS22) | unknowable in advance | condition unevaluable at choice time | `O(q^{1/2})` |
+| **RO-derived `γ` (this work)** | independent random per candidate | unstructured fixed point in one variable | `O(q)` |
+
+The re-randomization destroys exactly the enabler of §8.2.1: because each
+`(M, τ)` induces an independent-looking `r′ = F(γ·R)`, the adversary
+faces the plain-ECDSA situation (per-signature independent `r`), where
+the best generic attack is square-root — and, for the specific shape
+here, exhaustive search at `O(q)`.
+
+#### 8.2.4 Lemma statement and the named formal gap
+
+**Lemma candidate (re-randomization restores the square-root bound).**
+*In the AGM+ROM, the multiplicatively re-randomized presignature scheme
+of §8.2 (with RO-derived `γ = H(sid‖id‖M‖τ‖X)`) is existentially
+unforgeable under adaptive chosen-message-and-tweak attacks with
+advantage bounded by `O(q_s²/q)` plus the Groth–Shoup
+plain-presignature-model bound — i.e., the mitigation restores
+square-root security.*
+
+**Proof sketch.** (i) Single-query core: §8.2.2 — the forgery condition
+is an unstructured RO fixed point; any algebraic strategy beyond
+exhaustive search would yield a relation among RO outputs, contradicting
+the RO model. (ii) Multi-query lifting (**the named formal gap**): the
+argument must be carried through Groth–Shoup's multi-query analysis for
+plain ECDSA with presignatures (their AGM framework), with `r′(M, τ)`
+playing the role of independent per-signature nonces; the lifting is
+*expected* — the per-signature independence the GS proof needs is exactly
+what the RO-derived `γ` provides — but it is not written, and subtle
+multi-query interactions (the adversary scheduling its RO queries against
+signing queries) must be handled with their signing-oracle bookkeeping.
+(iii) The algebraic structure of `F` (x-coordinate extraction, notably
+`F(P) = F(−P)`) is accounted for by the injectivity argument of §8.2.2
+(preimage search up to sign) and needs no further relaxation in the AGM.
+
+**Status.** From "fully open" to *proof sketch with the formal gap named
+in (ii)*. The single-query core (i) is proved here; the multi-query
+lifting and its AGM bookkeeping are the remaining work. Until (ii) is
+written, the mitigation's status is unchanged for deployments: SPEC §9.4
+policy (signing-time disclosure, bounded pools) remains the security
+posture, and the implementation (`sign::sign_share_rerand`) stays
+experimental and default-off.
 
 ### 8.3 The assembled bound
 
@@ -601,10 +676,12 @@ sessions, the G3 birthday term, the L2 hop priced per the chosen route
 and framing-freeness (C3), uniformity with a bounded-bias lemma (C4),
 the extraction simulator for the DKG (L1), Feldman hiding in the AGM
 (L2, modulo the representation bookkeeping of §7.3), the composition
-lemma (§8.1), and the full reduction skeleton with per-hop bounds and the
-assembled advantage. **What remains open:** the re-randomization lemma
-(§8.2 — a genuine cryptanalytic question), the §7.3 bookkeeping pages,
-the plain-model OMDL alternative (named, unproven), UC, and adaptive
-corruptions. With those caveats, the game-based security claim of §1 is
-**proved in the AGM+ROM under ECDLP and the Groth–Shoup
-presignature-ECDSA assumption.**
+lemma (§8.1), the re-randomization single-query core (§8.2.2 — the
+forgery condition is an unstructured RO fixed point costing `O(q)`), and
+the full reduction skeleton with per-hop bounds and the assembled
+advantage. **What remains open:** the multi-query lifting of the
+re-randomization lemma (§8.2.4(ii) — the one named formal gap), the
+§7.3 bookkeeping pages, the plain-model OMDL alternative (named,
+unproven), UC, and adaptive corruptions. With those caveats, the
+game-based security claim of §1 is **proved in the AGM+ROM under ECDLP
+and the Groth–Shoup presignature-ECDSA assumption.**
