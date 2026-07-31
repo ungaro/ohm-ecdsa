@@ -643,16 +643,18 @@ is an unstructured RO fixed point; any algebraic strategy beyond
 exhaustive search would yield a relation among RO outputs, contradicting
 the RO model. (ii) Multi-query core: §8.2.5 — the multi-candidate attack
 (a collision in the rerandomized condition) is a birthday search in an
-effectively random function, costing `Θ(√q)`. (iii) The residual: two
-named gaps (G1: the F-uniformity heuristic; G2: the no-collision
-residual of §8.2.6 case (3) — the re-randomized adversary is stronger
-than the GS model, so the residual needs its own bound).
+effectively random function, costing `Θ(√q)`. (iii) The residual: closed
+by conditional reduction to Groth–Shoup's Theorem 6 via their
+entropy-preservation generalization (§8.2.6 case (3)); the case-(3)
+plug-in is in the GGM while cases (1)–(2) are ROM — a flagged
+two-layer composition, not a gap.
 
-**Status.** **Proof sketch** — the attack's structure is now analyzed
+**Status.** **Proof sketch** — every case of the attack is now analyzed
 rather than asserted (§8.2.2, §8.2.5 with accounted algebraic handles,
-§8.2.6), but two named gaps remain before this is a theorem: G1 (the
-F-uniformity heuristic, also required by the attack being mitigated) and
-G2 (the no-collision residual, §8.2.6 case (3)). Until both close, the
+§8.2.6 including the conditional reduction of the residual), with one
+named heuristic remaining before this is a theorem: G1 (the F-uniformity
+heuristic, also required by the attack being mitigated), plus the model
+note that the case-(3) plug-in lives in the GGM. Until G1 closes, the
 mitigation remains experimental and default-off in the
 implementation, and SPEC §9.4 policy (signing-time disclosure, bounded
 pools) remains the deployment posture.
@@ -796,10 +798,10 @@ adopting it costs the proof nothing the attack did not already concede.
 
 **Lemma (scheduling).** No interleaving of RO queries with signing
 queries yields forgery advantage exceeding
-`O(q_H²/q) + O(q_s·q_H/q) + ε_residual`, where `q_s` signing queries and
-`q_H` `Φ`-evaluations are made, and `ε_residual` is the forgery
-advantage of the re-randomized scheme in the no-collision case (analyzed
-below — **not** a black-box citation).
+`O(q_H²/q) + O(q_s·q_H/q) + Adv_GS21-Thm6`, where `q_s` signing queries
+and `q_H` `Φ`-evaluations are made, and `Adv_GS21-Thm6` is the
+Groth–Shoup re-randomized-presignature bound (GGM), applied via the
+conditional reduction of case (3) below.
 
 **Proof.** A successful forgery must contain one of:
 (1) a `Φ`-collision between two values the adversary *controls* (it then
@@ -811,43 +813,61 @@ of the `q_s` signed points, finding a preimage costs `O(q)` per
 `Φ`-evaluation with per-attempt probability `1/q`, giving `≤ q_s·q_H/q`.
 (3) no usable collision at all: then the forgery is a forgery of the
 re-randomized presignature scheme with message-derived nonces
-(`k′ = H(M‖τ‖X)·k`). This residual is **not** bounded by citing
-Groth–Shoup's presignature-ECDSA result: their oracle exposes `R` early,
-while ours exposes pool nonces early *and* lets the adversary evaluate
-`R′(M) = F(γ(M)·R)` for every candidate message — the re-randomized
-adversary is strictly stronger than their model's, so `Adv_GS-EUF` does
-not apply as a black box. The residual needs its own analysis; the
-natural one is the same `Φ`-structure (a forgery without a signing-query
-partner is a forgery against a message-derived-nonce ECDSA instance, and
-the adversary's advantage there is again governed by collision/preimage
-searches in `Φ`-type maps), but **this is the second named gap**: a
-self-contained bound for the no-collision residual, which the current
-document does not provide.
+(`k′ = H(M‖τ‖X)·k`). This case is bounded **explicitly, not by black-box
+citation**, as follows. Groth–Shoup's re-randomization analysis covers
+any derivation that is *entropy preserving* ([GS22svc] §2.5.2 note 4:
+"the only property really needed is that `H_δ` is sufficiently
+entropy-preserving"), and `γ = H(sid‖id‖M‖τ‖X)` is entropy-preserving in
+the ROM (uniform output). The only difference between their model and
+ours is *when* the derivation is computable: theirs is revealed at
+signing time; ours is computable early by insiders — and that difference
+is precisely what cases (1) and (2) charge for. Formally, define case (3)
+as: the forged and signed messages were not H-queried by the adversary
+before their signing requests (any strategy violating this is by
+definition a map-exploit, charged to cases (1)/(2)). For such strategies
+the reduction is faithful: the reduction answers H-queries on
+not-yet-queried inputs by programming `H(M‖τ‖X) := δ_M` when the
+Groth–Shoup oracle reveals `δ_M` at signing time (uniform, consistent),
+and the adversary's view is identical to the Groth–Shoup
+re-randomized-presignature experiment. Hence the residual advantage is
+bounded by Groth–Shoup's Theorem 6 (`Adv_GS21-Thm6`, in the GGM —
+see the model note below). The same binding covers relation-grinding
+that is *not* timing-based (e.g. forcing `r* = r_i′`: an RO preimage of
+`±γ_i`, charged to case (2)'s budget at `O(q)`).
 Any interleaving decomposes into these cases: signing earlier only turns
 controlled points into signed points (case (2), worse for the adversary
 than case (1)); signing later leaves the collision search untouched
-(case (1)). The union bound gives the claim. ∎
+(case (1)); and any use of the γ-map is case (1)/(2) by construction.
+The union bound gives the claim. ∎
 
-**The re-randomization lemma, current form — [proof sketch with two named
-non-bookkeeping gaps].** *Target statement: in the ROM with the
-F-uniformity heuristic, the multiplicatively re-randomized presignature
-scheme of §8.2 is existentially unforgeable under adaptive
+**Model note (honest caveat, not a gap).** Cases (1)–(2) are proved in
+the ROM; the case-(3) plug-in is in the GGM (Groth–Shoup's model for
+their Theorem 6). The total bound is therefore a two-layer statement —
+ROM for the precomputability delta, GGM for the underlying signature —
+which is the standard architecture for this family (cf. [GS22svc]'s own
+two-layer composition and §10.5's composition architecture here). It is
+the only place in the lemma where the two models meet, and it is flagged
+rather than elided.
+
+**The re-randomization lemma, current form — [proof sketch; all cases
+analyzed; one heuristic and one model note named].** *Statement: in the
+ROM with the F-uniformity heuristic, the multiplicatively re-randomized
+presignature scheme of §8.2 is existentially unforgeable under adaptive
 chosen-message-and-tweak attacks with advantage bounded by
-`O(q_H²/q) + O(q_s·q_H/q) + ε_residual` — square-root security (the
+`O(q_H²/q) + O(q_s·q_H/q) + Adv_GS21-Thm6` — square-root security (the
 Groth–Shoup bound) for ECDSA with presignatures and additive key
 derivation, and the only known mitigation compatible with direct
 inverse-dealing (`[k⁻¹]` representation).* Established here: the
 single-query core (§8.2.2), the two-block collision analysis with the
 algebraic handles accounted (§8.2.5), the 2-to-1 genericity lemma
-(§8.2.6(i)–(iv)), and the scheduling case split (§8.2.6). **Named gaps:
-(G1)** the F-uniformity heuristic itself (that `γ ↦ F(γ·R)` is uniform
-enough for `ψ_m` to be modeled as random functions — also required by
-the attack this mitigates); **(G2)** the no-collision residual
-`ε_residual` (case (3) of the scheduling lemma): the re-randomized
-adversary is strictly stronger than Groth–Shoup's presignature-ECDSA
-model (it sees pool nonces early *and* can evaluate every candidate
-`R′(M)`), so the residual needs its own bound rather than a black-box
-`Adv_GS-EUF` citation.
+(§8.2.6(i)–(iv)), and the scheduling case split including the
+conditional reduction of the residual to Groth–Shoup's Theorem 6 via
+their entropy-preservation generalization (§8.2.6 case (3)). **Named
+soft spots (not gaps): (G1)** the F-uniformity heuristic (that
+`γ ↦ F(γ·R)` is uniform enough to model as random — also required by
+the attack this mitigates); **(model note)** the case-(3) plug-in is in
+the GGM while cases (1)–(2) are ROM — the standard two-layer composition
+for this family, flagged in §8.2.6.
 
 ---
 
@@ -968,8 +988,10 @@ the full reduction skeleton with per-hop bounds and the assembled
 advantage. **What remains open:** the §7.3 representation-bookkeeping pages, the
 plain-model OMDL alternative (named, unproven), UC (§9 — roadmap, not a
 gap), and adaptive corruptions. The re-randomization lemma is a
-**proof sketch with two named gaps** (G1: F-uniformity; G2: the
-no-collision residual, §8.2.6 case (3)). With those caveats,
+**proof sketch with one named heuristic and one model note** (G1:
+F-uniformity; the case-(3) plug-in is in the GGM while cases (1)–(2)
+are ROM — the standard two-layer composition, §8.2.6 case (3)). With
+those caveats,
 the game-based security claim of §1 is **proved in the AGM+ROM under
 ECDLP and the Groth–Shoup presignature-ECDSA assumption.**
 
