@@ -926,3 +926,174 @@ gap), and adaptive corruptions. The re-randomization lemma is **proved**
 (§8.2.6, modulo the named F-uniformity heuristic). With those caveats,
 the game-based security claim of §1 is **proved in the AGM+ROM under
 ECDLP and the Groth–Shoup presignature-ECDSA assumption.**
+
+---
+
+## 10. UC framework (U2: model and functionalities)
+
+This section fixes the UC execution model and the ideal functionalities the
+UC proof will use, following the structure of Groth–Shoup's signing-service
+analysis [GS22svc], which §9.1's U1 review confirmed is a genuine UC proof
+(Canetti's framework, static corruptions, straight-line simulator,
+programmable RO, no AGM in the UC layer). Definitions here are precise where
+the game-based proof (§1–§8) was informal; theorems U1–U3 are stated at the
+end with their proof status.
+
+### 10.1 Execution model
+
+* **Framework.** Canetti's UC model. Entities: environment `Z`, adversary
+  `A`, simulator `S`, parties `P₁…Pₙ`, ideal functionalities as below. `Z`
+  and `S` pass messages freely.
+* **Corruptions.** **Static**, malicious, rushing: `A` corrupts a set `C`,
+  `|C| = f ≤ T−1`, chosen before execution. Adaptive corruptions are out of
+  scope (see §9 and the LDL-weakening technique of [GS22svc] §10.1 as the
+  known path if ever needed).
+* **Channels.** Authenticated, message delivery scheduled by `A` via
+  `ℱ_AUTH` (eventual delivery). Safety statements are timing-independent;
+  liveness statements cite the partial-synchrony assumption only inside the
+  `ℱ_BC` realization (mirroring [GS22svc]'s confinement of partial
+  synchrony to consensus liveness).
+* **Random oracle.** A programmable RO in the UC-hybrid sense: `S` programs
+  honest-party answers and sees all adversarial queries (the GRO-style
+  caveat of [GS22svc] App. A.6 — "benign programmability" — applies equally
+  here, since the same hash implements the protocol ROs and the
+  re-randomization derivations; we adopt their convention and flag it at
+  the composition step, §10.5).
+* **Threshold.** `n ≥ 2T−1`, honest majority; the identifiable-abort and
+  expulsion machinery of SPEC §10 is part of the *protocol*, and the
+  corresponding blame outputs are part of the *functionality* (§10.3).
+
+### 10.2 `ℱ_BC` — signed-echo consistent broadcast
+
+`ℱ_BC(sid, phase, round)`, per broadcast slot `(i)`:
+
+* On `(bcast, i, m)` from party `i` (possibly corrupt): record `m`, give
+  `(bcast, i, m)` to `S` for scheduling.
+* `S` instructs delivery per party: `(deliver, i, m, P_j)`. `ℱ_BC` delivers
+  `m` to `P_j` marked as from `i`.
+* **Consistency rule (idealized):** for each slot, `S` must deliver the
+  *same* `m` to all honest parties, or `⊥` to all — `ℱ_BC` rejects any
+  schedule that would deliver two different values. `S` may deliver `⊥`
+  only if it also outputs `(equivocate, i)` with evidence `E` to all
+  honest parties.
+* **Validity:** if `i` is honest and all parties are scheduled delivery,
+  `m` (not `⊥`) is delivered.
+* The F8 fault class of the real protocol realizes the
+  `(equivocate, i)` evidence output: two conflicting sender-signed values
+  are the offline-verifiable proof (SPEC §4.7, §10.1 F8).
+
+### 10.3 `ℱ_TECDSA` — threshold ECDSA with identifiable abort (UC form)
+
+Modeled on [GS22svc]'s `ℱ_ecdsa` (§2.6.1 there), extended with the blame
+interface and with the consumption state machine internalized (§1):
+
+* **Init(sid):** on the first request, run ECDSA key generation
+  `(x, X = x·G)`; record `(init, X, x)`. Give `(init, i, X)` to each
+  requester and to `S`. (`S` learns `X`, never `x`.)
+* **Presign(sid, id):** on request from all honest parties: run
+  presignature generation producing `(R = k·G, r = F(R), κ = k⁻¹)`;
+  record `(presig, id, R, r, κ, state := fresh)`; give `(presig, i, id, R, r)`
+  to each requester and to `S`. (`S` learns `(R, r)` immediately — the
+  presignature is adversarially visible, matching the §9.4 analysis; `κ`
+  is never revealed.)
+* **Sign(sid, M, id):** on request from `T` distinct parties for the same
+  `(M, id)` with `state = fresh`: compute `s = κ·(H(M) + r·x)`, set
+  `state := consumed`, record and give `(sig, M, id, r, s)` to each
+  requester and to `S`. If the requesting set is not well-formed
+  (`< T` distinct, or `id` not fresh): ignore.
+* **Abort:** `A` (through `S`) may send `(abort, sid, phase, C′)` with
+  `C′ ⊆ C`; `ℱ_TECDSA` reports `(abort, phase, C′)` to all honest parties
+  and sets any in-flight `id`'s state to `poisoned`. Blamed sets are
+  subsets of the corrupt set — **the functionality leaks nothing through
+  aborts beyond the corrupt identities, which are public knowledge**.
+* **Consumption state machine:** `fresh → consumed | poisoned`, enforced
+  by the functionality itself (§1); `Z` is additionally required to be
+  *locally consistent* (no honest party sees conflicting uses of one id)
+  and *globally consistent* (honest parties agree on request orderings —
+  justified in the realization by `ℱ_BC`), following [GS22svc]'s
+  environment-consistency pattern.
+* **Delivery control:** `S` schedules output delivery via
+  `(output-pk, i)` / `(output-sig, id, i)` control messages (their
+  §2.6.1 mechanism), but must deliver to every honest party that was
+  scheduled (no selective starvation: abort is the only suppression
+  mechanism).
+
+### 10.4 Theorems U1–U3 (structure and status)
+
+* **Theorem U1 (target).** *Protocol OHM-ECDSA (SPEC §6–§9) securely
+  realizes `ℱ_TECDSA` in the `(ℱ_GRO, ℱ_AUTH, ℱ_BC)`-hybrid, against
+  static malicious adversaries corrupting `< T` of `n ≥ 2T−1` parties,
+  with identifiable abort.* Status: **framework set (this section);
+  simulator construction pending (U3)**.
+* **Theorem U2 (unforgeability plug-in).** *No environment distinguishing
+  real from ideal can forge an ECDSA signature under the ideal key except
+  with `Adv_GS-EUF + Adv_rerand`*, where the two terms are the
+  Groth–Shoup presignature-ECDSA bound and the re-randomization lemma of
+  §8.2.6 (which plays the role that [GS21] Theorem 6 plays for
+  [GS22svc] — note: *their* theorem covers the additive mitigation, ours
+  covers the multiplicative one; there is no existing citable result for
+  the multiplicative form, which is why §8.2.6 had to exist). Status:
+  **proved modulo the F-uniformity heuristic (§8.2.6)**.
+* **Theorem U3 (UC-DKG against rushing).** *The commit-reveal DKG of
+  SPEC §6 is UC-simulatable against a rushing adversary via the
+  deferred-content technique (honest R1 hashes programmed at reveal
+  time), with the expulsion budget of §4.2 bounding rejection-sampling
+  to `O(log T)` bits.* Status: **the U3 sprint — candidate proof
+  technique chosen (§9.2), theorem not yet written**. This is the
+  load-bearing novel item; see §10.6 for the exact obstacle list.
+
+### 10.5 Composition architecture
+
+Two layers, mirroring [GS22svc]:
+
+1. **Protocol layer (U1):** prove `Π_OHM → ℱ_TECDSA` in the
+   `(ℱ_GRO, ℱ_AUTH, ℱ_BC)`-hybrid (assumption-free there, as their
+   Theorem 1 is in theirs).
+2. **Realization layer:** `ℱ_BC` realized by the §4.7 signed-echo
+   protocol (consistency/totality from §10.2's rules; liveness under
+   partial synchrony); `ℱ_AUTH` by the deployment's signed channels; the
+   unforgeability of final outputs plugged in from U2 ([GS21]'s
+   presignature-ECDSA result for the base scheme; §8.2.6 for the
+   re-randomized variant).
+3. **Caveat (shared hash):** the same hash function implements the
+   protocol ROs, the re-randomization `γ`-derivation, and the
+   Fiat–Shamir challenges; the composition across layers adopts the
+   benign-programmability convention of [GS22svc] App. A.6 and must be
+   stated explicitly in the final write-up.
+
+### 10.6 U3 obstacle list (for the sprint)
+
+The deferred-content UC-DKG proof must handle, in order:
+
+1. **Extraction without rewinding.** `S` reads adversarial reveal vectors
+   from the `ℱ_GRO` tape at reveal time — ports directly from §6.
+2. **Deferred-content programming against the environment.** `S` must
+   broadcast honest R1 hashes with content undefined, then program
+   `ℱ_GRO` at reveal. Obstacle: in UC, `Z` watches everything and may
+   adaptively query `ℱ_GRO`; the argument (content undefined ⇒ no
+   targeted query possible ⇒ programming undetectable except with
+   negligible probability) must be re-established against a `Z` that sees
+   the *transcript*, not just against `A`. This is the step whose UC
+   validity is asserted in §9.2 and must be proved in U3.
+3. **Rushing within rounds.** `A` schedules `ℱ_AUTH` deliveries; `S`
+   delays honest reveals until after adversarial reveals in each
+   commit-reveal instance (the same trick as §6.2, now justified by
+   adversarial scheduling rather than by the proof's bookkeeping).
+4. **Expulsion/restart in the ideal world.** The expulsion budget of §4.2
+   must appear in `ℱ_TECDSA`'s abort interface (it does — aborts carry
+   `C′ ⊆ C`, and the state machine poisons ids), and the simulator must
+   show the real expulsion policy (§10.3 of SPEC) realizes it.
+5. **Uniformity under restart loops.** The §4.2 lemma bounds the
+   adversary's rejection-sampling at `O(log T)` bits; U3 must show the
+   ideal key is uniform *independently*, and the real key's distribution
+   is within that bound of it (this is where the expulsion budget does
+   the work the classical anonymous-abort setting cannot bound).
+
+**Cross-validation from U1.** [GS22svc] §3.6 proves that Feldman-only
+DKG *without* anti-rushing protection is fatally biasable for ECDSA
+(the adversary contributes `−φ/ρ` after seeing honest constant terms,
+forces the public key to a known discrete log, and forges). Our
+commit-reveal fixes contributions before honest constant terms are
+visible, blocking exactly that attack — the UC proof must make this
+blocking explicit; it is also why `ℱ_TECDSA`'s key may be modeled as
+uniform (Theorem U3's output).

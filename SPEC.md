@@ -283,6 +283,7 @@ sequenceDiagram
 ### 6.2 KeyGen security notes
 
 * **Uniformity.** After the R1 commit phase every `f_i` is fixed; at least one honest dealer chose uniformly, hence `x` is uniform even against a rushing adversary [^gjkr07].
+* **Why commit-reveal is not optional.** Groth–Shoup demonstrate (signing-service paper, §3.6 [^gs22svc]) that a Feldman-only DKG *without* anti-rushing protection is fatally biasable for ECDSA: the adversary waits for the honest constant terms, contributes a dealing of `−φ/ρ`, forces the public key to `X·g^(−φ/ρ)` — whose discrete log it knows — and forges outright. The R1 hash-commit phase fixes every contribution *before* any constant term is visible, which blocks exactly this attack; the hiding property of Feldman commitments alone does not.
 * **Secrecy.** The adversary sees `T−1` shares of each `f_i` (information-theoretically useless) and commitments `A_i` (ECDLP-hiding).
 * **Identifiability.** Any invalid reveal or share is publicly attributable (§6.1).
 * **No ZKPoK needed.** In the honest-majority + identifiable-abort model, commit-reveal replaces the proof-of-knowledge of `f_i(0)` used in dishonest-majority DKGs; a dealer committing to garbage is caught in R3 and the instance restarts without it.
