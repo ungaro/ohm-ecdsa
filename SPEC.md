@@ -519,7 +519,7 @@ All openings are of values masked by fresh uniform randomness (`δ, ε, v, δ′
 
 ## 11. Security Analysis Sketch
 
-**Status: structured sketch, not a proof.** This section states the intended security theorem, decomposes it into proof obligations C1–C6, and gives for each an explicit argument skeleton (simulator construction or reduction) rather than informal intuition. What separates this from a proof is enumerated precisely in §11.3, and a game-based proof outline is given in §11.4. A full game-based or UC treatment remains future work and is a prerequisite to production use, alongside independent implementation review.
+**Status: structured sketch, not a proof.** This section states the intended security theorem, decomposes it into proof obligations C1–C6, and gives for each an explicit argument skeleton (simulator construction or reduction) rather than informal intuition. What separates this from a proof is enumerated precisely in §11.3, and a game-based proof outline is given in §11.4. **The full proof write-up lives in `docs/proof/PROOF.md`** (working document): C1, C3, C4 and L1 are proved there in the ROM; L2 is pinned to a named OMDL assumption or an AGM hiding lemma (sketched); composition and the re-randomization lemma remain open as stated there. A full game-based or UC treatment remains future work and is a prerequisite to production use, alongside independent implementation review.
 
 ### 11.1 Ideal functionality (informal)
 
