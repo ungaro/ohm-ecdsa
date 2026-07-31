@@ -1,6 +1,6 @@
 # OHM-ECDSA: Open Honest-Majority Threshold ECDSA from Public-Domain Components
 
-**Draft v0.3 — for IACR ePrint submission. Unreviewed. Not audited. Typeset version: `main.pdf` (from `main.tex`).**
+**Draft v0.4 — for IACR ePrint submission. Unreviewed. Not audited. Typeset version: `main.pdf` (from `main.tex`).**
 
 ## Abstract
 
@@ -26,7 +26,7 @@ There is an irony here that motivates this work. ECDSA itself exists because Sch
 
 ### 1.3 Related work
 
-GJKR96 established robust threshold DSS with identifiable abort in the honest-majority setting; GJKR07 fixed the rushing attack on Pedersen DKG via commit-then-reveal. Beaver (1991) gave multiplication triples; Chaum–Pedersen (1992) the DLEQ proof; Franklin–Yung (1992) packed sharing; Bar-Ilan–Beaver (1989) constant-round arithmetic MPC with inverses. DJNPO20 and KU23 are the encumbered modern refinements discussed above. Groth–Shoup (2021) formalized ECDSA with presignatures and additive key derivation — our presignature layout and HD-tweak compatibility follow that model. Katz (NIST MPTS 2023) sketched the direct generation of `[k⁻¹]` as a design-around for US 11,757,657; we adopt and complete that approach. cait-sith (NEAR, Apache-2.0) is an independent sibling implementation with key-independent presignatures but without identifiable abort. Robustness in threshold ECDSA requires an honest majority (Gagol et al., NDSS 2024) — matching our setting.
+GJKR96 established robust threshold DSS with identifiable abort in the honest-majority setting; GJKR07 fixed the rushing attack on Pedersen DKG via commit-then-reveal. Beaver (1991) gave multiplication triples; Chaum–Pedersen (1992) the DLEQ proof; Franklin–Yung (1992) packed sharing; Bar-Ilan–Beaver (1989) constant-round arithmetic MPC with inverses. DJNPO20 and KU23 are the encumbered modern refinements discussed above. Groth–Shoup (2021) formalized ECDSA with presignatures and additive key derivation — our presignature layout and HD-tweak compatibility follow that model. Katz (NIST MPTS 2023) sketched the direct generation of `[k⁻¹]` as a design-around for US 11,757,657; we adopt and complete that approach. cait-sith (cronokirby/NEAR, MIT) is an independent sibling implementation whose triple preprocessing is key-independent (its presignatures stay key-dependent) and which explicitly disclaims identifiable aborts. NEAR's production `near/mpc` additionally contains an MIT implementation of DJNPO20 itself, used by Chain Signatures. Robustness in threshold ECDSA requires an honest majority (Gagol et al., NDSS 2024) — matching our setting.
 
 ## 2. Preliminaries
 
@@ -78,7 +78,7 @@ Every broadcast value is one of: a hash that must match a later reveal, a share 
 
 **US 11,757,657 (Sepior → Blockdaemon).** The granted claim 1 is a conjunctive combination: `[w] = [a][k]`; `R = g^k` ensured correct "from at least `t+1` shares originating from honest parties"; authenticator `W = R^a` with its own check; `g^w == W`; and signing via `[k⁻¹] = [a]·w⁻¹`, `[x·k⁻¹]`, and `[s] = m·w⁻¹[a] + r·w⁻¹[a][x] + [d]` with `[d]` a random sharing of zero. Element by element: OHM-ECDSA has **no `[w]`, no `W`, no authenticator**; deals `[u] = [k⁻¹]` **directly** (no inversion protocol); computes all products with **Beaver triples** over degree-`T−1` sharings (**no zero-sharings** anywhere); and ensures correctness by **point equality against public commitments** — a different mechanism with a stronger result (attribution vs. mere detection). Shared elements (the ECDSA final algebra, share-exponentiation for `R`, abort-and-restart, one-round reveal) are the patent's own admitted prior art or unclaimed generic steps. Under the doctrine of equivalents, the inversion and correctness functions are performed in substantially different ways, with (for correctness) a substantially different result. Dependent claims 2–10 fail for the same reasons or read on admitted prior art.
 
-**KU23 (Dfns).** KU23's contribution — and patent — is *batch generation of key-independent presignatures* via a coordinator-assisted pipeline. OHM-ECDSA is key-dependent by design (P4 binds `[z] = [k⁻¹x]` at generation), which is precisely what keeps it clear. The optional key-independent mode (§3.5) follows earlier public art — DJNPO20's presignature is key-independent (2020); cait-sith shipped key-independent preprocessing (2022) — and implements no element of KU23's pipeline (no coordinator, no KU23 packing); it is opt-in and flagged for FTO review. Dfns has publicly stated intent to lift the KU23 patent via LF Decentralized Trust.
+**KU23 (Dfns).** KU23's contribution — and patent — is *batch generation of key-independent presignatures* via a coordinator-assisted pipeline. OHM-ECDSA is key-dependent by design (P4 binds `[z] = [k⁻¹x]` at generation), which is precisely what keeps it clear. The optional key-independent mode (§3.5) follows earlier public art — DJNPO20's presignature is key-independent (2020); cait-sith shipped key-independent triple preprocessing (2022; its presignatures remain key-dependent) — and implements no element of KU23's pipeline (no coordinator, no KU23 packing); it is opt-in and flagged for FTO review. Dfns has publicly stated intent to lift the KU23 patent via LF Decentralized Trust.
 
 **Prior-art wall.** Bar-Ilan–Beaver 1989; Beaver 1991; Pedersen 1991; Franklin–Yung 1992; Chaum–Pedersen 1992; GJKR 1996; GJKR 2007; Groth–Shoup 2021; cait-sith 2022; Katz MPTS 2023. This paper, timestamped publicly, is itself prior art against later patents on the construction.
 
@@ -130,6 +130,6 @@ KU23's 1.3 ms/presig is the amortization of key-independent batching at `m = 10,
 10. T. P. Jakobsen, I. B. Damgård, M. B. Østergaard, J. B. Nielsen, *Method for providing a digital signature to a message*, US Patent 11,757,657 B2 (2023; Sepior ApS → Blockdaemon ApS).
 11. J. Katz, *Threshold ECDSA: advances and open problems*, NIST MPTS 2023.
 12. J. Katz, A. Urban, *Honest-Majority Threshold ECDSA with Batch Generation of Key-Independent Presignatures*, IACR ePrint 2024/2011 (KU23).
-13. NEAR, *cait-sith* — threshold ECDSA with Beaver triples and presignatures (Apache-2.0), 2022–2023. github.com/near/cait-sith.
+13. L. Meier (cronokirby), *cait-sith* — threshold ECDSA via committed Beaver triples (MIT), 2022–2023. github.com/cronokirby/cait-sith; NEAR production derivative: github.com/near/mpc.
 14. T. P. Pedersen, *Non-Interactive and Information-Theoretic Secure Verifiable Secret Sharing*, CRYPTO 1991.
 15. C. P. Schnorr, *Method for identifying subscribers and for generating and verifying electronic signatures in a data exchange system*, US Patent 4,995,082 (1991; expired 2008).

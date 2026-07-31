@@ -411,7 +411,7 @@ Identifiable abort is preserved end-to-end: every opening and share is point-che
 
 **Construction constraint.** The online binding MUST use a Beaver triple as above. Computing `u_j·x_j` locally (degree-`2T−2` products) would require zero-sharing blinding to open safely — that combination is the machinery claimed by US 11,757,657 (§12.2, element E9) and is deliberately avoided.
 
-**Patent posture.** Key-independence per se is public art: DJNPO20's presignature binds no key (2020 [^djnpo]) and cait-sith shipped key-independent preprocessing in 2022 [^cait] — both before KU23's priority date. What Dfns claims as patented is KU23's **batch generation pipeline** (coordinator-assisted, packed presignature production) [^ku23][^dfns], which this mode does not implement: pool generation uses the ordinary §7/§8 commit-reveal machinery with binding simply deferred. The mode is nonetheless **yellow-flag**: opt-in, documented, and subject to FTO review for commercial multi-key use (§12.6); Dfns's stated intent to lift the KU23 patent via LF Decentralized Trust [^dfns] would turn the flag green.
+**Patent posture.** Key-independence per se is public art: DJNPO20's presignature binds no key (2020 [^djnpo]) and cait-sith shipped key-independent *triple* preprocessing in 2022 (its presignatures themselves remain key-dependent [^cait]) — both before KU23's priority date. What Dfns claims as patented is KU23's **batch generation pipeline** (coordinator-assisted, packed presignature production) [^ku23][^dfns], which this mode does not implement: pool generation uses the ordinary §7/§8 commit-reveal machinery with binding simply deferred. The mode is nonetheless **yellow-flag**: opt-in, documented, and subject to FTO review for commercial multi-key use (§12.6); Dfns's stated intent to lift the KU23 patent via LF Decentralized Trust [^dfns] would turn the flag green.
 
 ---
 
@@ -626,7 +626,7 @@ KU23's stated contribution is **batch generation of key-independent presignature
 
 OHM-ECDSA differs on the core architectural point: presignatures are **key-dependent** — each record binds the long-term key in phase P4 by computing `[z] = [k⁻¹x]` at generation time, in the Groth–Shoup presignature model [^gs21]. There is no key-independent pool, no later binding step, and no coordinator pipeline; batching (§8.5) is per-key commit-reveal amortization only. Deployment rule §8.6(4) (no cross-key use) keeps implementations on this side of the line.
 
-**Key-independence itself is public art.** DJNPO20's presignature `(R, [k⁻¹], [e], [d])` binds no key (2020) [^djnpo]; cait-sith shipped key-independent preprocessing in 2022 [^cait] — both before KU23's priority. OHM-ECDSA's optional key-independent mode (§8.7) follows that lineage using the ordinary commit-reveal and Beaver-triple machinery of §7–§8 with binding deferred to signing time; it implements no element of KU23's batch *pipeline* (no coordinator-assisted generation, no KU23 packing), which is where Dfns's patent actually sits. The mode is opt-in and yellow-flag pending Dfns's stated patent-lifting [^dfns].
+**Key-independence itself is public art.** DJNPO20's presignature `(R, [k⁻¹], [e], [d])` binds no key (2020) [^djnpo]; cait-sith shipped key-independent *triple* preprocessing in 2022 (its presignatures remain key-dependent) [^cait] — both before KU23's priority. OHM-ECDSA's optional key-independent mode (§8.7) follows that lineage using the ordinary commit-reveal and Beaver-triple machinery of §7–§8 with binding deferred to signing time; it implements no element of KU23's batch *pipeline* (no coordinator-assisted generation, no KU23 packing), which is where Dfns's patent actually sits. The mode is opt-in and yellow-flag pending Dfns's stated patent-lifting [^dfns].
 
 ### 12.4 Dishonest-majority patent families — not practiced
 
@@ -644,7 +644,7 @@ The Paillier/MtA two-party and multi-party families (Unbound→Coinbase lineage;
 | 1996 | **GJKR, Robust Threshold DSS Signatures** [^gjkr96] | the fundamental honest-majority threshold DSA/ECDSA construction (shared nonce, shared inverse, robustness) |
 | 1999–2007 | GJKR DKG + rushing fix [^gjkr07] | KeyGen |
 | 2021 | Groth–Shoup, ECDSA with presignatures + additive key derivation [^gs21] | presignature layout, §9.4 |
-| 2023 | cait-sith (NEAR), Apache-2.0 production code [^cait] | independent sibling implementation |
+| 2022 | cait-sith (cronokirby/NEAR), MIT production code [^cait] | independent sibling implementation |
 | 2023 | Katz, NIST MPTS alternate approach [^katz23] | direct generation of `[k⁻¹]` |
 
 This document is itself a defensive publication: once timestamped publicly, it is prior art against later patents on this construction.
@@ -727,7 +727,7 @@ This document and the accompanying code are **research artifacts**: unreviewed p
 [^gg20]: R. Gennaro, S. Goldfeder, *One Round Threshold ECDSA with Identifiable Abort* (GG20), IACR ePrint 2020/540. https://eprint.iacr.org/2020/540
 [^cggmp]: R. Canetti, R. Gennaro, S. Goldfeder, N. Makriyannis, U. Peled, *UC Non-Interactive, Proactive, Threshold ECDSA with Identifiable Aborts* (CGGMP21), IACR ePrint 2021/060. https://eprint.iacr.org/2021/060
 [^dkls]: J. Doerner, Y. Kondi, E. Lee, a. shelat, *Secure Two-party Threshold ECDSA from ECDSA Assumptions* (DKLs18), IEEE S&P 2018. https://eprint.iacr.org/2018/499
-[^cait]: NEAR, *cait-sith* — threshold ECDSA with Beaver triples and presignatures (Apache-2.0; documents that presignature shares are key-equivalent). https://github.com/near/cait-sith
+[^cait]: L. Meier (cronokirby), *cait-sith* — threshold ECDSA via committed Beaver triples (MIT; documents that presignatures and triples must never be reused; explicitly disclaims identifiable aborts). Canonical repo: https://github.com/cronokirby/cait-sith; NEAR's production derivative lives in https://github.com/near/mpc (which also contains an MIT "Robust ECDSA" implementation of DJNPO20 used by Chain Signatures).
 [^real]: A. Gagol et al., *Real Threshold ECDSA* (robustness requires honest majority `n ≥ 2t−1`), NDSS 2024. https://www.ndss-symposium.com/ndss-paper/real-threshold-ecdsa/
 
 ---

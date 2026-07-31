@@ -231,6 +231,25 @@ Timings are quoted from the respective papers under different hardware
 and network conditions — treat them as context, not a shootout. The
 rows that matter: identifiability, delivery, and encumbrance.
 
+And against the open-source implementations (verified from their own
+docs, July 2026):
+
+| Project | Regime | Identifiable abort | Presignatures | License | Notes |
+|---|---|---|---|---|---|
+| **OHM-ECDSA** (this repo) | honest majority | ✓ — unconditional | key-dependent; opt-in key-independent pools | Apache-2.0 (patent grant) | robust delivery opt-in; no coordinator |
+| **near/mpc "Robust ECDSA"** (NEAR) | honest majority (DJNPO20-based) | ✗ (paper: abort, optional fairness) | key-independent | MIT | in production (Chain Signatures) — an *open implementation of the patented protocol* |
+| **cait-sith** (cronokirby / NEAR fork) | arbitrary t-of-n | ✗ — explicitly disclaimed ("does not attempt to provide identifiable aborts") | key-dependent (triples key-independent) | MIT | sign ≈450 µs local (README, i5-4690K); upstream stale since 2024-04, NEAR fork in production |
+| **cggmp21** (LFDT Lockness, ex-Dfns) | dishonest majority | ✗ — paper has it, crate doesn't | key-dependent | Apache-2.0 | Kudelski-audited; moved to LF Decentralized Trust — corroborates Dfns's patent-lifting intent (§12.6) |
+| **ZenGo multi-party-ecdsa** | dishonest majority (GG18/GG20) | ✓ (GG20 only) | none | **GPL-3.0** | unmaintained ("no security updates") — the only other open identifiable-abort impl, and it's copyleft + dead |
+| **tss-lib** (bnb-chain) | dishonest majority (GG18) | ✗ (culprit list only, no evidence) | none | MIT | audited (Kudelski 2019); Paillier precomputation ~1 min |
+| **cb-mpc** (Coinbase) | dishonest majority (OT/DKLs-family) | ✗ | none | MIT | C++17, production lineage, 2025 release |
+| **dkls23** (Silence Labs) | dishonest majority (OT) | ✗ | none | **non-commercial** | audited (Trail of Bits); license blocks commercial use |
+
+The pattern: among open implementations, identifiable abort exists only
+in a dead GPL repo and in NEAR's DJNPO20 fork (which inherits the
+patented design). OHM-ECDSA is the only one that is open *and*
+unencumbered *and* identifies cheaters *and* delivers through faults.
+
 ## Why this is useful
 
 An Apache-2.0 implementation of an unencumbered design (see Motivation
