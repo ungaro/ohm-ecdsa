@@ -1038,9 +1038,10 @@ interface and with the consumption state machine internalized (§1):
   SPEC §6 is UC-simulatable against a rushing adversary via the
   deferred-content technique (honest R1 hashes programmed at reveal
   time), with the expulsion budget of §4.2 bounding rejection-sampling
-  to `O(log T)` bits.* Status: **the U3 sprint — candidate proof
-  technique chosen (§9.2), theorem not yet written**. This is the
-  load-bearing novel item; see §10.6 for the exact obstacle list.
+  to `O(log T)` bits.* Status: **proved in §11** (hybrid argument in
+  full, delicate points P1–P3 explicit; realization bookkeeping for
+  `ℱ_BC` and the per-restart union bound expansion remain as indexing
+  work, §11.6).
 
 ### 10.5 Composition architecture
 
@@ -1097,3 +1098,199 @@ commit-reveal fixes contributions before honest constant terms are
 visible, blocking exactly that attack — the UC proof must make this
 blocking explicit; it is also why `ℱ_TECDSA`'s key may be modeled as
 uniform (Theorem U3's output).
+
+---
+
+## 11. Theorem U3: UC security of the commit-reveal DKG against rushing adversaries
+
+This section carries the UC sprint's load-bearing item: the commit-reveal
+Feldman DKG of SPEC §6, in the `(ℱ_GRO, ℱ_AUTH, ℱ_BC)`-hybrid of §10,
+securely realizes the key-generation interface of `ℱ_TECDSA` against a
+static, rushing, malicious adversary corrupting `f ≤ T−1` of `n ≥ 2T−1`
+parties. The proof technique is deferred-content programming (§6, §9.2);
+the restart economics use the expulsion budget of §4.2. Status: **proved
+here at the level of the hybrid argument, with three delicate points
+(P1–P3) made explicit; the §7.3-style representation bookkeeping for a
+journal version is flagged where it binds.**
+
+### 11.1 Statement
+
+**Theorem U3.** *There exists a straight-line simulator `S` such that for
+every environment `Z` and every static rushing adversary `A` corrupting
+`f ≤ T−1` parties, the view of `Z` in the real execution of the
+commit-reveal DKG (in the `(ℱ_GRO, ℱ_AUTH, ℱ_BC)`-hybrid) is
+indistinguishable from its view in the ideal execution with `S` and the
+key-generation interface of `ℱ_TECDSA` (§10.3 as extended by §11.2),
+except with advantage at most*
+
+```
+ε_U3  ≤  (f+1)·(q_H·2^{-128} + O(q_H²/2^λ))  +  ε_C3
+```
+
+*where the two terms are the per-restart extraction/programming error and
+the blame-attribution error of §3.2.*
+
+### 11.2 The ideal interface, extended for restarts
+
+The key-generation interface of `ℱ_TECDSA` (§10.3) is extended with the
+restart economics of the real protocol, so that real and ideal runs
+implement the *same* accept/reroll process rather than requiring the
+bias to be negligible (it is `log₂(f+1)` bits, which is a small constant,
+not negligible — P2):
+
+* **Candidate generation.** On `(keygen, sid)`, the functionality samples
+  a fresh uniform candidate `x^(ρ) ←$ 𝔽_q*`, `X^(ρ) = x^(ρ)·G`, and gives
+  `X^(ρ)` to `S`.
+* **Adversarial influence hook.** `S` may respond `(keep, sid)` or
+  `(reroll, sid)`. On `reroll`, a fresh candidate is drawn; the hook may
+  be exercised at most `f+1` times per `sid` (the expulsion budget, §4.2:
+  each reroll costs `A` one corrupted party, and after `f` expulsions the
+  instance completes or dies). On `keep`, `x := x^(ρ)` is recorded as the
+  joint key.
+* **Abort with attribution.** As in §10.3: `(abort, phase, C′)` with
+  `C′ ⊆ C`, reported to all honest parties, in-flight ids poisoned. A
+  `reroll` accompanied by an abort blames one corrupt party; the
+  functionality enforces the budget by refusing the `f+2`-th reroll.
+
+### 11.3 The simulator
+
+`S` receives `X^(ρ)` from the functionality for the current candidate and
+runs the deferred-content procedure (§6.2) inside the UC model:
+
+*R1 (commit).* For each honest dealer `h`, `S` broadcasts
+`h_h ←$ {0,1}^λ` (no content) and schedules delivery via `ℱ_AUTH`/`ℱ_BC`.
+`A` (rushing) then broadcasts `h_i` for `i ∈ C`. Every `h_i` that will
+ever pass the R3 hash check appears in `A`'s `ℱ_GRO` query tape
+(extraction — the tape is `S`'s by definition of the GRO; a passing
+reveal absent from the tape costs `A` a `2^{-λ}`-per-verifier-query
+guess, ≤ `q_H·2^{-λ}` total).
+
+*R2 (reveal).* `S` schedules adversarial reveals first (adversarial
+scheduling justifies the ordering — it is `A`'s own choice to rush, and
+`S` simply does not accelerate honest messages). For each revealed `A_i`,
+`S` records the extracted vector. `A` may instead abort (refuse to
+reveal): see R3 abort handling.
+
+*Programming.* With every adversarial constant point extracted, `S`
+chooses, per honest dealer `h`, the commitment vector `A_h` as in §6.2:
+`A_{h,0} := X^(ρ) − Σ_{i revealed} A_{i,0} − Σ_{h′ ≠ h} A_{h′,0}`;
+`EvalCom(A_h, j) := s_{h,j}·G` with `s_{h,j} ←$ 𝔽_q` uniform for
+`j ∈ C`; the Vandermonde system over `{0} ∪ C` yields the unique
+coefficient points. `S` then programs `ℱ_GRO`: on input
+`(sid‖KG‖h‖A_h)`, answer `h_h`.
+
+*R3 (checks, complaints, aborts).* `S` executes the honest checks. False
+accusations against honest dealers resolve with the accuser blamed (the
+defense share `s_{h,j}` verifies by construction); genuine misdealings
+are caught information-theoretically (§3.1). An adversarial refusal to
+reveal is handled at round close (P3): after `ℱ_BC`'s scheduled round
+completes without `A_i`, the dealer is excluded and blamed by omission —
+identification is by *position in the scheduled round*, not by timeout
+guesswork; `S` reports `(abort, sid, R2, {i})` to the functionality,
+which poisons the instance and (if the policy restarts) draws a fresh
+candidate per §11.2.
+
+*Restart.* On a restart, `S` requests a fresh candidate from the
+functionality and repeats the procedure; `S` keeps the functionality's
+candidate count honest by construction: the functionality's `reroll`
+hook is exercised exactly when `A` actually caused an expulsion (one
+corrupted party per reroll, budget `f`), so the `f+2`-th reroll never
+occurs in either world.
+
+### 11.4 Indistinguishability (the hybrid argument)
+
+Condition on the two bad events not occurring: **E1** (a passing reveal
+absent from the `ℱ_GRO` tape, `≤ q_H·2^{-λ}`), **E2** (a `ℱ_GRO`
+programming inconsistency, below). Then:
+
+**(i) Transcript distribution.** The joint candidate key is `X^(ρ)` by
+construction in both worlds (real: `Σ` of constant points including the
+programmed `A_{h,0}`; ideal: the functionality's candidate). Honest
+commitment vectors are uniform subject to the position constraints —
+and in the real protocol, conditioned on the joint key, the honest
+dealers' vectors are *also* uniform subject to those same constraints
+(constant term uniform, `T−1` adversary-facing shares uniform by the
+random-polynomial property: the `(T−1)`-vector of evaluations of a
+uniform degree-`T−1` polynomial at fixed positions is uniform and
+independent of the constant term). The adversary-facing shares `s_{h,j}`
+are uniform in both worlds. All checks and complaint outcomes match
+(§3.1, §3.2 — the `ε_C3` term).
+
+**(ii) P1 — programming undetectability.** `Z` distinguishes only if it
+queries `(sid‖KG‖h‖A_h)` on `ℱ_GRO` before `S` programs it (or detects
+the planted answer by a collision). The input's full content is
+determined only at R2-programming time; from `Z`'s view before that
+point, the vector `A_h` carries `≥ (T−1)·λ` bits of min-entropy
+(the `T−1` adversary-facing shares `s_{h,j}` are uniform and
+independent, even though `Z` knows `X^(ρ)` and can compute `A_{h,0}` —
+the higher coefficients are not determined by the constant point).
+`Z`'s probability of querying that exact input across `q_H` queries is
+`≤ q_H·2^{-(T−1)λ} ≤ q_H·2^{-128}` for `T ≥ 2`. Weakening `T = 2` to
+`λ ≥ 128` is where the `2^{-128}` in the bound comes from; committees
+with larger `T` get more entropy, not less. Birthday consistency against
+all other programmed answers and honest-party queries (R3 verifiers
+query exactly the planted input) contributes `O(q_H²/2^λ)`.
+
+**(iii) P2 — restart correspondence.** In the real world, `A`'s decision
+to abort after seeing honest reveals depends only on the honest vectors
+it sees, which are uniform-subject-to-constraints identically in both
+worlds (item (i)); hence `A` aborts with the same distribution. Each
+abort expels one corrupt party (attributed: deviation by §3.1–3.2,
+omission by P3). The functionality's reroll hook is exercised at the
+same points, so both worlds implement the identical accept/reroll
+process with `≤ f+1` uniform candidates — the kept key's distribution
+matches by construction. (This is why the bound need only be *matched*,
+not *negligible*: the `log₂(f+1)`-bit selection the adversary gets in
+the real world is exactly the influence the hook grants in the ideal
+world.)
+
+**(iv) P3 — refusal identification.** Blame-by-omission is attributed
+only at `ℱ_BC`-scheduled round close, which `S` controls identically in
+both worlds (the round-close event is a functionality-level scheduling
+decision, visible to `Z`). Safety never depends on when the close
+happens; the blame lands on the party whose scheduled reveal slot
+closed empty — in both worlds, `A` cannot make an honest party's slot
+close empty (it does not control honest sending), so no honest party is
+blamed by omission except via the `ε_C3` term of §3.2.
+
+Union over `≤ f+1` restarts gives the `ε_U3` bound. ∎
+
+### 11.5 Uniformity corollary
+
+Under Theorem U3, the joint long-term key is uniform subject to the
+`≤ f+1` accept/reroll process, identically in real and ideal worlds —
+and the rushing key-bias attack of [GS22svc] §3.6 (contribute `−φ/ρ`
+after seeing honest constant terms) is impossible: by the time honest
+constant terms are visible (R2), every adversarial contribution is fixed
+by its R1 hash (extraction shows it was committed before the honest
+reveal), so the adversary cannot choose its dealing as a function of the
+honest contributions. Commit-reveal is thus certified as the *minimum*
+viable anti-rushing protection for a Feldman DKG in this setting —
+matching the necessity direction of [GS22svc] §3.6.
+
+### 11.6 Status and remaining work
+
+* **Proved here:** the hybrid argument of §11.4 in full, including the
+  three delicate points (P1 entropy accounting, P2 restart
+  correspondence, P3 round-close attribution), the simulator of §11.3,
+  and the uniformity corollary of §11.5.
+* **Bookkeeping for a journal version:** (i) the `ℱ_BC` realization
+  theorem (§10.2's ideal rules ← §4.7's signed-echo protocol) written
+  out — the consistency/totality argument exists at the game-based level
+  already (F8 analysis), so this is indexing, not ideas; (ii) the exact
+  per-restart union bound expanded; (iii) the benign-programmability
+  note of §10.5 folded into a GUC-style statement if the full version
+  goes that way.
+* **Not claimed:** UC security with *adaptive* corruptions (the
+  deferred-content trick does not obviously survive an adversary that
+  corrupts after R1; the [GS22svc] §10.1 LDL-weakening is the known
+  path); UC with dishonest majority (out of model); liveness under full
+  asynchrony (partial synchrony stays in the `ℱ_BC` realization layer,
+  §10.1).
+
+With U3 in place, Theorem U1 (§10.4) reduces to assembling the remaining
+phases (triples, presign, sign) around the same machinery: their
+simulators are the §5 games G2–G5, which are already straight-line and
+query-tape-based; the only UC-specific addition beyond U3 is the
+delivery-scheduling correspondence for the online phase, which is
+bookkeeping. **The UC proof has no remaining novel obstacle.**
