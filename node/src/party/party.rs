@@ -574,14 +574,35 @@ struct Candidate {
 const MAX_TRACKED_SIDS: usize = 4096;
 const MAX_CANDIDATES_PER_SLOT: usize = 8;
 
-/// The per-node echo-broadcast acceptor: same rule as M1
-/// (`⌈(n+1)/2⌉` distinct echoers OTHER than the sender), but fed by this
-/// node's mailbox ONLY — including the node's own echo via the mesh's
-/// self-echo loopback (M1 counted it through the peers' mailboxes).
+/// The F8 equivocation evidence: two conflicting sender-signed
+/// envelopes of one broadcast slot (SPEC §4.7 rule (3)).
+type EquivocationEvidence = (SignedEnvelope<NodePayload>, SignedEnvelope<NodePayload>);
+
+/// The per-node echo-broadcast acceptor (SPEC §4.7 signed-echo
+/// consistent broadcast): fed by this node's mailbox ONLY — including
+/// the node's own echo via the mesh's self-echo loopback, which counts
+/// toward the `T−1` echo quorum (M1's orchestrator counted echoes
+/// globally). A broadcast value `m` from sender `i` is accepted iff
+/// (1) this node holds `i`'s valid §10.2 signature on `m` (every
+/// candidate carries the sender-signed envelope, verified by the mesh),
+/// (2) `m` was echoed by `≥ T−1` distinct parties other than `i`, and
+/// (3) no conflicting sender-signed value was seen — a SECOND distinct
+/// payload in a slot is equivocation: the sender is poisoned (`⊥`) for
+/// the whole session, the value is never delivered, and the two
+/// conflicting signed envelopes are kept as offline-verifiable blame
+/// evidence (§10.1 F8, surfaced by the round-wait path).
 struct Acceptor {
-    majority: usize,
+    /// §4.7 rule (2): echoes from `T−1` distinct parties other than the
+    /// sender.
+    echo_quorum: usize,
     bcast: BTreeMap<SlotKey, BTreeMap<Vec<u8>, Candidate>>,
     p2p: BTreeMap<SlotKey, BTreeMap<PartyId, SignedEnvelope<NodePayload>>>,
+    /// `(sid, sender)` poisoned by equivocation (§4.7 rule (3)), with
+    /// the evidence: the first two conflicting sender-signed envelopes.
+    equivocations: BTreeMap<(Vec<u8>, PartyId), EquivocationEvidence>,
+    /// Equivocations already surfaced to the drivers (log + archive) —
+    /// report each once.
+    reported: BTreeSet<(Vec<u8>, PartyId)>,
     /// Distinct session ids admitted so far (H2 cap).
     sids: BTreeSet<Vec<u8>>,
     /// Frames dropped by the H2 caps.
@@ -589,11 +610,13 @@ struct Acceptor {
 }
 
 impl Acceptor {
-    fn new(n: usize) -> Self {
+    fn new(t: usize) -> Self {
         Self {
-            majority: (n + 2) / 2,
+            echo_quorum: t.saturating_sub(1),
             bcast: BTreeMap::new(),
             p2p: BTreeMap::new(),
+            equivocations: BTreeMap::new(),
+            reported: BTreeSet::new(),
             sids: BTreeSet::new(),
             dropped: 0,
         }
@@ -616,6 +639,35 @@ impl Acceptor {
         true
     }
 
+    /// Insert one candidate payload into its slot; on the SECOND
+    /// distinct payload poison `(sid, from)` and record the evidence
+    /// (the first two conflicting sender-signed envelopes, §10.1 F8).
+    fn insert_candidate(
+        &mut self,
+        key: &SlotKey,
+        payload: Vec<u8>,
+        env: SignedEnvelope<NodePayload>,
+    ) {
+        let payloads = self.bcast.entry(key.clone()).or_default();
+        // H2: an equivocating sender can mint unbounded distinct
+        // payloads per slot — cap the candidates.
+        if payloads.len() >= MAX_CANDIDATES_PER_SLOT && !payloads.contains_key(&payload) {
+            self.dropped += 1;
+            return;
+        }
+        payloads.entry(payload).or_insert_with(|| Candidate {
+            env,
+            echoers: BTreeSet::new(),
+        });
+        if payloads.len() == 2 && !self.equivocations.contains_key(&(key.0.clone(), key.3)) {
+            let mut it = payloads.values();
+            let first = it.next().expect("two candidates").env.clone();
+            let second = it.next().expect("two candidates").env.clone();
+            self.equivocations
+                .insert((key.0.clone(), key.3), (first, second));
+        }
+    }
+
     fn process(&mut self, msg: Received<NodePayload>) {
         match msg {
             Received::Original(se) => {
@@ -625,19 +677,10 @@ impl Acceptor {
                 match se.envelope.to {
                     None => {
                         let (key, payload) = slot_and_payload(&se);
-                        let payloads = self.bcast.entry(key).or_default();
-                        // H2: an equivocating sender can mint unbounded
-                        // distinct payloads per slot — cap the candidates.
-                        if payloads.len() >= MAX_CANDIDATES_PER_SLOT
-                            && !payloads.contains_key(&payload)
-                        {
-                            self.dropped += 1;
-                            return;
+                        if self.equivocations.contains_key(&(key.0.clone(), key.3)) {
+                            return; // sender already ⊥ in this session
                         }
-                        payloads.entry(payload).or_insert_with(|| Candidate {
-                            env: se,
-                            echoers: BTreeSet::new(),
-                        });
+                        self.insert_candidate(&key, payload, se);
                     }
                     Some(to) => {
                         let key = (
@@ -659,22 +702,24 @@ impl Acceptor {
                     return;
                 }
                 let (key, payload) = slot_and_payload(&original);
-                let payloads = self.bcast.entry(key).or_default();
-                if payloads.len() >= MAX_CANDIDATES_PER_SLOT && !payloads.contains_key(&payload) {
-                    self.dropped += 1;
-                    return;
+                if self.equivocations.contains_key(&(key.0.clone(), key.3)) {
+                    return; // sender already ⊥ in this session
                 }
-                let candidate = payloads.entry(payload).or_insert_with(|| Candidate {
-                    env: original,
-                    echoers: BTreeSet::new(),
-                });
-                candidate.echoers.insert(echoer);
+                self.insert_candidate(&key, payload.clone(), original);
+                if let Some(candidate) = self
+                    .bcast
+                    .get_mut(&key)
+                    .and_then(|payloads| payloads.get_mut(&payload))
+                {
+                    candidate.echoers.insert(echoer);
+                }
             }
         }
     }
 
-    /// The accepted broadcast set of one round: values that reached the
-    /// echo majority, keyed by sender.
+    /// The accepted broadcast set of one round: values satisfying §4.7
+    /// rules (1)–(3) (sender-signed, `T−1` echoes, no equivocation),
+    /// keyed by sender. Poisoned (equivocating) senders are `⊥`.
     fn bcast_set(
         &self,
         sid: &[u8],
@@ -684,16 +729,54 @@ impl Acceptor {
     ) -> BTreeMap<PartyId, SignedEnvelope<NodePayload>> {
         let mut out = BTreeMap::new();
         for &id in ids {
+            if self.equivocations.contains_key(&(sid.to_vec(), id)) {
+                continue; // rule (3): ⊥ for an equivocating sender
+            }
             let key = (sid.to_vec(), phase, round, id);
             let accepted = self
                 .bcast
                 .get(&key)
-                .and_then(|m| m.values().find(|c| c.echoers.len() >= self.majority));
+                .and_then(|m| m.values().find(|c| c.echoers.len() >= self.echo_quorum));
             if let Some(c) = accepted {
                 out.insert(id, c.env.clone());
             }
         }
         out
+    }
+
+    /// The equivocations detected so far in one session, with the
+    /// evidence envelopes (peek — used by [`PartyNode`]'s evidence
+    /// accessor and tests).
+    #[allow(clippy::type_complexity)]
+    fn equivocations(&self, sid: &[u8]) -> Vec<(PartyId, EquivocationEvidence)> {
+        self.equivocations
+            .iter()
+            .filter(|((s, _), _)| s == sid)
+            .map(|((_, from), (a, b))| (*from, (a.clone(), b.clone())))
+            .collect()
+    }
+
+    /// The not-yet-surfaced equivocations (any session), marked as
+    /// reported: the round-wait path logs and archives each exactly once.
+    #[allow(clippy::type_complexity)]
+    fn take_new_equivocations(&mut self) -> Vec<(SlotKey, EquivocationEvidence)> {
+        let new: Vec<_> = self
+            .equivocations
+            .iter()
+            .filter(|(k, _)| !self.reported.contains(*k))
+            .map(|((sid, from), (a, b))| ((sid.clone(), *from), (a.clone(), b.clone())))
+            .collect();
+        for (k, _) in &new {
+            self.reported.insert(k.clone());
+        }
+        // The slot's phase/round are carried by the evidence envelopes;
+        // rebuild the full slot key for the report.
+        new.into_iter()
+            .map(|((sid, from), (a, b))| {
+                let key = (sid, a.envelope.phase, a.envelope.round, from);
+                (key, (a, b))
+            })
+            .collect()
     }
 
     /// The round's P2P messages addressed to `to`, keyed by sender.
@@ -844,7 +927,7 @@ impl PartyNode {
         // The per-node acceptor counts this node's own echo through its
         // own mailbox (M1's orchestrator counted it globally).
         node.set_self_echo_loopback(true);
-        let state = Arc::new((Mutex::new(Acceptor::new(params.n)), Condvar::new()));
+        let state = Arc::new((Mutex::new(Acceptor::new(params.t)), Condvar::new()));
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         // H2: the collector thread — the ONLY receiver of the mesh
         // mailbox — so concurrent session drivers never serialize on a
@@ -1073,13 +1156,14 @@ impl PartyNode {
 
     /// [`Self::accepted_broadcasts`] over an explicit id set (H4 §10.3:
     /// restart sessions run over the surviving committee with ORIGINAL
-    /// ids — rounds complete on the survivors' values only). The
-    /// echo-acceptance quorum is unchanged (`⌈(n+1)/2⌉` over the full
-    /// registry: echoes come from every live mesh, including expelled
-    /// parties' — safety follows from the first-echo-per-slot rule;
-    /// liveness holds while expelled parties' meshes keep echoing, the
-    /// same assumption as the rest of the active-cheater model — a
-    /// crash-stop is the separate H2 crash-recovery gap).
+    /// ids — rounds complete on the survivors' values only). The §4.7
+    /// echo quorum is unchanged (`T−1` echoes from parties other than
+    /// the sender, over the full registry: echoes come from every live
+    /// mesh, including expelled parties' — safety follows from the
+    /// first-echo-per-slot rule; liveness holds while expelled parties'
+    /// meshes keep echoing, the same assumption as the rest of the
+    /// active-cheater model — a crash-stop is the separate H2
+    /// crash-recovery gap).
     pub fn accepted_broadcasts_over(
         &self,
         sid: &[u8],
@@ -1093,7 +1177,9 @@ impl PartyNode {
         loop {
             let set = guard.bcast_set(sid, phase, round, ids);
             if set.len() == ids.len() {
+                let equivocations = guard.take_new_equivocations();
                 drop(guard);
+                self.report_equivocations(equivocations);
                 self.log_accepted(&set);
                 return set;
             }
@@ -1104,7 +1190,9 @@ impl PartyNode {
                      failing closed on the partial accepted set (SPEC §13.1)",
                     self.me
                 );
+                let equivocations = guard.take_new_equivocations();
                 drop(guard);
+                self.report_equivocations(equivocations);
                 self.log_accepted(&set);
                 return set;
             }
@@ -1112,6 +1200,49 @@ impl PartyNode {
                 .wait_timeout(guard, remaining)
                 .expect("mesh mutex poisoned")
                 .0;
+        }
+    }
+
+    /// §4.7 rule (3) / §10.1 F8: the equivocations this node's acceptor
+    /// has detected in session `sid` — the sender and the two
+    /// conflicting signed envelopes (the offline-verifiable evidence).
+    pub fn equivocation_evidence(&self, sid: &[u8]) -> Vec<(PartyId, EquivocationEvidence)> {
+        self.state
+            .0
+            .lock()
+            .expect("mesh mutex poisoned")
+            .equivocations(sid)
+    }
+
+    /// Log and archive newly detected broadcast equivocations (§4.7
+    /// rule (3), §10.1 F8): the two conflicting sender-signed envelopes
+    /// are the blame token; the sender is `⊥` for the session and the
+    /// §10.3 policy applies. Non-fatal on I/O failure.
+    #[allow(clippy::type_complexity)]
+    fn report_equivocations(&self, equivocations: Vec<(SlotKey, EquivocationEvidence)>) {
+        for ((_, phase, round, from), (first, second)) in equivocations {
+            eprintln!(
+                "[node {}] EQUIVOCATION: party {from} signed two conflicting values for the \
+                 same broadcast slot ({phase}, round {round}) — the sender is ⊥ for this \
+                 session (SPEC §4.7 rule (3), fault class F8)",
+                self.me
+            );
+            let abort = IdentifiableAbort {
+                phase,
+                blamed: vec![from],
+                detail: format!(
+                    "broadcast equivocation in round {round}: two conflicting values carry \
+                     party {from}'s valid signature (§4.7 rule (3))"
+                ),
+            };
+            self.note(
+                &abort.clone(),
+                Some(BlameEvidence::Equivocation {
+                    abort,
+                    first,
+                    second,
+                }),
+            );
         }
     }
 

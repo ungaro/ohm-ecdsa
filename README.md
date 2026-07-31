@@ -10,7 +10,7 @@ signing**, **identifiable abort at every broadcast**, no Paillier, no OT,
 no class groups, no range proofs — just Shamir + Feldman VSS + Beaver
 triples + commit-reveal DKG. The full protocol is specified in
 [`SPEC.md`](./SPEC.md), including the patent design-around analysis
-(US 11,757,657 / Sepior and KU23 / Dfns; §12).
+(US 11,757,657 / Sepior and KU24 / Dfns; §12).
 
 **Contents:** [Motivation](#motivation-the-patent-situation) ·
 [How it works](#how-it-works) · [Quick start](#quick-start) ·
@@ -40,7 +40,7 @@ that make it fast in practice:
   Katz put it at NIST MPTS 2023. The patent was granted to **Sepior**
   in 2023; Sepior has since been renamed **Blockdaemon**, which sells
   institutional custody on, among other things, this technology.
-* **KU23** (*key-independent batch presignatures*, ePrint 2024/2011) —
+* **KU24** (*key-independent batch presignatures*, ePrint 2024/2011) —
   described by **Dfns**, the authors' employer, on its own blog as
   "this patented protocol", saving everyone the guesswork.
 
@@ -216,10 +216,10 @@ Against the two encumbered honest-majority protocols, on the metrics
 that are machine-independent (sources and timing context:
 [`SPEC.md`](./SPEC.md) Appendix B):
 
-| | DJNPO20 (patented) | KU23 (patented) | OHM-ECDSA |
+| | DJNPO20 (patented) | KU24 (patented) | OHM-ECDSA |
 |---|---|---|---|
 | Online signing | 1 round | non-interactive, needs semi-honest coordinator | 1 round |
-| Identifiable abort | ✗ (given up for speed) | ✗ (detects, can't blame) | ✓ — unconditional |
+| Identifiable abort | ✗ (given up for speed) | ✗ (detects, can't blame) | ✓ — unconditional detection, computational attribution |
 | Guaranteed delivery | ✗ | ✗ | ✓ (optional, §10.4) |
 | Presignatures | key-independent | key-independent, batched | key-dependent by default (§12.3); optional key-independent pools (§8.7) |
 | Reported presig cost | 34 ms (AWS, LAN) | 1.3 ms amortized at batch 10,000 | 9.7 ms; 5.2 ms packed |
@@ -236,7 +236,7 @@ docs, July 2026):
 
 | Project | Regime | Identifiable abort | Presignatures | License | Notes |
 |---|---|---|---|---|---|
-| **OHM-ECDSA** (this repo) | honest majority | ✓ — unconditional | key-dependent; opt-in key-independent pools | Apache-2.0 (patent grant) | robust delivery opt-in; no coordinator |
+| **OHM-ECDSA** (this repo) | honest majority | ✓ — unconditional detection, computational attribution | key-dependent; opt-in key-independent pools | Apache-2.0 (patent grant) | robust delivery opt-in; no coordinator |
 | **near/mpc "Robust ECDSA"** (NEAR) | honest majority (DJNPO20-based) | ✗ (paper: abort, optional fairness) | key-independent | MIT | in production (Chain Signatures) — an *open implementation of the patented protocol* |
 | **cait-sith** (cronokirby / NEAR fork) | arbitrary t-of-n | ✗ — explicitly disclaimed ("does not attempt to provide identifiable aborts") | key-dependent (triples key-independent) | MIT | sign ≈450 µs local (README, i5-4690K); upstream stale since 2024-04, NEAR fork in production |
 | **cggmp21** (LFDT Lockness, ex-Dfns) | dishonest majority | ✗ — paper has it, crate doesn't | key-dependent | Apache-2.0 | Kudelski-audited; moved to LF Decentralized Trust — corroborates Dfns's patent-lifting intent (§12.6) |
@@ -449,7 +449,7 @@ out-of-band bundle exchange itself (ops, not code), key rotation
 * Patent design-around analysis → SPEC §12
 * Deployment, transport, and hardening checklists → SPEC §13
 * Deployment topologies (who holds which share, blame-token evidence flow, storage duties) → SPEC Appendix A
-* References (GJKR96, Beaver, Groth–Shoup, DJNPO20, KU23, …) → SPEC §14
+* References (GJKR96, Beaver, Groth–Shoup, DJNPO20, KU24, …) → SPEC §14
 * Contributor conventions (and guidance for AI agents) → `AGENTS.md`
 
 ## Layout
@@ -503,7 +503,7 @@ cargo test --workspace` green; follow `AGENTS.md`.
 
 The construction uses only 1989–2007 public-domain building blocks plus
 openly published presignature algebra, and is engineered to practice no
-element of US 11,757,657 B2 claim 1 and to differ materially from KU23
+element of US 11,757,657 B2 claim 1 and to differ materially from KU24
 (element-by-element analysis: SPEC §12). Open-source ≠ patent-free; get
 an FTO opinion for commercial custody use.
 

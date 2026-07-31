@@ -1,20 +1,34 @@
 //! [`MeshTransport`]: the core `Transport<SignedEnvelope<DkgMessage>>`
 //! trait over the real-TCP mesh, with §4.7 echo-broadcast acceptance.
 //!
-//! Acceptance rule (SPEC §4.7, "accept `m` for `i` upon `⌈(n+1)/2⌉`
-//! consistent echoes"): a broadcast value from sender `i` is accepted
-//! once `⌈(n+1)/2⌉` DISTINCT parties OTHER than `i` echoed it. The
-//! sender's own copy is never counted — counting it would let an
-//! equivocating sender reach the majority for two different values at
-//! `n = 3` (its own copy plus one echo each), breaking the §4.7
-//! consistency property. Together with the mesh's first-echo rule this
-//! yields:
+//! Acceptance rule (SPEC §4.7, signed-echo consistent broadcast): a
+//! broadcast value `m` from sender `i` is accepted once
 //!
-//! * consistency — two different values cannot both collect
-//!   `⌈(n+1)/2⌉` echoes from honest parties (their echo sets would have
-//!   to overlap in an honest party that echoed twice);
-//! * validity — an accepted value carries the sender's §10.2 signature,
-//!   verified before echoing and before counting.
+//! 1. the acceptor holds `i`'s valid §10.2 signature on `m` (every
+//!    candidate carries the sender's signed envelope, verified on
+//!    receipt);
+//! 2. `m` was echoed by at least `T−1` DISTINCT parties OTHER than `i`
+//!    (the sender's own copy is never counted — an echo of one's own
+//!    message is rejected by the mesh);
+//! 3. no value `m′ ≠ m` carrying `i`'s signature has been seen: a
+//!    second distinct sender-signed payload in the same slot is
+//!    EQUIVOCATION — the slot is poisoned (`⊥` for `i`, the value is
+//!    never delivered) and logged loudly; the two signed envelopes are
+//!    the offline-verifiable blame evidence (§10.1 F8).
+//!
+//! Together with the mesh's first-echo rule this yields:
+//!
+//! * consistency — two different values cannot both be accepted: each
+//!   would need `i`'s signature (rule 1) and `T−1` echoers, at least
+//!   one of them honest (at most `T−2` corrupt parties other than `i`
+//!   exist), and an honest echoer echoes to ALL, making the conflict
+//!   visible everywhere — rule (3) then forces `⊥`;
+//! * validity/totality — an honest sender's value collects its
+//!   signature plus the `≥ T−1` honest non-sender echoes.
+//!
+//! (The superseded `⌈(n+1)/2⌉`-majority-echo rule is inconsistent at
+//! `T ≥ 3` — two size-`T` quorums of `n = 2T−1` may intersect only in
+//! corrupt parties; see the §4.7 design note.)
 //!
 //! Round completeness: `accepted_broadcasts` / `accepted_p2p` block until
 //! every committee member has an accepted value for the round (the DKG
@@ -67,11 +81,6 @@ impl FrameBound for DkgMessage {
 /// Default per-round timeout (localhost rounds complete in milliseconds).
 pub const DEFAULT_ROUND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `⌈(n+1)/2⌉` — the §4.7 acceptance threshold.
-fn majority(n: usize) -> usize {
-    (n + 2) / 2
-}
-
 /// Broadcast slot key `(sid, phase, round, from)`; for P2P the last
 /// component is the addressee instead.
 type SlotKey = (Vec<u8>, Phase, u8, PartyId);
@@ -83,25 +92,59 @@ struct Candidate {
 }
 
 /// The echo-broadcast acceptor: dedups by slot and payload, counts
-/// distinct echoers, decides acceptance. Fed by every node's mailbox
-/// (orchestrator pattern — one acceptor yields one consistent accepted
-/// set, the `SimTransport` analog of §13.2).
+/// distinct echoers, decides acceptance per §4.7 rules (1)–(3). Fed by
+/// every node's mailbox (orchestrator pattern — one acceptor yields one
+/// consistent accepted set, the `SimTransport` analog of §13.2).
 struct Acceptor {
-    majority: usize,
-    /// slot → payload-bytes → candidate (equivocation-safe: payloads are
-    /// tracked separately, first to majority wins).
+    /// §4.7 rule (2): echoes from `T−1` distinct parties other than the
+    /// sender.
+    echo_quorum: usize,
+    /// slot → payload-bytes → candidate. A SECOND distinct payload in a
+    /// slot is sender equivocation (every candidate carries the sender's
+    /// verified signature) — the slot is poisoned (rule (3)).
     bcast: BTreeMap<SlotKey, BTreeMap<Vec<u8>, Candidate>>,
+    /// `(sid, sender)` poisoned by equivocation (§4.7 rule (3)): the
+    /// sender's slots in this session never accept (the value is not
+    /// delivered, the evidence is the two conflicting signed envelopes).
+    equivocated: BTreeSet<(Vec<u8>, PartyId)>,
     /// (sid, phase, round, to) → sender → message.
     p2p: BTreeMap<SlotKey, BTreeMap<PartyId, SignedEnvelope<DkgMessage>>>,
 }
 
 impl Acceptor {
-    fn new(n: usize) -> Self {
+    fn new(t: usize) -> Self {
         Self {
-            majority: majority(n),
+            echo_quorum: t.saturating_sub(1),
             bcast: BTreeMap::new(),
+            equivocated: BTreeSet::new(),
             p2p: BTreeMap::new(),
         }
+    }
+
+    /// Insert one candidate payload into its slot; on the SECOND distinct
+    /// payload poison `(sid, from)` and log the equivocation loudly.
+    fn insert_candidate(
+        &mut self,
+        key: &SlotKey,
+        payload: Vec<u8>,
+        env: SignedEnvelope<DkgMessage>,
+    ) -> &mut Candidate {
+        let payloads = self.bcast.entry(key.clone()).or_default();
+        payloads
+            .entry(payload.clone())
+            .or_insert_with(|| Candidate {
+                env,
+                echoers: BTreeSet::new(),
+            });
+        if payloads.len() == 2 && self.equivocated.insert((key.0.clone(), key.3)) {
+            eprintln!(
+                "[mesh] EQUIVOCATION: party {} signed two conflicting values for the same \
+                 broadcast slot ({}, round {}) — the sender is ⊥ for this session \
+                 (SPEC §4.7 rule (3), fault class F8)",
+                key.3, key.1, key.2
+            );
+        }
+        payloads.get_mut(&payload).expect("candidate just inserted")
     }
 
     fn process(&mut self, msg: Received<DkgMessage>) {
@@ -109,14 +152,10 @@ impl Acceptor {
             Received::Original(se) => match se.envelope.to {
                 None => {
                     let (key, payload) = slot_and_payload(&se);
-                    self.bcast
-                        .entry(key)
-                        .or_default()
-                        .entry(payload)
-                        .or_insert_with(|| Candidate {
-                            env: se,
-                            echoers: BTreeSet::new(),
-                        });
+                    if self.equivocated.contains(&(key.0.clone(), key.3)) {
+                        return; // sender already ⊥ in this session
+                    }
+                    self.insert_candidate(&key, payload, se);
                 }
                 Some(to) => {
                     let key = (
@@ -134,22 +173,18 @@ impl Acceptor {
             },
             Received::Echo { echoer, original } => {
                 let (key, payload) = slot_and_payload(&original);
-                let candidate = self
-                    .bcast
-                    .entry(key)
-                    .or_default()
-                    .entry(payload)
-                    .or_insert_with(|| Candidate {
-                        env: original,
-                        echoers: BTreeSet::new(),
-                    });
-                candidate.echoers.insert(echoer);
+                if self.equivocated.contains(&(key.0.clone(), key.3)) {
+                    return; // sender already ⊥ in this session
+                }
+                self.insert_candidate(&key, payload, original)
+                    .echoers
+                    .insert(echoer);
             }
         }
     }
 
-    /// The accepted broadcast set of one round (only values that reached
-    /// the echo majority), plus whether every member has one.
+    /// The accepted broadcast set of one round (only values satisfying
+    /// §4.7 rules (1)–(3)), plus whether every member has one.
     #[allow(clippy::type_complexity)]
     fn bcast_set(
         &self,
@@ -163,11 +198,14 @@ impl Acceptor {
     ) {
         let mut out = BTreeMap::new();
         for &id in ids {
+            if self.equivocated.contains(&(sid.to_vec(), id)) {
+                continue; // rule (3): ⊥ for an equivocating sender
+            }
             let key = (sid.to_vec(), phase, round, id);
             let accepted = self
                 .bcast
                 .get(&key)
-                .and_then(|m| m.values().find(|c| c.echoers.len() >= self.majority));
+                .and_then(|m| m.values().find(|c| c.echoers.len() >= self.echo_quorum));
             if let Some(c) = accepted {
                 out.insert(
                     id,
@@ -238,10 +276,12 @@ impl MeshTransport {
     /// (retry/backoff until the mesh is up). `keys` holds each party's
     /// transport keypair — required for echo signing and, in the
     /// orchestrator pattern, handed to the core's `SigningTransport` for
-    /// envelope signing.
+    /// envelope signing. `t` is the signing threshold — the §4.7 echo
+    /// quorum is `T−1` echoes from parties other than the sender.
     pub fn start(
         parties: &[(PartyId, SocketAddr)],
         keys: &[(PartyId, SecretKey)],
+        t: usize,
         round_timeout: Duration,
     ) -> io::Result<Self> {
         let registry: BTreeMap<PartyId, VerifyingKey> = keys
@@ -273,7 +313,7 @@ impl MeshTransport {
             nodes,
             ids,
             inbox: Mutex::new(rx),
-            state: Mutex::new(Acceptor::new(parties.len())),
+            state: Mutex::new(Acceptor::new(t)),
             timeout: round_timeout,
         })
     }

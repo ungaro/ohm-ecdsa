@@ -1683,7 +1683,7 @@ fn m1_demo(port_base: u16) -> ExitCode {
             (i, SocketAddr::from(([127, 0, 0, 1], port)))
         })
         .collect();
-    let mesh = match MeshTransport::start(&parties, &signers, DEFAULT_ROUND_TIMEOUT) {
+    let mesh = match MeshTransport::start(&parties, &signers, params.t, DEFAULT_ROUND_TIMEOUT) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("mesh setup failed: {e}");
@@ -1693,7 +1693,7 @@ fn m1_demo(port_base: u16) -> ExitCode {
     for (id, addr) in mesh.local_addrs() {
         println!("  node {id} listening on {addr}");
     }
-    println!("  full mesh up; echo broadcast accepts on 2-of-3 consistent echoes");
+    println!("  full mesh up; echo broadcast accepts on the sender's signature + T−1 echoes");
     println!("  every envelope is signed by its sender and verified on receipt");
 
     let mut transport = SigningTransport::new(mesh, &signers);

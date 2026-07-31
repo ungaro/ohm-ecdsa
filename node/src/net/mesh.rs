@@ -21,8 +21,8 @@
 //!   echo is also delivered to its own mailbox. M1's orchestrator acceptor
 //!   saw every node's mailbox, so every honest echo was counted globally;
 //!   a per-node acceptor (M2, [`crate::party`]) sees only its own mailbox
-//!   and must count its own echo explicitly to reach the same
-//!   `⌈(n+1)/2⌉`-of-others acceptance rule.
+//!   and must count its own echo explicitly to reach the §4.7 `T−1`
+//!   echoes-from-others acceptance quorum.
 //! * artificial send delay ([`Node::set_send_delay`]): every outgoing
 //!   frame is written after a fixed sleep (on a helper thread), simulating
 //!   a per-link network latency for the `mesh_perf` benchmark.

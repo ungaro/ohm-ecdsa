@@ -10,9 +10,14 @@
 //!   [`Encode`]/[`Decode`] wire format;
 //! * §10.2 signed envelopes, verified on receipt (unknown sender or bad
 //!   signature: drop + log);
-//! * §4.7 echo broadcast: a broadcast value is *accepted* for sender `i`
-//!   in a round once `⌈(n+1)/2⌉` distinct parties OTHER than `i` echoed
-//!   it, with dedup by `(sid, phase, round, from)`;
+//! * §4.7 signed-echo consistent broadcast: a broadcast value `m` from
+//!   sender `i` is *accepted* iff (1) the acceptor holds `i`'s valid
+//!   §10.2 signature on `m`, (2) `m` was echoed by `≥ T−1` distinct
+//!   parties OTHER than `i`, and (3) no conflicting sender-signed value
+//!   was seen — a second distinct payload in one slot poisons the
+//!   sender for the session (`⊥`) and leaves the two signed envelopes
+//!   as blame evidence (§10.1 F8), with dedup by
+//!   `(sid, phase, round, from)`;
 //! * [`MeshTransport`] implements the core `Transport` trait, so the M1
 //!   reference orchestration (`drive_dkg_signed`, one process holding
 //!   every party's key) still runs unchanged.

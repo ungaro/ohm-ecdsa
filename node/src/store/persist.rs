@@ -669,7 +669,9 @@ impl DiskPresigStore {
 /// bad DLEQ proofs, bad nonce points, bad opening shares — signed but
 /// not tokenized here; bad re-shares — a `Reshare` envelope does not
 /// fit the share-token shape) are logged to `aborts.log` with
-/// `token: none`.
+/// `token: none`. Tokenized classes: F2 dealt shares, F6 sign shares,
+/// F8 broadcast equivocation (§4.7 rule (3) — two conflicting
+/// sender-signed envelopes of one slot).
 #[derive(Clone, Debug)]
 pub enum BlameEvidence {
     /// The core's [`BlameToken`] (M1 orchestrator path,
@@ -705,6 +707,19 @@ pub enum BlameEvidence {
         /// `A[z]`.
         z_com: FeldmanCommitment,
     },
+    /// F8 (§4.7 rule (3)): broadcast equivocation — two CONFLICTING
+    /// values in the same broadcast slot, each in an envelope carrying
+    /// the blamed sender's valid §10.2 signature. The pair is the
+    /// public, offline-verifiable proof of equivocation.
+    Equivocation {
+        /// The blame event (names the equivocating sender).
+        abort: IdentifiableAbort,
+        /// The first conflicting signed broadcast envelope.
+        first: SignedEnvelope<NodePayload>,
+        /// The second conflicting signed broadcast envelope (same slot,
+        /// different value).
+        second: SignedEnvelope<NodePayload>,
+    },
 }
 
 impl BlameEvidence {
@@ -714,6 +729,7 @@ impl BlameEvidence {
             Self::Core(_) => "core blame token (M1 drive_dkg_signed, F2)",
             Self::DealtShare { .. } => "dealt-share evidence (M2 wire, F2)",
             Self::SignShare { .. } => "sign-share evidence (M2 wire, F6)",
+            Self::Equivocation { .. } => "broadcast-equivocation evidence (M2 wire, F8)",
         }
     }
 
@@ -721,7 +737,9 @@ impl BlameEvidence {
     pub fn abort(&self) -> &IdentifiableAbort {
         match self {
             Self::Core(t) => &t.abort,
-            Self::DealtShare { abort, .. } | Self::SignShare { abort, .. } => abort,
+            Self::DealtShare { abort, .. }
+            | Self::SignShare { abort, .. }
+            | Self::Equivocation { abort, .. } => abort,
         }
     }
 
@@ -758,6 +776,16 @@ impl BlameEvidence {
                 r.encode(&mut out);
                 u_com.encode(&mut out);
                 z_com.encode(&mut out);
+            }
+            Self::Equivocation {
+                abort,
+                first,
+                second,
+            } => {
+                out.push(4);
+                put_abort(&mut out, abort);
+                first.encode(&mut out);
+                second.encode(&mut out);
             }
         }
         out
@@ -815,6 +843,22 @@ impl BlameEvidence {
                         r,
                         u_com,
                         z_com,
+                    },
+                    used,
+                ))
+            }
+            4 => {
+                let (abort, u) = take_abort(bytes.get(used..)?)?;
+                used += u;
+                let (first, u) = SignedEnvelope::decode(bytes.get(used..)?)?;
+                used += u;
+                let (second, u) = SignedEnvelope::decode(bytes.get(used..)?)?;
+                used += u;
+                Some((
+                    Self::Equivocation {
+                        abort,
+                        first,
+                        second,
                     },
                     used,
                 ))
@@ -945,6 +989,35 @@ pub fn audit_token(bytes: &[u8], party_keys: &[(PartyId, VerifyingKey)]) -> Audi
                 "recomputed check really fails: dealt share does not match EvalCom(com, to)"
                     .to_string(),
                 dealt_fails,
+            );
+        }
+        BlameEvidence::Equivocation { first, second, .. } => {
+            let from = first.envelope.from;
+            let same_slot = first.envelope.to.is_none()
+                && second.envelope.to.is_none()
+                && second.envelope.from == from
+                && second.envelope.sid == first.envelope.sid
+                && second.envelope.phase == first.envelope.phase
+                && second.envelope.round == first.envelope.round;
+            check(
+                format!(
+                    "blame consistency: abort names exactly the sender {from} in its phase, \
+                         both envelopes are broadcasts of the same slot"
+                ),
+                abort.blamed == [from] && abort.phase == first.envelope.phase && same_slot,
+            );
+            let sigs_ok = key_of(from)
+                .is_some_and(|k| first.verify_signature(k) && second.verify_signature(k));
+            check(
+                format!("both envelope signatures verify under party {from}'s transport key"),
+                sigs_ok,
+            );
+            let (mut fa, mut fb) = (Vec::new(), Vec::new());
+            first.encode(&mut fa);
+            second.encode(&mut fb);
+            check(
+                "the two signed values really conflict (distinct payloads in one slot)".to_string(),
+                fa != fb,
             );
         }
         BlameEvidence::SignShare {

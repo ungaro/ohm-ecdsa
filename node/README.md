@@ -15,6 +15,23 @@ mTLS layer). Milestones:
   signed envelopes verified on receipt, §4.7 echo broadcast
   (`MeshTransport` implementing the core `Transport` trait), keygen
   through `drive_dkg_signed`. One process holds every party's key.
+  The broadcast primitive is **signed-echo consistent broadcast**: a
+  value `m` from sender `i` is *accepted* iff (1) the acceptor holds
+  `i`'s valid signature on `m` (echoes carry the sender's signed
+  message, so acceptance condition (1) is always checkable and
+  equivocation evidence constructible), (2) `m` was echoed by `≥ T−1`
+  distinct parties other than `i`, and (3) no conflicting sender-signed
+  value was seen — a second distinct payload in one slot poisons the
+  sender for the session (`⊥`, the value never delivered) and the two
+  signed envelopes are archived as offline-verifiable F8 blame evidence
+  (`BlameEvidence::Equivocation`, checked by the `auditor`).
+  *Design note:* the superseded textbook rule — accept on
+  `⌈(n+1)/2⌉` consistent echoes — is inconsistent at `T ≥ 3`: two
+  size-`T` quorums of `n = 2T−1` may intersect only in corrupt parties,
+  so a corrupt sender with one colluding echoer could split the honest
+  accepted sets (demonstrated at `n = 5, T = 3, f = 2`; the
+  `node/tests/echo_consistency.rs` regression test drives exactly this
+  attack over the wire).
 * **M2** — per-party node drivers (`src/party/party.rs`): the orchestrator
   model is gone. A `PartyNode` holds ONLY its own material — its own
   transport secret key, its own party id, the peers' verifying keys, its
@@ -645,6 +662,16 @@ cargo test -p ohm-ecdsa-node
 * `node/tests/mesh_keygen.rs` (M1, 3 tests): orchestrated keygen over
   `MeshTransport`, a cheating dealer blamed with a verifying
   `BlameToken`, forged/unknown-sender/malformed frames dropped.
+* `node/tests/echo_consistency.rs` (§4.7, 2 tests, thread-level):
+  the reviewer attack on the superseded majority-echo rule — at 3-of-5
+  a corrupt sender signs two conflicting values for one broadcast slot
+  and a colluding corrupt echoer echoes each to a different honest
+  node; every honest node outputs ⊥ for the sender's slot (accepted
+  sets identical, honest values still accepted), holds the two
+  conflicting sender-signed envelopes as F8 evidence, and the
+  constructed `BlameEvidence::Equivocation` token audits VALID offline;
+  plus an echo of a value the sender never signed is dropped + counted
+  while the honest keygen completes.
 * `node/tests/party_mesh.rs` (M2, 6 tests, thread-level with strict
   per-node key separation): per-node keygen reconstructs the joint key
   (2-of-3 and 3-of-5); a cheating dealer is named by every node via the

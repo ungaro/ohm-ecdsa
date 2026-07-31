@@ -40,7 +40,7 @@ fn start_committee(seed: u64) -> Committee {
     let parties: Vec<(usize, SocketAddr)> = (1..=3)
         .map(|i| (i, SocketAddr::from(([127, 0, 0, 1], 0))))
         .collect();
-    let mesh = MeshTransport::start(&parties, &signers, ROUND_TIMEOUT).unwrap();
+    let mesh = MeshTransport::start(&parties, &signers, params.t, ROUND_TIMEOUT).unwrap();
     let transport = SigningTransport::new(mesh, &signers);
     let rngs = make_rngs(3, seed + 1);
     (params, signers, transport, rngs)
@@ -110,7 +110,7 @@ fn mesh_drops_forged_frames_and_completes() {
         let parties: Vec<(usize, SocketAddr)> = (1..=3)
             .map(|i| (i, SocketAddr::from(([127, 0, 0, 1], 0))))
             .collect();
-        let mesh = MeshTransport::start(&parties, &signers, ROUND_TIMEOUT).unwrap();
+        let mesh = MeshTransport::start(&parties, &signers, params.t, ROUND_TIMEOUT).unwrap();
         // Node 1's address, before the mesh is wrapped.
         let victim_addr = mesh.local_addrs()[0].1;
         let transport = SigningTransport::new(mesh, &signers);
