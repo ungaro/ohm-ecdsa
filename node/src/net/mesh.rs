@@ -1,5 +1,7 @@
 //! The full-mesh TCP layer (SPEC §13.1): `std::net` with blocking
-//! threads, no external runtime (M1; tokio is M3).
+//! threads, no external runtime — a deliberate choice for committee
+//! scale (n ≤ 20; a tokio-based transport is a possible future swap,
+//! see node/README.md).
 //!
 //! Topology: every node listens, and opens one outgoing connection to
 //! every peer. A pair of nodes therefore has two connections between
