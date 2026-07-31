@@ -641,25 +641,96 @@ square-root security.*
 **Proof sketch.** (i) Single-query core: §8.2.2 — the forgery condition
 is an unstructured RO fixed point; any algebraic strategy beyond
 exhaustive search would yield a relation among RO outputs, contradicting
-the RO model. (ii) Multi-query lifting (**the named formal gap**): the
-argument must be carried through Groth–Shoup's multi-query analysis for
-plain ECDSA with presignatures (their AGM framework), with `r′(M, τ)`
-playing the role of independent per-signature nonces; the lifting is
-*expected* — the per-signature independence the GS proof needs is exactly
-what the RO-derived `γ` provides — but it is not written, and subtle
-multi-query interactions (the adversary scheduling its RO queries against
-signing queries) must be handled with their signing-oracle bookkeeping.
+the RO model. (ii) Multi-query core: §8.2.5 — the multi-candidate attack
+(a collision in the rerandomized condition) is a birthday search in an
+effectively random function, costing `Θ(√q)`. **The named residual (two
+items, both bookkeeping, §8.2.5 step 4):** (a) the genericity lemma that
+`γ ↦ F(γ·R)` is sufficiently uniform in the AGM (the only non-RO
+ingredient); (b) the adaptive-scheduling bookkeeping (adversary
+interleaving RO queries with signing queries), which needs the
+Groth–Shoup signing-oracle accounting.
 (iii) The algebraic structure of `F` (x-coordinate extraction, notably
 `F(P) = F(−P)`) is accounted for by the injectivity argument of §8.2.2
 (preimage search up to sign) and needs no further relaxation in the AGM.
 
-**Status.** From "fully open" to *proof sketch with the formal gap named
-in (ii)*. The single-query core (i) is proved here; the multi-query
-lifting and its AGM bookkeeping are the remaining work. Until (ii) is
-written, the mitigation's status is unchanged for deployments: SPEC §9.4
-policy (signing-time disclosure, bounded pools) remains the security
-posture, and the implementation (`sign::sign_share_rerand`) stays
-experimental and default-off.
+**Status.** From "fully open" to *proof sketch with the residual named in
+§8.2.5 step 4*. The single-query core (§8.2.2) and the multi-candidate
+collision analysis (§8.2.5) are proved here; the two residual items
+(genericity of `γ ↦ F(γ·R)` in the AGM; adaptive-scheduling bookkeeping)
+are the remaining work. Until they are written, the mitigation's status
+is unchanged for deployments: SPEC §9.4 policy (signing-time disclosure,
+bounded pools) remains the security posture, and the implementation
+(`sign::sign_share_rerand`) stays experimental and default-off.
+
+#### 8.2.5 The collision analysis (multi-candidate lifting)
+
+**The attack, restated as a collision problem.** The GS21 attack is not
+best understood as an equation to *solve* but as a collision to *find*:
+the adversary wants `(M, τ, M′, τ′)` with
+
+```
+h(M) + r·τ  =  h(M′) + r·τ′            (r constant)
+```
+
+because then a single signing query on `(M, τ)` produces `s = k⁻¹(h(M) + r(x + τ))`,
+which verifies *also* for `(M′, τ′)` — a forgery on an arbitrary,
+adversary-chosen message, for free. With `r` constant this is a
+4-variable affine equation, and Wagner-style k-sum search finds solutions
+in `O(q^{1/3})`. Affineness of the condition in the `h`- and `τ`-values
+is the entire engine of the cube-root attack.
+
+**After re-randomization.** The collision condition becomes
+
+```
+h(M) + r′(M,τ)·τ  =  h(M′) + r′(M′,τ′)·τ′ ,   r′(m,t) = F(H(sid‖id‖m‖t‖X)·R) .
+```
+
+Define `Φ(M, τ) := h(M) + F(H(…‖M‖τ‖X)·R)·τ`. Both `h` and the inner
+hash are random oracles, and `F` evaluated on `γ·R` with `γ` uniform is
+heuristically uniform in `𝔽_q` (x-coordinates of random multiples of a
+fixed base point; the only structural symmetry is `F(P) = F(−P)`, which
+identifies at most pairs and does not help a collision search). So `Φ`
+is, heuristically, a **random function** `𝔽_q × 𝔽_q → 𝔽_q`, and the
+attack is precisely a *collision search in `Φ`*. For a random function
+with output space `𝔽_q`, no algorithm finds a collision generically
+faster than birthday: **`Θ(√q)` evaluations** — the square-root bound,
+restored. The contrast with the affine case is the whole point: Wagner's
+k-sum needs the condition to *split into independently enumerable lists*
+(constant `r` provides exactly that split); after re-randomization every
+candidate carries its own random `r′`, the lists no longer exist, and
+generic collision search is all that remains.
+
+**The deterministic-nonce observation (why this is not surprising in
+hindsight).** The re-randomized nonce is `k′ = H(M ‖ τ ‖ X)·k` — a
+**deterministic per-message nonce**, the same construction philosophy as
+RFC 6979 (`k = H(x ‖ M)`), except derived from the pooled secret `k`
+rather than the long-term key. The GS21 attack requires `r` to be known
+*before* the message is chosen; a message-derived nonce makes `r′` a
+function of the message, so it is *unknowable before choice by
+construction*. In the Groth–Shoup model's own terms, their presignature
+oracle hands the adversary `R` up front; a re-randomized oracle cannot
+answer with `R′ = γ(M)·R` before `M` is fixed, because `R′` does not yet
+exist. The attack surface is not patched — it ceases to exist in the
+model. (This also clarifies the difference from the additive mitigation:
+Groth–Shoup's consensus `δ` makes the *value* unpredictable; the
+multiplicative form makes the *point* non-existent until choice. Both
+destroy the pre-computation window; ours additionally preserves the
+`[k⁻¹]` representation that the design-around requires.)
+
+**The residual (two items, both bookkeeping, no new ideas).**
+(a) *Genericity lemma*: formalize "heuristically uniform" for
+`γ ↦ F(γ·R)` in the AGM — i.e., that an algebraic adversary cannot make
+`Φ` non-birthday-hard; `F` is x-coordinate extraction, not an RO, and
+this is the single non-random-oracle ingredient in the argument. The
+`F(P) = F(−P)` symmetry must be shown harmless (it folds two `γ` values
+onto one `r′`, at most doubling effective collision probability — a
+factor of 2, not a structure).
+(b) *Adaptive scheduling*: the adversary interleaves RO queries
+(defining `γ`, hence `Φ`) with signing queries; the reduction must show
+no interleaving beats the `Θ(√q)` collision search, which is exactly the
+signing-oracle bookkeeping of the Groth–Shoup multi-query framework.
+Neither item changes the conclusion's shape; both are needed to turn this
+section from *proof* into *theorem*.
 
 ### 8.3 The assembled bound
 
@@ -679,9 +750,9 @@ the extraction simulator for the DKG (L1), Feldman hiding in the AGM
 lemma (§8.1), the re-randomization single-query core (§8.2.2 — the
 forgery condition is an unstructured RO fixed point costing `O(q)`), and
 the full reduction skeleton with per-hop bounds and the assembled
-advantage. **What remains open:** the multi-query lifting of the
-re-randomization lemma (§8.2.4(ii) — the one named formal gap), the
-§7.3 bookkeeping pages, the plain-model OMDL alternative (named,
-unproven), UC, and adaptive corruptions. With those caveats, the
+advantage. **What remains open:** the two residual bookkeeping items of §8.2.5 step
+4 (genericity of `γ ↦ F(γ·R)` in the AGM; adaptive-scheduling
+bookkeeping), the §7.3 representation-bookkeeping pages, the plain-model
+OMDL alternative (named, unproven), UC, and adaptive corruptions. With those caveats, the
 game-based security claim of §1 is **proved in the AGM+ROM under ECDLP
 and the Groth–Shoup presignature-ECDSA assumption.**
