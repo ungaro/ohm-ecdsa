@@ -136,7 +136,7 @@ In the random-oracle model, under ECDLP in $\GG$, OHM-ECDSA securely realizes th
 
 \paragraph{Proof skeleton (game-based).}
 \textbf{G0 (real).} Forgery is the only live winning condition: soundness-break and framing are impossible outright by C3.
-\textbf{G1 (program the DKG).} The simulator programs the commit-reveal so the joint public key is the challenge $X$ (\emph{gap L1}: extraction against a rushing adversary --- the GJKR caveat; requires an extractable commitment or RO rewinding).
+\textbf{G1 (program the DKG).} The simulator programs the commit-reveal so the joint public key is the challenge $X$ (\emph{L1 closure sketch, SPEC \S11.5}: in the game-based ROM no rewinding is needed --- honest R1 hashes are broadcast with content deferred, adversarial reveal vectors are read from the RO query log at R2 --- any passing reveal was necessarily queried --- and the honest vector is then programmed to land on $X$ via exponent-Lagrange with random adversary-facing shares; UC porting expected but not claimed).
 \textbf{G2 (program every joint VSS)} likewise; fresh $\sid$s keep instances independent.
 \textbf{G3 (simulate DLEQ proofs)} via RO programming, $O(q_H^2/q)$ total.
 \textbf{G4 (program the openings)} using:
@@ -145,13 +145,13 @@ In the random-oracle model, under ECDLP in $\GG$, OHM-ECDSA securely realizes th
 For each degree-$(T{-}1)$ sharing, the adversary's $T{-}1$ shares plus one prescribed value (an opening, or $X$ at point $0$) leave exactly one consistent honest contribution; commitment vectors are programmed in the exponent to match. Hence the simulation of every masked opening is exact (statistical), not computational.
 \end{lemma}
 
-\noindent The only computational residue is Feldman \emph{hiding} of never-opened values (\emph{gap L2}: an ECDLP/OMDL hybrid, or AGM following Groth--Shoup).
+\noindent The only computational residue is Feldman \emph{hiding} of never-opened values (\emph{gap L2, pinned in SPEC \S11.6}: recommended route AGM+ROM, where the hiding hop becomes a lemma --- any algebraic distinguisher yields a discrete log --- leaving ECDLP the sole assumption; plain-model alternative $(T{-}1)$-OMDL with known shares).
 \textbf{G5 (sign from the oracle).} Sign queries are answered via the Groth--Shoup presignature-model oracle; honest $s_j$ are computed by Lagrange through $(0, s)$ and the adversary's shares, consistent with $A\share{s} = m A\share{u} + r A\share{z}$ by construction.
 \textbf{Extraction.} A forgery in the final game is a model forgery:
 \[
 \mathrm{Adv}_{\mathrm{OHM}}(\mathcal{A}) \;\leq\; \mathrm{Adv}_{\mathrm{GS\text{-}EUF}}(\mathcal{F}) \;+\; O(q_H^2/q) \;+\; \varepsilon_{L1} \;+\; \varepsilon_{L2}.
 \]
-Closing L1/L2 and a rigorous composition statement are the remaining work toward a full proof.
+With L1 addressed by the closure sketch (SPEC \S11.5) and L2 pinned to an AGM+ROM hiding lemma (SPEC \S11.6), the remaining work toward a full proof is writing those two lemmas out in full plus a rigorous composition statement.
 
 \section{Patent Design-Around}\label{sec:patent}
 
