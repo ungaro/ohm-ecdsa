@@ -253,4 +253,35 @@ mod tests {
             session_id(b"a", b"bc", None, b"t")
         );
     }
+
+    #[test]
+    fn params_and_committee_enforce_honest_majority() {
+        // The honest-majority bound n >= 2t - 1 is enforced at construction
+        // (SPEC §2): the boundary shape is accepted, one short is rejected.
+        assert!(Params::new(3, 2).is_ok()); // 3 == 2*2 - 1: tightest valid
+        assert!(Params::new(4, 2).is_ok());
+        assert!(matches!(
+            Params::new(2, 2),
+            Err(Error::InvalidParams(_)) // 2 < 3: dishonest majority
+        ));
+        assert!(matches!(Params::new(3, 0), Err(Error::InvalidParams(_))));
+
+        // Committee::new enforces the same bound over explicit ids, plus
+        // id hygiene: no 0 (reserved for the secret), no duplicates.
+        assert!(Committee::new(vec![1, 2, 3], 2).is_ok());
+        assert!(matches!(
+            Committee::new(vec![1, 2], 2),
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            Committee::new(vec![0, 1, 2], 2),
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            Committee::new(vec![1, 1, 2], 2),
+            Err(Error::InvalidParams(_))
+        ));
+        // Non-contiguous survivor sets (§10.3 restarts) are valid.
+        assert!(Committee::new(vec![1, 3, 4, 5, 6], 3).is_ok());
+    }
 }

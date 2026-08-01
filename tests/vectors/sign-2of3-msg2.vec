@@ -1,0 +1,9 @@
+# ohm-ecdsa test vector — DO NOT EDIT BY HAND
+# regenerate: OHM_BLESS_VECTORS=1 cargo test -p ohm-ecdsa --test vectors
+case=sign-2of3-msg2
+presign_id=2
+message=6f686d2d6563647361207465737420766563746f72202332
+pubkey=02f0e59fe5caa11fc776e81327bba5543b5d92957fbf11776ed25d0cef8ed3b8ff
+signature=34bc9ecb65a190db9ec650df05553c95d1821a672aaa0b46f6ebfc033acb58ee59770003a7b687e04e5827f4ffdb90b0d08a09a94a4245650fd6310c8388a1dd
+r=34bc9ecb65a190db9ec650df05553c95d1821a672aaa0b46f6ebfc033acb58ee
+s=59770003a7b687e04e5827f4ffdb90b0d08a09a94a4245650fd6310c8388a1dd
