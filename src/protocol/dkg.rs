@@ -61,6 +61,9 @@ pub struct DkgInstance {
     com: FeldmanCommitment,
     /// Fault injection (tests): deal a wrong share to this party.
     pub(crate) bad_deal: Option<PartyId>,
+    /// Fault injection (tests): reveal a well-formed commitment vector that
+    /// does NOT hash to the R1 commit (F1).
+    pub(crate) bad_reveal: bool,
 }
 
 /// DKG output held by one party.
@@ -131,6 +134,7 @@ impl DkgInstance {
             poly,
             com,
             bad_deal: None,
+            bad_reveal: false,
         };
         (inst, DkgBcast1 { from: me, hash })
     }
@@ -155,10 +159,16 @@ impl DkgInstance {
 
     /// Round 2: reveal the commitment and produce P2P shares for everyone.
     pub fn reveal(&self) -> (DkgBcast2, Vec<DkgP2P>) {
-        let bcast = DkgBcast2 {
-            from: self.me,
-            com: self.com.clone(),
+        // Fault injection (tests): a cheating dealer reveals a well-formed
+        // vector that does NOT hash to its R1 commit (F1) — the finalize
+        // commit-reveal consistency check blames the dealer before any
+        // share check runs.
+        let com = if self.bad_reveal {
+            self.com.add_const(&Scalar::ONE)
+        } else {
+            self.com.clone()
         };
+        let bcast = DkgBcast2 { from: self.me, com };
         let p2p = self
             .committee
             .ids()
@@ -509,6 +519,10 @@ pub struct DkgTamper {
     /// Make this dealer compute a wrong share for this victim (cheating
     /// dealer). The defense does not verify, so the dealer is blamed.
     pub bad_deal: Option<(PartyId, PartyId)>,
+    /// Make this dealer broadcast a reveal whose commitment vector is
+    /// well-formed but does NOT hash to its R1 commit (F1): the
+    /// commit-reveal consistency check blames the dealer.
+    pub bad_reveal: Option<PartyId>,
 }
 
 #[cfg(test)]

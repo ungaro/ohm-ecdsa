@@ -79,6 +79,10 @@ fn deal_fixed_secrets(
                 inst.bad_deal = Some(victim);
             }
         }
+        if tamper.and_then(|t| t.bad_reveal) == Some(i) {
+            // Cheating dealer: the reveal does not match the R1 commit (F1).
+            inst.bad_reveal = true;
+        }
         r1.insert(i, b1);
         insts.push(inst);
     }

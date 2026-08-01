@@ -447,7 +447,7 @@ This is a one-more-discrete-log assumption in the form used by
 Bacho–Loss-style analyses; it is *named, not proved* — it is the plain
 model price for Feldman (rather than Pedersen) commitments.
 
-### 7.3 AGM form (recommended route) — [proved here, with bookkeeping note]
+### 7.3 AGM form (recommended route) — [proved here]
 
 **Lemma (AGM hiding).** In the algebraic group model, for the OHM-ECDSA
 view — commitment vectors to independent random degree-`T−1`
@@ -495,15 +495,52 @@ uniformity and spreads the challenge). Everything else is unchanged:
    zero. Formally, `Adv_dist ≤ ε_DLP + q_H²/2^λ` (the RO-programming
    birthday term from G1–G3, independent of the hiding hop).
 
-**Bookkeeping note (the honest residual).** A journal-grade version
-requires: (i) the representation extractor for the DLEQ statements
-explicitly — all statements are of the form `z·B == T + c·C` with `B, C`
-in the basis, so representations are read off directly, but this must be
-written; (ii) the argument that the *simulator's own* programmed points
-remain in the AGM basis (they are linear combinations of basis elements
-with simulator-known coefficients — immediate); (iii) the union bound
-over instances. None of these involves a new idea; they are two pages of
-careful indexing, left for the full version. ∎
+**Representation bookkeeping (discharged).** The three items the earlier
+version of this section left for the full version:
+
+(i) *The DLEQ representation extractor, explicitly.* Every Chaum–Pedersen
+statement the adversary proves has the shape: bases `B₁, B₂` in the seen
+basis, statement points `U₁ = x·B₁, U₂ = x·B₂`, announcement
+`T₁ = w·B₁, T₂ = w·B₂`, challenge `c = H(…)`, response `z = w + c·x`;
+verification checks `z·B_i == T_i + c·U_i` (`i = 1, 2`). In the AGM the
+adversary's outputs `T₁, T₂, U₁, U₂` arrive with representation vectors
+in the seen basis `{G, Y, c_i·Y, extracted adversarial points,
+programmed simulator points}`; the scalars `z, c` need no
+representation. Rewrite each verification equation as a linear relation
+`R_i := z·B_i − T_i − c·U_i = O` and read off its coefficient vector on
+the basis: the coefficient of `R_i` on any challenge coordinate (`Y`, or
+`c_i·Y`) is a publicly computable linear combination of `z`, `c`, and
+the representations of `T_i, U_i`. If `R_i = O` holds in one world
+(real embedding) but not the other (zeroized), that coefficient is
+nonzero; setting the real-world relation equal to the zeroized-world one
+and solving the resulting one-unknown linear equation yields `log_G Y`
+(up to the known factor `c_i⁻¹`). A distinguishing DLEQ transcript
+therefore extracts the challenge discrete log directly — no rewinding,
+no forking, exactly the extraction the lemma requires.
+
+(ii) *The simulator's own programmed points remain in the AGM basis.* By
+induction over rounds. Base: `G`, `Y`, and the `c_i·Y` are basis
+elements by definition. Step: every point the simulator hands the
+adversary is either (a) a commitment vector point obtained as a
+Vandermonde solution over position constraints whose entries are already
+basis combinations with simulator-known coefficients (public points and
+`s·G` for simulator-chosen scalars `s`, §6.2/G4) — hence a known linear
+combination of basis elements; (b) a simulated DLEQ announcement
+computed as `T_i := z·B_i − c·U_i` from basis combinations `B_i, U_i`
+with known coefficients — likewise; or (c) an extracted adversarial
+point, which is in the basis by the AGM interface itself. So at every
+round the seen basis grows only by points with simulator-known
+representations, and the coefficient-reading of (i) stays available.
+
+(iii) *The union bound over instances — avoided, not paid.* The
+reduction embeds *all* never-opened instances simultaneously as
+independent random multiples `c_i·Y` of the single challenge, with known
+`c_i`. A distinguishing relation against *any* instance yields
+`c_i · log_G Y`, hence `log_G Y`, in one reduction run. The hop is
+therefore a single hybrid with advantage `ε_DLP`, independent of the
+instance count — no factor-`Q` union loss. (Contrast §7.2's sequential
+plain-model hybrid, which pays the union and needs the `(T−1)`-OMDL
+assumption instead.) ∎
 
 **Remark (why AGM and not plain).** §7.1 shows single-instance hiding is
 exactly DL — so no hardness amplification is *needed*; the AGM is used
@@ -978,8 +1015,8 @@ simulator's job).
 ### 9.5 Recommendation
 
 Do not start the UC proof inside this document's arc. The honest
-sequencing is: (i) finish the game-based proof's remaining bookkeeping
-(§7.3 pages) and get it externally reviewed; (ii) check whether
+sequencing is: (i) get the game-based proof externally reviewed (the
+§7.3 bookkeeping it previously waited on is now written); (ii) check whether
 Groth–Shoup 2022/506's model is UC-flavored — if so, it is the template
 for §9.3(2) and halves the work; (iii) pursue UC as a joint follow-up
 paper with an academic collaborator, where the expulsion-budget
@@ -1000,12 +1037,14 @@ sessions, the G3 birthday term, the L2 hop priced per the chosen route
 
 **What this document establishes now:** correctness (C1), blame soundness
 and framing-freeness (C3), uniformity with a bounded-bias lemma (C4),
-the extraction simulator for the DKG (L1), Feldman hiding in the AGM
-(L2, modulo the representation bookkeeping of §7.3), the composition
+robustness with exact blame (C6, §8.4), abort-distribution
+indistinguishability (§8.4 — SPEC §11.3(4) closed), the extraction
+simulator for the DKG (L1), Feldman hiding in the AGM
+(L2, §7.3 AGM form — no factor-`Q` union loss), the composition
 lemma (§8.1), the re-randomization single-query core (§8.2.2 — the
 forgery condition is an unstructured RO fixed point costing `O(q)`), and
 the full reduction skeleton with per-hop bounds and the assembled
-advantage. **What remains open:** the §7.3 representation-bookkeeping pages, the
+advantage. **What remains open:** the
 plain-model OMDL alternative (named, unproven), UC (§9 — roadmap, not a
 gap), and adaptive corruptions. The re-randomization lemma is a
 **proof sketch with one named heuristic and one model note** (G1:
@@ -1014,6 +1053,73 @@ are ROM — the standard two-layer composition, §8.2.6 case (3)). With
 those caveats,
 the game-based security claim of §1 is **proved in the AGM+ROM under
 ECDLP and the Groth–Shoup presignature-ECDSA assumption.**
+
+### 8.4 Lemma C6 (robustness) and the abort-distribution lemma — [proved here]
+
+SPEC §11.4 defers both as "independent, simpler lemmas"; they are
+discharged here. Neither adds a term to the bound of §8.3.
+
+**Lemma (C6, robustness).** *Let `f ≤ T−1` parties be malicious. In the
+§10.4 robust variants (`open_robust` for the presign openings,
+`generate_robust` for triples, `combine_robust` for signing), the
+protocol completes and delivers the correct output, and the blamed set
+is exactly the set of deviating senders.*
+
+**Proof.** By C3 (§3.1–3.2), every share that fails its public
+point-equality check is detected (detection is unconditional) and every
+honest party's share passes (C1) — so filtering removes exactly the
+invalid shares and never an honest one. What remains is, for every
+committed sharing, at least `n − f ≥ (2T−1) − (T−1) = T` valid shares,
+and validity means the share lies on the dealt degree-`(T−1)` polynomial
+(the Feldman binding check is against the dealt commitment, so a passing
+share is a point of that polynomial). `T` points determine a
+degree-`(T−1)` polynomial, so the filtered set reconstructs the dealt
+value uniquely (C1). By phase: **openings** (Presign P2/P4) —
+`open_robust` interpolates the dealt mask from the filtered set;
+**signing** — `combine_robust` interpolates `s` from the `≥ T` valid
+`s_j` (each verified against the public `m·A[u] + r·A[z]`); **triples
+T3** — the cheating dealer's *committed* re-sharing polynomial is
+uniquely determined by the `≥ T` valid re-shares the honest parties
+hold, so it is reconstructed publicly and the product combine proceeds
+(exclusion alone is impossible: `n − f` can be as low as `T`, below the
+`2T−1` product points `γ` needs — SPEC §11.2 C6's phase split).
+**Dealing phases** (F1–F3) are not continuable — the adversary is not
+yet bound to enough public material — and go to §10.3 expel-and-restart,
+which preserves safety (poisoned sid/id per §10.3(2)) and restores
+liveness exactly when the survivor count is `≥ 2T−1`; the policy never
+lowers `T` (`policy::restart_committee`). Blame exactness is C3.2
+(framing-freeness) applied to each filtered share. ∎
+
+**Lemma (abort-distribution indistinguishability; SPEC §11.3(4)).**
+*In the G1–G5 simulation of §5–§8, the joint distribution of abort
+events — whether an abort occurs, its phase, and the blamed set — is
+identical to the real execution's, up to the per-hop bounds already
+charged. No separate leakage term is needed.*
+
+**Proof.** Inspect every abort trigger in the protocol (SPEC §10.1,
+F1–F8): each is a boolean predicate over **public** verification
+outcomes — the commit-reveal hash match (F1), Feldman point-equality of
+a dealt or re-shared share (F2), DLEQ verification (F3), opening-share
+point-equality (F4), nonce-point equality `R_j == EvalCom(A[k], j)`
+(F5), signature-share point-equality (F6), final ECDSA verification
+(F7), and the signed-envelope/echo rules (F8) — plus the zero-value
+checks `v = 0` / `r = 0`, which are equality tests on public points. In
+every hybrid hop the simulator evaluates these same predicates: on
+values it produced itself (then the outcome is determined by its own
+choices, identically distributed to the real execution's whenever the
+hop's value distributions match) and on adversary messages (verified
+with the same public checks as the real protocol). Hence any difference
+in abort behavior between adjacent hybrids is a distinguisher for that
+hop's value distributions and is charged to that hop's bound
+(`Q·ε_L1`, `O(q_H²/q)`, `ε_L2`); no abort-specific term remains. The
+blamed set is likewise reproduced: by C3.2 the blame assignment is a
+function of the same public verification outcomes, so identical outcomes
+give identical blame. ∎
+
+**Consequence for C2.** The privacy simulator's abort behavior needs no
+separate argument: aborts carry no information beyond the public
+verification transcript, which the simulator already reproduces. This
+closes SPEC §11.3(4).
 
 ---
 
@@ -1719,8 +1825,9 @@ a resolution path:*
   (static corruptions, honest majority) in the EC-GGM+ROM, under the
   Groth–Shoup presignature-ECDSA assumption.* The proof is the U1
   assembly of §12.1 plus the §13.2 simulation with the §13.3 trapdoor;
-  its only named debts are the §7.3 representation bookkeeping and the
-  external-review pass.
+  the §7.3 representation bookkeeping is now written (§7.3 —
+  DLEQ extractor, basis induction, simultaneous embedding), so its only
+  named debt is the external-review pass.
 - **Theorem U1 (UC):** unchanged — the roadmap of §9–§11 plus the same
   trapdoor mechanism for the key-involving openings; the ε′-obstruction
   was the last novel obstacle, and §13.2 is the candidate answer.

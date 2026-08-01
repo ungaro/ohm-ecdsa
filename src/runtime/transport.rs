@@ -911,6 +911,10 @@ pub fn drive_dkg_signed<R: RngCore>(
                 inst.bad_deal = Some(victim);
             }
         }
+        if tamper.and_then(|t| t.bad_reveal) == Some(i) {
+            // Cheating dealer: the reveal does not match the R1 commit (F1).
+            inst.bad_reveal = true;
+        }
         transport.broadcast(Envelope::broadcast(
             sid,
             phase,
@@ -1060,6 +1064,10 @@ pub fn drive_dkg<R: RngCore>(
                 // Cheating dealer: wrong share *and* wrong §6.1 defense.
                 inst.bad_deal = Some(victim);
             }
+        }
+        if tamper.and_then(|t| t.bad_reveal) == Some(i) {
+            // Cheating dealer: the reveal does not match the R1 commit (F1).
+            inst.bad_reveal = true;
         }
         transport.broadcast(Envelope::broadcast(
             sid,

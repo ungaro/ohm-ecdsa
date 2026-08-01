@@ -10,7 +10,7 @@
 //!
 //! | Class | SPEC §10.1 fault (phase) | Injection hook | Covered by |
 //! |-------|--------------------------|----------------|------------|
-//! | F1 | reveal hash ≠ committed hash (KeyGen/Triples/Presign P1) | no sim hook exists — injected at the message level: a decoy reveal swapped into `DkgInstance::finalize` | `f1_reveal_hash_mismatch_blames_dealer` |
+//! | F1 | reveal hash ≠ committed hash (KeyGen/Triples/Presign P1) | `DkgTamper::bad_reveal` (dealer's R2 reveal is well-formed but does not hash to its R1 commit) | `f1_reveal_hash_mismatch_blames_dealer` |
 //! | F2 | dealt share fails `v_j·G == EvalCom(A, j)`, §6.1 complaint (dealing) | `DkgTamper::bad_deal` (dealer's defense invalid ⇒ dealer blamed) | `f2_keygen_bad_deal_blames_dealer`, `f2_refresh_bad_deal_blames_dealer`, `f2_reshare_bad_deal_blames_dealer` |
 //! | F2 | §6.1 false accusation (defense verifies ⇒ accuser blamed) | `DkgTamper::corrupt_share` | `f2_keygen_false_accusation_blames_accuser` |
 //! | F2 | wrong re-shared share (Triples T2/T3) | `TripleTamper::bad_reshare` | `f2_triples_bad_reshare_blames_dealer`, `f2_presign_triple_session_fault_blames_dealer` |
@@ -38,7 +38,7 @@ use k256::elliptic_curve::scalar::IsHigh;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::{ProjectivePoint, Scalar};
 
-use ohm_ecdsa::dkg::{DkgInstance, DkgTamper};
+use ohm_ecdsa::dkg::DkgTamper;
 use ohm_ecdsa::open::open;
 use ohm_ecdsa::presign::{KeyShare, PresignTamper};
 use ohm_ecdsa::refresh::ReshareTamper;
@@ -77,55 +77,25 @@ fn assert_abort(err: Error, phase: Phase, blamed: &[PartyId]) {
 
 #[test]
 fn f1_reveal_hash_mismatch_blames_dealer() {
-    // No sim-level hook flips a reveal (the drivers build each party's
-    // reveal from its own committed state), so inject at the message level:
-    // party 2 reveals a commitment vector that does NOT hash to its R1
-    // commit (a decoy instance's reveal). Every honest party's finalize
-    // must blame dealer 2, and only dealer 2.
+    // Dealer 2 reveals a well-formed commitment vector that does NOT hash
+    // to its R1 commit (`DkgTamper::bad_reveal` perturbs the reveal, not
+    // the commit). The commit-reveal consistency check runs before any
+    // share check, so the abort blames dealer 2, and only dealer 2.
     let params = Params::new(3, 2).unwrap();
-    let sid = b"blame/f1";
     let mut rngs = sim::make_rngs(3, 101);
-
-    let mut r1 = BTreeMap::new();
-    let mut insts = Vec::new();
-    for (k, &i) in params.parties().iter().enumerate() {
-        let (inst, b1) = DkgInstance::start(params, sid, b"tag", i, &mut rngs[k]);
-        r1.insert(i, b1);
-        insts.push(inst);
-    }
-    let mut r2 = BTreeMap::new();
-    let mut p2p = Vec::new();
-    for inst in &insts {
-        let (b2, shares) = inst.reveal();
-        r2.insert(inst.me, b2);
-        p2p.extend(shares);
-    }
-    // Fault: dealer 2's reveal is replaced by a decoy (same shape, wrong hash).
-    let mut decoy_rng = sim::make_rngs(1, 999);
-    let (decoy, _) = DkgInstance::start(params, sid, b"tag", 2, &mut decoy_rng[0]);
-    let (decoy_b2, _) = decoy.reveal();
-    r2.insert(2, decoy_b2);
-
-    // Every honest party blames dealer 2 alone.
-    for me in [1, 3] {
-        let mine: BTreeMap<PartyId, Scalar> = p2p
-            .iter()
-            .filter(|m| m.to == me)
-            .map(|m| (m.from, m.share))
-            .collect();
-        let defenses: BTreeMap<PartyId, Scalar> =
-            insts.iter().map(|d| (d.me, d.defend(me))).collect();
-        let err = insts[me - 1]
-            .finalize(Phase::KeyGen, &r1, &r2, &mine, &defenses)
-            .unwrap_err();
-        match err {
-            Error::Abort { abort } => {
-                assert_eq!(abort.phase, Phase::KeyGen);
-                assert_eq!(abort.blamed, vec![2]);
-                assert_eq!(abort.detail, "commit-reveal hash mismatch");
-            }
-            other => panic!("expected identifiable abort, got {other:?}"),
+    let tamper = DkgTamper {
+        bad_reveal: Some(2),
+        ..Default::default()
+    };
+    let err =
+        sim::run_keygen_with_tamper(&params, b"blame/101", &mut rngs, Some(&tamper)).unwrap_err();
+    match err {
+        Error::Abort { abort } => {
+            assert_eq!(abort.phase, Phase::KeyGen);
+            assert_eq!(abort.blamed, vec![2]);
+            assert_eq!(abort.detail, "commit-reveal hash mismatch");
         }
+        other => panic!("expected identifiable abort, got {other:?}"),
     }
 }
 
