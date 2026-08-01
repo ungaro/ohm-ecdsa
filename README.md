@@ -445,7 +445,7 @@ out-of-band bundle exchange itself (ops, not code), key rotation
 * Visual walkthrough (Alice/Bob sequence diagrams) → `docs/diagrams.md`
 * Paper draft (ePrint-style) → `docs/paper/OHM-ECDSA.md` (Markdown) and `docs/paper/main.pdf` (typeset, built from `docs/paper/main.tex`)
 * Protocol design, notation, diagrams → [`SPEC.md`](./SPEC.md) §1–§10
-* Security claims, proof obligations, and the game-based proof skeleton → SPEC §11 (esp. §11.4); the full proof write-up → `docs/proof/PROOF.md`
+* Security claims, proof obligations, and the game-based proof skeleton → SPEC §11 (esp. §11.4); the full proof write-up → `docs/proof/PROOF.md` (empirical probe of the one named heuristic: `analysis/g1_probe.sage`)
 * Patent design-around analysis → SPEC §12
 * FTO briefing package (for patent counsel) → `docs/fto-briefing.md`
 * Deployment, transport, and hardening checklists → SPEC §13

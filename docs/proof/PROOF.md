@@ -798,6 +798,21 @@ load-bearing for the GS21 *attack* we are mitigating (their cube-root
 search assumes the same `F`-behavior to find its special ratios), so
 adopting it costs the proof nothing the attack did not already concede.
 
+**Empirical probe (`analysis/g1_probe.sage`).** The heuristic and the
+§8.2.5 collision analysis are pressure-tested at small scale (secp256k1's
+equation `y² = x³+7` over prime-order toy fields, `N` up to ~10⁶):
+a full-domain enumeration finds `Φ` statistically indistinguishable from
+a random function (colliding-pair ratio 1.0001 vs a same-size control);
+the 2-to-1 genericity lemma holds exactly; the F-distribution has
+`N_eff/N = 0.500` (non-uniformity is a constant factor `√2`, not a
+structure); and fitted work-exponents for eight adversarial strategies —
+including all the degenerate `τ`-schedules of §8.2.5 — come out at
+0.47–0.50 (birthday) or 0.91–1.00 (preimage), while a Wagner 4-sum
+positive control on the *affine* (constant-`r`, GS21) condition recovers
+the cube-root exponent 0.31, confirming the harness can detect
+sub-birthday structure when it exists. Small-scale evidence, not a proof;
+run with `sage analysis/g1_probe.sage`.
+
 **Lemma (scheduling).** No interleaving of RO queries with signing
 queries yields forgery advantage exceeding
 `O(q_H²/q) + O(q_s·q_H/q) + Adv_GS21-Thm6`, where `q_s` signing queries
