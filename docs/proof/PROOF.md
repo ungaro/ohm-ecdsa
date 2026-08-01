@@ -4,7 +4,10 @@
 
 **Working document v0.2.** Companion to `SPEC.md` §11. Status per lemma is
 marked **[proved here]**, **[proof sketched]**, or **[open]**. The model is
-game-based security in the random-oracle model (ROM); no rewinding is used.
+game-based security with **no rewinding anywhere**; the assumption base is
+marked per component — ROM for C3/C4 and L1, AGM+ROM (under ECDLP and the
+Groth–Shoup presignature-ECDSA assumption) for the main claim of §8.3, and
+EC-GGM+ROM for the §13 ε′-opening resolution and the U1 statement of §13.4.
 This document supersedes the "sketch" phrasing of SPEC §11 for the components
 marked [proved here]; the ideal-functionality-level composition (UC or
 stand-alone with sessions, §11.3(5)) remains future work and is stated
@@ -758,7 +761,7 @@ asserted — and it is exactly the heuristic the GS21 attack itself
 requires, so adopting it concedes nothing the attack did not already
 concede.
 
-#### 8.2.6 Closing the residual — [analysis, with gaps G1/G2 named in §8.2.4]
+#### 8.2.6 Closing the residual — [analysis, with gap G1 and the model note named in §8.2.4]
 
 **Lemma (genericity of `F∘(·R)`).** Let `R ∈ 𝔾`, `R ≠ O`, and
 `F: 𝔾 → 𝔽_q` the ECDSA x-coordinate extraction. Then:
@@ -802,7 +805,7 @@ adopting it costs the proof nothing the attack did not already concede.
 §8.2.5 collision analysis are pressure-tested at small scale (secp256k1's
 equation `y² = x³+7` over prime-order toy fields, `N` up to ~10⁶):
 a full-domain enumeration finds `Φ` statistically indistinguishable from
-a random function (colliding-pair ratio 1.0001 vs a same-size control);
+a random function (colliding-pair ratio 1.0000 vs a same-size control);
 the 2-to-1 genericity lemma holds exactly; the F-distribution has
 `N_eff/N = 0.500` (non-uniformity is a constant factor `√2`, not a
 structure); and fitted work-exponents for eight adversarial strategies —
@@ -1118,7 +1121,7 @@ interface and with the consumption state machine internalized (§1):
   [GS22svc] — note: *their* theorem covers the additive mitigation, ours
   covers the multiplicative one; there is no existing citable result for
   the multiplicative form, which is why §8.2 had to exist). Status:
-  **proof sketch (§8.2.4), gaps G1/G2 named**.
+  **proof sketch (§8.2.4), gap G1 and the model note named**.
 * **Theorem U3 (UC-DKG against rushing).** *The commit-reveal DKG of
   SPEC §6 is UC-simulatable against a rushing adversary via the
   deferred-content technique (honest R1 hashes programmed at reveal
@@ -1519,7 +1522,9 @@ upon adoption of Path A (a protocol decision — it weakens the key
 sharing's binding from perfect to computational and therefore requires
 sign-off under the project's "never weaken verification checks" rule).
 Path B has been eliminated with evidence; Path D is documented at its
-cost.*
+cost.* **Superseded by §13: the obstruction is resolved there without
+Path A (no protocol change, no weakened binding); see §13.4 for the
+current U1 statement.**
 
 ### 12.4 What the assembly already establishes without the decision
 
@@ -1542,12 +1547,16 @@ Independently of the Path A/B choice, the assembly verifies:
   not a *security* hole in the real protocol — it is a *proof* hole in
   the simulation argument for the online-involving-key opening.
 
-**Recommendation.** Take Path A as a protocol decision (Pedersen
-commitment for `⟦x⟧` only, with the binding trade-off documented in
-SPEC §4.2/§6 and the blame taxonomy annotated accordingly), then the U1
-assembly completes with no further novel work. Path B is the cheaper
-alternative *if* the GJKR96 mechanism verifies; assign it a literature
-check first.
+**Recommendation.** *Superseded by §13.* The §13 resolution (the
+simulator computes the public opening `ε′ = x* − β′(0)` itself — the
+reduction samples `x*` in its challenger role, so the "trapdoor" is
+simulator state, not an assumption and not a protocol change) closes the
+obstruction **without Path A**: the key sharing stays perfectly-binding
+Feldman, and no verification check is weakened. Path A remains documented
+above as the fallback if §13's simulation fails external review. Path B
+was assigned its literature check (§12.3): outcome negative. The earlier
+version of this paragraph recommended Path A with a Path B literature
+check first; both are now settled.
 
 ---
 

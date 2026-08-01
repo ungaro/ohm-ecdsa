@@ -110,7 +110,10 @@ keep those citations accurate when changing code.
   pins `base64ct 1.6.0` / `zeroize 1.8.2` for the same reason — the whole
   tree builds with the workspace MSRV 1.75 (verify with
   `cargo +1.75.0 check --workspace --all-targets`). `Cargo.lock` is
-  committed — keep it reproducible.
+  committed — keep it reproducible. Core dev-dependencies (tests only,
+  never in `[dependencies]`): `proptest` (`=1.5.0`, pinned for MSRV —
+  newer releases pull `tempfile`/`getrandom` versions needing edition2024
+  toolchains).
 - Parties are numbered `1..=n` (`PartyId = usize`); evaluation point 0 is
   reserved for the secret.
 - Fiat–Shamir / hashing domain separation uses versioned tags in
@@ -123,15 +126,29 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
 
 - `cargo build` / `cargo build --workspace` — build the library and the
   node crate.
-- `cargo test -p ohm-ecdsa` — runs 30 unit tests (inline `#[cfg(test)]`
+- `cargo test -p ohm-ecdsa` — runs 31 unit tests (inline `#[cfg(test)]`
   modules in `src/lib.rs`, `src/primitives/{shamir,vss,open,dleq}.rs`,
   `src/protocol/{dkg,triples}.rs`, `src/runtime/{policy,transport}.rs` —
   including the `wire_*` canonical `Encode`→`Decode` roundtrip and
-  malformed-input tests),
-  49 integration tests in `tests/e2e.rs`, and 5 example smoke tests in
+  malformed-input tests, and the honest-majority/Committee parameter
+  enforcement test),
+  49 integration tests in `tests/e2e.rs`, 5 example smoke tests in
   `tests/examples.rs` (each narrative example is run via `cargo run
-  --example` and checked for its guarantee lines). All 84 pass at the
-  time of writing.
+  --example` and checked for its guarantee lines),
+  20 fault-injection tests in `tests/blame_matrix.rs` (the SPEC §10 F1–F8
+  blame matrix: each fault class injected via the tamper hooks, exact
+  `phase`+`blamed` asserted, §10.4 robust blame-and-continue variants,
+  and the framing-freeness control; F7 unreachable by construction and
+  F8 wire-level — both documented in the file header),
+  12 property-based tests in `tests/properties.rs` (proptest: Shamir
+  reconstruction/subset-independence, VSS homomorphism + zero-padding,
+  verified openings, DLEQ roundtrip/rejection, triple multiplicativity,
+  presign/sign invariants — capped case counts for the protocol-level
+  ones), and 6 deterministic test-vector cases in `tests/vectors.rs`
+  (byte-pinned keygen/presign/sign outputs under `tests/vectors/*.vec`;
+  each sign vector re-parsed and k256-verified; regenerate with
+  `OHM_BLESS_VECTORS=1 cargo test -p ohm-ecdsa --test vectors`). All 123
+  pass at the time of writing.
 - `cargo test -p ohm-ecdsa-node` — 109 tests: 3 M1 tests in
   `node/tests/mesh_keygen.rs` (3 nodes on localhost ephemeral ports:
   keygen over `MeshTransport` reconstructs the joint key, a cheating
