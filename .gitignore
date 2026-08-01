@@ -1,3 +1,7 @@
 /target
 /fuzz/target
 /fuzz/artifacts
+
+# Sage preparse artifacts and Python bytecode (analysis/)
+*.sage.py
+__pycache__/
