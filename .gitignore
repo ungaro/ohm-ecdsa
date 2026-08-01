@@ -6,3 +6,11 @@
 # Sage preparse artifacts and Python bytecode (analysis/)
 *.sage.py
 __pycache__/
+
+# Secrets (RPC endpoints, storage keys) — env-var/config-file only, never committed
+.env
+.env.local
+.env.*
+!.env.example
+!.env.sample
+!.env.template
