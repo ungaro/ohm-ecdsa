@@ -1,0 +1,29 @@
+[package]
+name = "ohm-ecdsa-wasm"
+version = "0.1.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+description = "wasm-bindgen wrapper over ohm-ecdsa for the no-build explainer site (frontend/). Exposes REAL protocol values under deterministic seeds."
+
+# Workspace-excluded (same pattern as fuzz/ and demo-evm/): the wasm
+# crate is its own workspace so the main workspace (MSRV 1.75,
+# dependency-pure core) never builds it.
+[workspace]
+members = ["."]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ohm-ecdsa = { path = "../.." }
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+rand = "0.8"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+# The core's k256/ff dep tree pulls `rand_core` with its DEFAULT features
+# (hence getrandom), and feature unification makes that impossible to
+# strip from here without touching the core — so the wasm build needs
+# getrandom's `js` backend to COMPILE for wasm32-unknown-unknown. It is
+# never CALLED: every RNG in this wrapper is a seeded StdRng.
+getrandom = { version = "0.2", features = ["js"] }

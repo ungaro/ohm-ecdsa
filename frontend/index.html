@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OHM-ECDSA — threshold signatures, visualized</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="banner">Unaudited research code — not for securing real assets (SPEC §13)</div>
+  <nav class="nav">
+    <span class="brand">OHM-ECDSA</span>
+    <span class="links">
+      <a href="#" class="active">Shamir + VSS</a>
+      <a href="#" class="soon" title="frontend milestone F2">Protocol arc <em>(F2)</em></a>
+      <a href="#" class="soon" title="frontend milestone F3">Live demo <em>(F3)</em></a>
+    </span>
+  </nav>
+  <p class="pitch">
+    An honest-majority threshold ECDSA protocol over secp256k1 — no single
+    party ever holds the key, any <code>t</code> of <code>n</code> sign, and
+    every share is checked against public Feldman commitments so a cheater
+    is <em>named</em>, not just rejected. Everything on this page is computed
+    live in your browser: the protocol's own Rust code, compiled to WebAssembly.
+  </p>
+</header>
+
+<main>
+
+<section class="card" id="shamir-card">
+  <h2>1 · Shamir sharing + Feldman verification <span class="spec-ref">SPEC §4.1–4.2</span></h2>
+  <p class="explainer">
+    A dealer samples a degree-(<code>t</code>−1) polynomial whose constant term
+    is the secret; party <code>j</code> receives the evaluation <code>p(j)</code>.
+    Any <code>t</code> shares interpolate <code>p(0)</code>; fewer learn nothing.
+    The dealer also publishes <code>A = (a₀·G, a₁·G, …)</code> — the Feldman
+    commitment — so every share can be checked: <code>share·G == Σ j<sup>ℓ</sup>·A<sub>ℓ</sub></code>.
+    Deal below, verify every share, then reconstruct.
+  </p>
+
+  <div class="controls">
+    <label>seed <input id="seed" type="number" value="42" min="0"></label>
+    <label>t <input id="t" type="number" value="2" min="1" max="12"></label>
+    <label>n <input id="n" type="number" value="3" min="1" max="12"></label>
+    <button id="redeal">re-deal</button>
+    <span id="wasm-status" class="muted">loading wasm…</span>
+  </div>
+
+  <canvas id="plot" width="960" height="420"></canvas>
+  <p class="caption">
+    The curve is the real polynomial, projected to f64 for display (the
+    demo deals small coefficients so it is drawable; every check below runs
+    over the full 256-bit field). Point 0 — the secret — is highlighted.
+  </p>
+
+  <table id="shares" class="shares">
+    <thead>
+      <tr><th>reconstruct?</th><th>party</th><th>share (hex)</th><th>Feldman check</th><th>cheat</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <div id="recon" class="recon muted">select shares to reconstruct</div>
+  <p class="caption">
+    Flip a share with its cheat button: the Feldman badge fires ✗ — the wrong
+    value fails against the public commitment. In the full protocol this is
+    where the cheating party gets <em>named</em> (identifiable abort, SPEC §10);
+    here you see the primitive that makes naming possible.
+  </p>
+</section>
+
+<section class="card" id="keygen-card">
+  <h2>2 · The real 2-of-3 committee keygen <span class="spec-ref">SPEC §6</span></h2>
+  <p class="explainer">
+    Not a mock — this card runs the protocol's commit-reveal Pedersen DKG
+    (<code>sim::run_keygen</code>, the exact code path the test suite and the
+    Sepolia demo drive) with your seed. Nobody ever assembles the joint key
+    <code>x</code>; each party leaves with only its share. The same code
+    signed a real EIP-1559 transaction on Sepolia
+    (<a href="https://sepolia.etherscan.io/tx/0x96914c199b8efee5d4e5376e110330ea2808651830210444a6b985ad9e1b9fb9">on-chain record</a>;
+    see <code>demo-evm/README.md</code> in the repo — including the k-reuse
+    incident it teaches).
+  </p>
+  <div id="keygen-out" class="keygen-out muted">waiting for wasm…</div>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  ohm-ecdsa · reference implementation of an unreviewed protocol draft ·
+  all values on this page are deterministic under the seed and reproducible
+</footer>
+
+<script type="module" src="shamir.js"></script>
+</body>
+</html>

@@ -3,6 +3,8 @@
 /fuzz/artifacts
 /demo-evm/target
 /demo-evm/data
+/frontend/pkg
+/frontend/node_modules
 
 # Sage preparse artifacts and Python bytecode (analysis/)
 *.sage.py
