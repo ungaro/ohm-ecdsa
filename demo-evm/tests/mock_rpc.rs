@@ -14,7 +14,7 @@ use std::time::Duration;
 use ohm_ecdsa_demo_evm::json::{self, Json};
 use ohm_ecdsa_demo_evm::tx::hex_encode;
 use ohm_ecdsa_demo_evm::{
-    run_demo, DemoConfig, DemoError, DemoReport, DEFAULT_VALUE_WEI, SEPOLIA_CHAIN_ID,
+    run_demo, DemoConfig, DemoError, DemoReport, Driver, DEFAULT_VALUE_WEI, SEPOLIA_CHAIN_ID,
 };
 
 /// CONSTRUCTED Sepolia-shaped receipt (status 1, plain transfer).
@@ -196,6 +196,8 @@ fn cfg(url: &str, broadcast: bool) -> DemoConfig {
         to: [0x35u8; 20],
         value_wei: DEFAULT_VALUE_WEI,
         broadcast,
+        driver: Driver::Sim,
+        data_dir: std::path::PathBuf::new(),
         receipt_interval: Duration::from_millis(10),
         receipt_timeout: Duration::from_secs(5),
     }

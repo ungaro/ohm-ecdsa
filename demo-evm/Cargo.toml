@@ -14,6 +14,7 @@ members = ["."]
 
 [dependencies]
 ohm-ecdsa = { path = ".." }
+ohm-ecdsa-node = { path = "../node" }
 k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
 tiny-keccak = { version = "2", features = ["keccak"] }
 rand = "0.8"

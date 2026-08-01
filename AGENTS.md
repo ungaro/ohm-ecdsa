@@ -149,7 +149,7 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
   each sign vector re-parsed and k256-verified; regenerate with
   `OHM_BLESS_VECTORS=1 cargo test -p ohm-ecdsa --test vectors`). All 123
   pass at the time of writing.
-- `cargo test -p ohm-ecdsa-node` — 109 tests: 3 M1 tests in
+- `cargo test -p ohm-ecdsa-node` — 110 tests: 3 M1 tests in
   `node/tests/mesh_keygen.rs` (3 nodes on localhost ephemeral ports:
   keygen over `MeshTransport` reconstructs the joint key, a cheating
   dealer is blamed with a verifying `BlameToken`, forged/unknown-sender/
@@ -235,6 +235,12 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
   for TWO different keys from two independent keygens — each signature
   verifies under its own X — and a bad R1 opening share is blamed by
   every node in `Phase::Sign`),
+  1 pre-hashed-message test in `node/tests/party_scalar.rs`
+  (`sign_stored_scalar` over a caller-provided message scalar — for
+  chains whose signed payload is an externally-computed hash, e.g. the
+  EVM keccak sighash: 3-node keygen → `presign_stored` → sign verifies
+  with k256 under the joint key, low-s, and a second sign with the same
+  presig id fails the durable single-use consume),
   15 M3b tests in `node/tests/persist.rs` (the durable store
   survives drop/reopen, consumed ids stay consumed across a simulated
   crash, duplicate inserts rejected live/consumed/on reopen, wrong-key
@@ -347,14 +353,20 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
   `docs/proof/PROOF.md` §8.2.6.
 - `cd demo-evm && cargo test` / `cargo run` — the EVM testnet demo
   (workspace-EXCLUDED like `fuzz/`, own `Cargo.toml`/`Cargo.lock`; deps
-  beyond the core: `tiny-keccak` only). M1 is local-only: hand-rolled
-  RLP + EIP-1559 sighash, a 2-of-3 committee arc (keygen → presign →
-  sign with the sighash as the message scalar — the protocol layer takes
-  `m: &Scalar`, no core change), y-parity from `presig.big_r` flipped by
-  low-`s` normalization, and `VerifyingKey::recover_from_prehash` as the
-  local ecrecover check. Prints a broadcast-ready signed Sepolia
-  transfer. M2 (JSON-RPC broadcast) and M3 (per-node drivers, soak,
-  Plume) are roadmap.
+  beyond the core + node: `tiny-keccak`, `ureq` 2.12.1). Two drivers
+  behind `--driver`: `sim` (M1/M2 — in-process committee, hand-rolled
+  RLP + EIP-1559 sighash, y-parity from `presig.big_r` with low-`s`
+  flip, `recover_from_prehash` as the local ecrecover check; dry-run is
+  signature-free by construction and broadcast mints a FRESH presign per
+  attempt — the fixes for the k-reuse incident documented in
+  `demo-evm/README.md`) and `mesh` (M3 — three thread-level `PartyNode`
+  drivers with per-node durable stores under `data/mesh/`, signing the
+  keccak sighash via the node crate's `sign_stored_scalar` — the
+  pre-hashed-message variants added for this demo; idempotence via
+  deterministic keygen + on-disk monotonic id counters). Endpoint via
+  `OHM_DEMO_RPC_URL` only (never committed); two live Sepolia transfers
+  confirmed on-chain. Plume testnet (`--chain-id 98899`) is wired.
+  See `demo-evm/README.md` and runbook §9.
 - `cargo run --example NAME` — narrative examples (living documentation,
   deterministic `sim::make_rngs` seeds, every signature k256-verified):
   `wallet_2_of_3` (presig pool + single-use stores + lost-phone

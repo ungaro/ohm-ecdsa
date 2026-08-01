@@ -3187,6 +3187,47 @@ impl PartyNode {
         out
     }
 
+    /// [`Self::sign`] with an EXTERNALLY computed message scalar (SPEC
+    /// §9): for chains whose signed payload is a hash computed outside
+    /// the protocol — e.g. an EVM keccak-256 sighash (EIP-1559) — the
+    /// caller reduces the digest to a scalar itself (the core's
+    /// `scalar_from_digest`) instead of letting the driver SHA-256 the
+    /// message. Rounds, point-equality blame, robust combine, low-`s`
+    /// normalization, and single-use semantics are IDENTICAL to
+    /// [`Self::sign`]; only the `m` computation moves to the caller.
+    pub fn sign_scalar(
+        &self,
+        sid: &[u8],
+        presig: &Presignature,
+        m: &Scalar,
+        cheat: Option<Cheat>,
+    ) -> Result<(Signature, Vec<PartyId>)> {
+        self.sign_scalar_over(sid, presig, m, &self.params.parties(), cheat)
+    }
+
+    /// [`Self::sign_scalar`] over an explicit committee (the
+    /// scalar-message counterpart of [`Self::sign_over`]).
+    pub fn sign_scalar_over(
+        &self,
+        sid: &[u8],
+        presig: &Presignature,
+        m: &Scalar,
+        ids: &[PartyId],
+        cheat: Option<Cheat>,
+    ) -> Result<(Signature, Vec<PartyId>)> {
+        if !ids.contains(&self.me) {
+            return Err(Error::InvalidParams(
+                "this node is not a member of the signing committee",
+            ));
+        }
+        // The scalar's canonical bytes stand in for the message in the
+        // blame archive (same evidence shape as the byte-message path).
+        let message = m.to_bytes().to_vec();
+        let out = self.sign_run_scalar(sid, presig, m, &message, ids, cheat);
+        self.node.retire_session(sid);
+        out
+    }
+
     fn sign_run(
         &self,
         sid: &[u8],
@@ -3195,9 +3236,21 @@ impl PartyNode {
         ids: &[PartyId],
         cheat: Option<Cheat>,
     ) -> Result<(Signature, Vec<PartyId>)> {
-        let phase = Phase::Sign;
         let m = ohm_ecdsa::sim::message_scalar(msg);
-        let mut share = sign::sign_share(presig, &m);
+        self.sign_run_scalar(sid, presig, &m, msg, ids, cheat)
+    }
+
+    fn sign_run_scalar(
+        &self,
+        sid: &[u8],
+        presig: &Presignature,
+        m: &Scalar,
+        message: &[u8],
+        ids: &[PartyId],
+        cheat: Option<Cheat>,
+    ) -> Result<(Signature, Vec<PartyId>)> {
+        let phase = Phase::Sign;
+        let mut share = sign::sign_share(presig, m);
         if cheat == Some(Cheat::BadSignShare) {
             share.s += Scalar::ONE; // malicious: wrong signature share
         }
@@ -3232,7 +3285,7 @@ impl PartyNode {
         }
         // §10.4 robust combine: bad shares are blamed and excluded; the
         // signature is interpolated from the first t valid shares.
-        let ((r, s), blamed) = sign::combine_robust(&self.params, presig, &m, &shares)?;
+        let ((r, s), blamed) = sign::combine_robust(&self.params, presig, m, &shares)?;
         // M3b (§10.2/§A.4): archive the F6 sign-share token for every
         // blamed sender — the signed share envelope plus the public data
         // the auditor recomputes the failed check from.
@@ -3248,7 +3301,7 @@ impl PartyNode {
                     Some(BlameEvidence::SignShare {
                         abort,
                         envelope: se.clone(),
-                        message: msg.to_vec(),
+                        message: message.to_vec(),
                         r: presig.r,
                         u_com: presig.u_com.clone(),
                         z_com: presig.z_com.clone(),
@@ -3334,6 +3387,43 @@ impl PartyNode {
                 .consume(presig_id)?
         };
         Ok(self.sign_over(sid, &presig, msg, ids, cheat)?)
+    }
+
+    /// [`Self::sign_stored`] with an EXTERNALLY computed message scalar
+    /// (SPEC §9 — the durable-consume counterpart of
+    /// [`Self::sign_scalar`]): for chains whose signed payload is a hash
+    /// computed outside the protocol (e.g. an EVM keccak-256 sighash).
+    /// The consume tombstone is fsync'd BEFORE the share is broadcast,
+    /// exactly as in [`Self::sign_stored`] — durable single-use is
+    /// unchanged.
+    pub fn sign_stored_scalar(
+        &self,
+        sid: &[u8],
+        presig_id: u64,
+        m: &Scalar,
+        cheat: Option<Cheat>,
+    ) -> std::result::Result<(Signature, Vec<PartyId>), PersistError> {
+        self.sign_stored_scalar_over(sid, presig_id, m, &self.params.parties(), cheat)
+    }
+
+    /// [`Self::sign_stored_scalar`] over an explicit committee (the
+    /// scalar-message counterpart of [`Self::sign_stored_over`]).
+    pub fn sign_stored_scalar_over(
+        &self,
+        sid: &[u8],
+        presig_id: u64,
+        m: &Scalar,
+        ids: &[PartyId],
+        cheat: Option<Cheat>,
+    ) -> std::result::Result<(Signature, Vec<PartyId>), PersistError> {
+        let presig = {
+            let mut guard = self.store.lock().expect("mesh mutex poisoned");
+            guard
+                .as_mut()
+                .ok_or(Error::PresigStore("no store configured"))?
+                .consume(presig_id)?
+        };
+        Ok(self.sign_scalar_over(sid, &presig, m, ids, cheat)?)
     }
 
     // --- H4: expel-and-restart at the driver level (SPEC §10.3) -----------

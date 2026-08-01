@@ -16,6 +16,66 @@ and the derived Ethereum address must be the committee address.
 - **M1 (local)**: keygen → presign → sign → ecrecover assert. No network.
 - **M2 (testnet)**: live nonce/fees from a JSON-RPC endpoint, broadcast
   on explicit flag, bounded receipt polling, explorer link.
+- **M3 (mesh)**: the committee is three REAL per-node `PartyNode`
+  drivers on loopback TCP with per-node durable single-use stores —
+  `--driver mesh`.
+
+## M3: the mesh driver (`--driver mesh`)
+
+The default `sim` driver runs the whole committee in one process
+through the core's reference orchestrator — great for the protocol arc,
+but it proves nothing about message-passing. The mesh driver replaces
+that with the real per-node drivers from `ohm-ecdsa-node`:
+
+- **Real message-passing**: three `PartyNode` instances on loopback TCP
+  (ephemeral ports), each in its own thread, driving the wire §6.1
+  keygen, §8 presign, and §9 sign rounds — signed envelopes,
+  echo-broadcast acceptor, complaint rounds, and all.
+- **Per-node key separation**: each thread holds only its own transport
+  key, RNG, key share, and presignature share — nothing sim-shaped.
+- **Durable single-use stores**: every node keeps a `DiskPresigStore`
+  under `data/mesh/node-<id>/store/` (sealed records, fsync'd
+  tombstones, A4 rollback detection). Signing consumes through
+  `sign_stored_scalar`: the consume tombstone is fsync'd BEFORE the
+  share is broadcast, so a crash mid-sign can never replay a record.
+- **Blame-capable**: the drivers are the same blame-attributing ones
+  the node tests exercise; a cheating peer would be named, not just
+  failed.
+
+Signing the EIP-1559 sighash uses the node crate's scalar-message
+variants (`sign_stored_scalar`): the driver takes the externally
+computed keccak sighash as the message scalar instead of hashing
+internally — single-use and blame semantics identical.
+
+Data-dir layout (gitignored — sealed records, never commit):
+
+```
+demo-evm/data/mesh/
+├── node-1/store/   (sealed presig records, tombstones, journal)
+├── node-2/store/
+├── node-3/store/
+├── next-presign-id (monotonic counter, incremented BEFORE use)
+└── next-sign-id    (monotonic counter, incremented BEFORE the attempt)
+```
+
+**Address stability across runs**: keygen is deterministic (fixed seed
++ sid — DIFFERENT from the sim committee, so the mesh committee is a
+fresh key with its own address), re-run on every process start, and
+reproduces the same joint key. Presign ids come from the counter files,
+so reruns never collide with consumed records; a failed broadcast
+attempt burns its record and is never retried with it. Dry runs DO run
+mesh keygen + one presign (setup — they warm the stores) but still
+never sign.
+
+**Why a new address**: the M2 sim committee key was burned in the
+k-reuse incident above. The mesh committee starts fresh — fund it
+separately.
+
+```sh
+cargo run -- --driver mesh                      # dry run
+cargo run -- --driver mesh --broadcast          # sign + send
+cargo run -- --driver mesh --data-dir /tmp/x    # custom data dir
+```
 
 ## Setup
 
@@ -27,8 +87,9 @@ export OHM_DEMO_RPC_URL="https://<your-sepolia-endpoint>"
 ```
 
 Any Sepolia JSON-RPC endpoint works (Alchemy, Infura, QuickNode, a
-public one). Nothing else to configure: the committee is derived
-deterministically (fixed seed — demo reproducibility, NOT security).
+public one). Nothing else to configure: each driver's committee key is
+derived deterministically (fixed seed — demo reproducibility, NOT
+security; the sim and mesh drivers have DIFFERENT keys and addresses).
 
 ## Workflow: dry run first, broadcast second
 
@@ -59,6 +120,8 @@ and the explorer link.
 --chain-id N     default 11155111 (Sepolia)
 --to 0xADDR      recipient (default 0x3535…3535)
 --value-wei N    value (default 10000000000000000 = 0.01 ETH)
+--driver sim|mesh  default sim; mesh = 3 real PartyNodes (see M3 above)
+--data-dir PATH  mesh stores/counters (default demo-evm/data/mesh)
 --broadcast      actually send (default: dry run)
 ```
 
@@ -144,10 +207,12 @@ cargo test           # unit + mock-RPC end-to-end (no external network)
 cargo fmt
 ```
 
-The mock-RPC tests (`tests/mock_rpc.rs`) spin a local `std::net`
-`TcpListener` that answers canned JSON-RPC responses — tests never touch
-a live endpoint. The receipt fixture in that file is CONSTRUCTED
-(field-for-field the geth receipt shape).
+The mock-RPC tests (`tests/mock_rpc.rs`, `tests/mesh_rpc.rs`) spin a
+local `std::net` `TcpListener` that answers canned JSON-RPC responses —
+tests never touch a live endpoint. `tests/mesh_rpc.rs` drives the full
+M3 arc (3 real `PartyNode`s in threads, durable stores in per-test temp
+dirs). Receipt fixtures: one CONSTRUCTED (marked as such), one REAL
+Sepolia receipt (source cited in the file).
 
 The crate is workspace-excluded (own `[workspace]`, like `fuzz/`) and
 pinned to build with the repo MSRV (`cargo +1.75.0 check`); the lockfile

@@ -11,15 +11,17 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use ohm_ecdsa_demo_evm::mesh::default_data_dir;
 use ohm_ecdsa_demo_evm::rpc::explorer_tx_url;
 use ohm_ecdsa_demo_evm::tx::{hex_decode, hex_encode};
 use ohm_ecdsa_demo_evm::{
-    run_demo, DemoConfig, DemoReport, DEFAULT_TO, DEFAULT_VALUE_WEI, SEPOLIA_CHAIN_ID,
+    run_demo, DemoConfig, DemoReport, Driver, DEFAULT_TO, DEFAULT_VALUE_WEI, SEPOLIA_CHAIN_ID,
 };
 
-const USAGE: &str = "usage: demo-evm [--chain-id N] [--to 0xADDR] [--value-wei N] [--broadcast]
+const USAGE: &str = "usage: demo-evm [--chain-id N] [--to 0xADDR] [--value-wei N] [--driver sim|mesh] [--data-dir PATH] [--broadcast]
   env: OHM_DEMO_RPC_URL (required) — JSON-RPC endpoint
   default chain: 11155111 (Sepolia); Plume testnet: --chain-id 98899
+  default driver: sim (in-process committee); mesh = 3 real PartyNodes
   default: DRY RUN (nothing is sent); --broadcast sends";
 
 fn main() -> ExitCode {
@@ -27,6 +29,8 @@ fn main() -> ExitCode {
     let mut to = DEFAULT_TO.to_string();
     let mut value_wei = DEFAULT_VALUE_WEI;
     let mut broadcast = false;
+    let mut driver = Driver::Sim;
+    let mut data_dir = default_data_dir();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -38,6 +42,21 @@ fn main() -> ExitCode {
                 chain_id = match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
                     Some(v) => v,
                     None => return usage("--chain-id needs a u64"),
+                };
+            }
+            "--driver" => {
+                i += 1;
+                driver = match args.get(i).map(String::as_str) {
+                    Some("sim") => Driver::Sim,
+                    Some("mesh") => Driver::Mesh,
+                    _ => return usage("--driver must be sim or mesh"),
+                };
+            }
+            "--data-dir" => {
+                i += 1;
+                data_dir = match args.get(i) {
+                    Some(v) => v.into(),
+                    None => return usage("--data-dir needs a path"),
                 };
             }
             "--to" => {
@@ -83,6 +102,8 @@ fn main() -> ExitCode {
         to: to_bytes,
         value_wei,
         broadcast,
+        driver,
+        data_dir,
         receipt_interval: Duration::from_secs(3),
         receipt_timeout: Duration::from_secs(120),
     };
@@ -95,8 +116,16 @@ fn main() -> ExitCode {
         }
     };
 
-    println!("== OHM-ECDSA → EVM demo (M2) ==");
+    println!("== OHM-ECDSA → EVM demo (M3) ==");
     println!("chain id:      {chain_id}");
+    println!(
+        "driver:        {}",
+        if driver == Driver::Mesh {
+            "mesh (3 real PartyNodes, durable stores)"
+        } else {
+            "sim (in-process committee)"
+        }
+    );
 
     match report {
         DemoReport::Unfunded { address } => {

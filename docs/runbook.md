@@ -311,3 +311,60 @@ mode when unchecked:
 - [ ] Blame playbook rehearsed: collect `BLAME` lines → `auditor`
       verification → expel/reshare decision (§6).
 - [ ] Everyone involved has read SPEC §13.6: unaudited research code.
+
+## 9. EVM testnet demo (`demo-evm/`)
+
+The workspace-excluded demo crate (`demo-evm/`) proves the "threshold
+signature → on-chain-verifiable EVM signature" path end to end: a
+2-of-3 committee signs a real EIP-1559 transfer and broadcasts it to a
+testnet. **Testnet/fake funds only** — the same SPEC §13.6 disclaimer
+applies, and the demo's deterministic committees are public by
+construction (see the k-reuse incident in `demo-evm/README.md`; the M2
+sim committee key is BURNED and kept only for testnet continuity).
+
+Endpoints come from an environment variable ONLY — never a flag, never
+a default, never written to any file:
+
+```sh
+export OHM_DEMO_RPC_URL="https://<your-testnet-endpoint>"
+```
+
+Chains: Sepolia by default (`--chain-id 11155111`); Plume testnet via
+`--chain-id 98899` (with a Plume endpoint in the env var). The
+endpoint's `eth_chainId` must match or the run refuses before anything
+else.
+
+Workflow — dry run first, always:
+
+```sh
+cd demo-evm
+cargo run                          # dry run: chain-id sanity, balance
+                                   # gate, live nonce/fees, UNSIGNED tx.
+                                   # No signature is produced by design
+                                   # (SPEC §8.6 single-use).
+cargo run -- --broadcast           # signs (fresh presignature) + sends,
+                                   # polls the receipt, prints the
+                                   # explorer link.
+```
+
+Faucets (Sepolia; the run prints the committee address and this list
+when unfunded): sepoliafaucet.com, the Google Cloud web3 faucet, the
+QuickNode faucet. Fund the committee address, re-run the dry run, then
+broadcast.
+
+Drivers (`--driver sim|mesh`, default `sim`):
+
+- `sim` — the in-process reference committee (M1/M2 arc).
+- `mesh` — three REAL per-node `PartyNode` drivers on loopback TCP with
+  per-node durable single-use stores (`demo-evm/data/mesh/node-<id>/`,
+  gitignored — sealed records, never commit). Deterministic keygen keeps
+  the mesh address stable across runs; presignature ids come from
+  monotonic counter files in the data dir, and the durable store's
+  consume tombstone enforces single-use — a failed broadcast attempt is
+  never retried with the same presignature. The mesh committee is a
+  FRESH key with its own address (fund it separately).
+
+Single-use posture (§8.6), restated for operators: one presignature
+signs exactly one transaction, ever; dry runs sign nothing; broadcast
+attempts burn their record whether or not the tx lands. If a run dies
+mid-broadcast, re-run — the driver moves to the next record on its own.

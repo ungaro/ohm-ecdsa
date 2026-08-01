@@ -19,6 +19,7 @@
 
 pub mod json;
 pub mod keccak;
+pub mod mesh;
 pub mod rlp;
 pub mod rpc;
 pub mod tx;
@@ -210,6 +211,14 @@ pub fn run_arc(tx: &Eip1559Tx) -> Result<ArcOutput, DemoError> {
     committee.sign(tx, &presigs)
 }
 
+/// Which committee driver signs: the in-process `sim` orchestrator
+/// (M1/M2) or the real per-node mesh drivers (M3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Driver {
+    Sim,
+    Mesh,
+}
+
 /// Configuration for one M2 run.
 #[derive(Clone, Debug)]
 pub struct DemoConfig {
@@ -220,6 +229,11 @@ pub struct DemoConfig {
     pub value_wei: u128,
     /// Broadcast only when true; false is the dry-run safety gate.
     pub broadcast: bool,
+    /// Committee driver (default `sim`; `mesh` = real PartyNodes).
+    pub driver: Driver,
+    /// Mesh data dir (per-node durable stores + id counters; unused by
+    /// the sim driver).
+    pub data_dir: std::path::PathBuf,
     /// Receipt polling (production default: 3 s / 120 s; tests shrink).
     pub receipt_interval: Duration,
     pub receipt_timeout: Duration,
@@ -277,20 +291,36 @@ pub enum DemoError {
     Ecdsa(#[from] k256::ecdsa::Error),
     #[error("rpc error: {0}")]
     Rpc(#[from] RpcError),
+    #[error("store error: {0}")]
+    Store(#[from] ohm_ecdsa_node::persist::PersistError),
+    #[error("io error: {0}")]
+    Io(String),
     #[error("ecrecover recovered a key that is NOT the committee's joint key")]
     RecoveryMismatch,
     #[error("chain id mismatch: endpoint is on {got}, --chain-id says {expected}")]
     ChainIdMismatch { expected: u64, got: u64 },
 }
 
-/// The M2 flow, shared by `main.rs` and the mock-RPC test:
-/// chain-id sanity → balance gate → live nonce/fees → tx assembly.
-/// Then, and ONLY then:
-/// - dry run: report the unsigned tx; NO presign, NO sign;
-/// - `--broadcast`: mint a FRESH presignature ([`Committee::presign_fresh`]),
-///   sign, send, poll the receipt (bounded).
+/// The M2/M3 flow, shared by `main.rs` and the mock-RPC test:
+/// committee setup (sim keygen, or MESH keygen + store warmup — setup,
+/// not signing) → chain-id sanity → balance gate → live nonce/fees →
+/// tx assembly. Then, and ONLY then:
+/// - dry run: report the unsigned tx; NO sign anywhere;
+/// - `--broadcast`: sign (sim: fresh presignature via
+///   [`Committee::presign_fresh`]; mesh: the durable store's next
+///   record via `sign_stored_scalar`), send, poll the receipt (bounded).
 pub fn run_demo(cfg: &DemoConfig) -> Result<DemoReport, DemoError> {
-    let committee = Committee::deterministic()?;
+    // Committee setup — for the mesh driver this runs the REAL per-node
+    // keygen over the loopback mesh (deterministic → stable address),
+    // opens the durable stores, and stocks one fresh presignature.
+    let prepared = match cfg.driver {
+        Driver::Sim => Prepared::Sim(Committee::deterministic()?),
+        Driver::Mesh => Prepared::Mesh(mesh::setup(&cfg.data_dir)?),
+    };
+    let address = match &prepared {
+        Prepared::Sim(c) => c.address().to_string(),
+        Prepared::Mesh(s) => s.address.clone(),
+    };
     let mut client = rpc::Client::new(&cfg.rpc_url);
 
     // Sanity: the endpoint must be on the chain we think it is.
@@ -304,15 +334,13 @@ pub fn run_demo(cfg: &DemoConfig) -> Result<DemoReport, DemoError> {
 
     // Funding gate: an unfunded committee address cannot send — say so
     // and exit successfully (the faucet step is manual).
-    let balance = client.get_balance(committee.address())?;
+    let balance = client.get_balance(&address)?;
     if balance == 0 {
-        return Ok(DemoReport::Unfunded {
-            address: committee.address().to_string(),
-        });
+        return Ok(DemoReport::Unfunded { address });
     }
 
     // Live nonce (pending pool) and fees.
-    let nonce = client.get_transaction_count(committee.address())?;
+    let nonce = client.get_transaction_count(&address)?;
     let priority = client.max_priority_fee_per_gas()?;
     let gas_price = client.gas_price()?;
     let history: Option<FeeHistory> = client.fee_history()?;
@@ -332,7 +360,7 @@ pub fn run_demo(cfg: &DemoConfig) -> Result<DemoReport, DemoError> {
 
     if !cfg.broadcast {
         return Ok(DemoReport::DryRun(DryRunReport {
-            address: committee.address().to_string(),
+            address,
             balance_wei: balance,
             nonce,
             fees,
@@ -341,14 +369,27 @@ pub fn run_demo(cfg: &DemoConfig) -> Result<DemoReport, DemoError> {
         }));
     }
 
-    // --broadcast: fresh presignature per attempt (SPEC §8.6 — a new `k`
-    // every run), then sign locally and send.
-    let presigs = committee.presign_fresh()?;
-    let arc = committee.sign(&tx, &presigs)?;
+    // --broadcast: fresh presignature per attempt (SPEC §8.6 — a new
+    // `k` every run, sim and mesh alike), then sign locally and send.
+    let sighash = tx.sighash();
+    let arc = match &prepared {
+        Prepared::Sim(committee) => {
+            let presigs = committee.presign_fresh()?;
+            committee.sign(&tx, &presigs)?
+        }
+        Prepared::Mesh(setup) => {
+            // The mesh signs the sighash SCALAR through the durable
+            // single-use stores; y_parity is recovered by trial against
+            // the joint key (the driver already low-s normalizes).
+            let m = scalar_from_digest(&sighash);
+            let sig = mesh::sign(&cfg.data_dir, &m)?;
+            assemble_signed_tx(&address, sighash, sig, &setup.joint_vk, &tx)?
+        }
+    };
     let tx_hash = client.send_raw_transaction(&arc.signed_tx)?;
     let receipt = client.wait_for_receipt(&tx_hash, cfg.receipt_interval, cfg.receipt_timeout)?;
     Ok(DemoReport::Broadcast(BroadcastReport {
-        address: committee.address().to_string(),
+        address,
         balance_wei: balance,
         nonce,
         fees,
@@ -356,6 +397,48 @@ pub fn run_demo(cfg: &DemoConfig) -> Result<DemoReport, DemoError> {
         tx_hash,
         receipt,
     }))
+}
+
+/// Committee setup, per driver.
+enum Prepared {
+    Sim(Committee),
+    Mesh(mesh::MeshSetup),
+}
+
+/// Build the signed tx from a finished signature (mesh path): find the
+/// `y_parity` whose ecrecover returns the joint key — that trial IS the
+/// ecrecover assertion, same guarantee as the sim path's explicit check.
+fn assemble_signed_tx(
+    address: &str,
+    sighash: [u8; 32],
+    sig: Signature,
+    joint_vk: &VerifyingKey,
+    tx: &Eip1559Tx,
+) -> Result<ArcOutput, DemoError> {
+    debug_assert!(
+        !bool::from(sig.s().is_high()),
+        "the mesh driver yields low-s"
+    );
+    for y_parity in [false, true] {
+        let recid = RecoveryId::new(y_parity, false);
+        if let Ok(recovered) = VerifyingKey::recover_from_prehash(&sighash, &sig, recid) {
+            if recovered == *joint_vk {
+                let signed_tx = tx.signed_tx(
+                    y_parity,
+                    &sig.r().to_bytes().into(),
+                    &sig.s().to_bytes().into(),
+                );
+                return Ok(ArcOutput {
+                    address: address.to_string(),
+                    sighash,
+                    signature: sig,
+                    y_parity,
+                    signed_tx,
+                });
+            }
+        }
+    }
+    Err(DemoError::RecoveryMismatch)
 }
 
 /// The M1 fixed demo transaction (tests).
