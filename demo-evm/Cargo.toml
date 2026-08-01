@@ -18,3 +18,7 @@ k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
 tiny-keccak = { version = "2", features = ["keccak"] }
 rand = "0.8"
 thiserror = "2"
+# Pinned exactly: cargo 1.75 has no rust-version-aware resolution, so the
+# lockfile must hold a dep tree that builds with the workspace MSRV.
+# default-features off: no gzip/brotli/json/cookies — rustls TLS only.
+ureq = { version = "=2.12.1", default-features = false, features = ["tls"] }
