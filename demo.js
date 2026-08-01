@@ -209,9 +209,9 @@ const SEPOLIA_RPC = 'https://ethereum-sepolia-rpc.publicnode.com';
 const PLUME_RPC = 'https://testnet-rpc.plume.org';
 
 const COMMITTEES = [
-  { label: 'sim committee (BURNED key — educational)', address: '0x729BB22d46A1790708a3cfB2AAe7F74dE8c9e970', rpc: SEPOLIA_RPC, chain: 'Sepolia' },
-  { label: 'mesh committee', address: '0x27D8C9e7D340b4c38c769b14E239e61BF2E35d7c', rpc: SEPOLIA_RPC, chain: 'Sepolia' },
-  { label: 'mesh committee (same key)', address: '0x27D8C9e7D340b4c38c769b14E239e61BF2E35d7c', rpc: PLUME_RPC, chain: 'Plume' },
+  { label: 'sim committee (BURNED key — educational)', address: '0x729BB22d46A1790708a3cfB2AAe7F74dE8c9e970', rpc: SEPOLIA_RPC, chain: 'Sepolia', explorer: 'https://sepolia.etherscan.io' },
+  { label: 'mesh committee', address: '0x27D8C9e7D340b4c38c769b14E239e61BF2E35d7c', rpc: SEPOLIA_RPC, chain: 'Sepolia', explorer: 'https://sepolia.etherscan.io' },
+  { label: 'mesh committee (same key)', address: '0x27D8C9e7D340b4c38c769b14E239e61BF2E35d7c', rpc: PLUME_RPC, chain: 'Plume', explorer: 'https://testnet-explorer.plume.org' },
 ];
 
 const TXS = [
@@ -241,7 +241,7 @@ function chainBadge(chain) {
 
 function renderChainStatic() {
   $('#balances').innerHTML = COMMITTEES.map(
-    (c) => `<div class="kv"><span class="k">${c.label} (${c.chain})</span><span class="v" title="${c.address}">${trunc(c.address.slice(2))} — balance n/a (offline)</span></div>`,
+    (c) => `<div class="kv"><span class="k">${c.label} (${c.chain})</span><span class="v"><a class="tx-link" href="${c.explorer}/address/${c.address}" title="${c.address}">${trunc(c.address.slice(2))} ↗</a> — balance n/a (offline)</span></div>`,
   ).join('');
   $('#tx-cards').innerHTML = TXS.map(
     (t) => `<div class="tx-card">
@@ -267,7 +267,7 @@ async function renderChainLive() {
     $('#balances').innerHTML = balances
       .map((c) => {
         const eth = (Number(BigInt(c.balance)) / 1e18).toFixed(4);
-        return `<div class="kv"><span class="k">${c.label} (${c.chain})</span><span class="v" title="${c.address}">${trunc(c.address.slice(2))} — ${eth} ETH live</span></div>`;
+        return `<div class="kv"><span class="k">${c.label} (${c.chain})</span><span class="v"><a class="tx-link" href="${c.explorer}/address/${c.address}" title="${c.address}">${trunc(c.address.slice(2))} ↗</a> — ${eth} ETH live</span></div>`;
       })
       .join('');
     $('#tx-cards').innerHTML = receipts
