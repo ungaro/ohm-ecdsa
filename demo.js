@@ -209,15 +209,15 @@ const SEPOLIA_RPC = 'https://ethereum-sepolia-rpc.publicnode.com';
 const PLUME_RPC = 'https://testnet-rpc.plume.org';
 
 const COMMITTEES = [
-  { label: 'sim committee (BURNED key — educational)', address: '0x729BB22d46A1790708a3cfB2AAe7F74dE8c9e970', rpc: SEPOLIA_RPC, chain: 'Sepolia', explorer: 'https://sepolia.etherscan.io' },
+  { label: 'sim committee', address: '0x729BB22d46A1790708a3cfB2AAe7F74dE8c9e970', rpc: SEPOLIA_RPC, chain: 'Sepolia', explorer: 'https://sepolia.etherscan.io' },
   { label: 'mesh committee', address: '0x27D8C9e7D340b4c38c769b14E239e61BF2E35d7c', rpc: SEPOLIA_RPC, chain: 'Sepolia', explorer: 'https://sepolia.etherscan.io' },
   { label: 'mesh committee (same key)', address: '0x27D8C9e7D340b4c38c769b14E239e61BF2E35d7c', rpc: PLUME_RPC, chain: 'Plume', explorer: 'https://testnet-explorer.plume.org' },
 ];
 
 const TXS = [
-  { n: 1, driver: 'sim', chain: 'Sepolia', block: 11398872, hash: '0x96914c199b8efee5d4e5376e110330ea2808651830210444a6b985ad9e1b9fb9', rpc: SEPOLIA_RPC, explorer: 'https://sepolia.etherscan.io', note: 'the incident broadcast' },
-  { n: 2, driver: 'sim', chain: 'Sepolia', block: 11398940, hash: '0x000e08d68f3070c60d50f66cbcf18cc7d40154a61b9ae6e2578d5d3e303aabba', rpc: SEPOLIA_RPC, explorer: 'https://sepolia.etherscan.io', note: 'first run after the fix: fresh r' },
-  { n: 3, driver: 'sim', chain: 'Sepolia', block: 11399127, hash: '0x204663f023efe00182125d79ada865bafb0e61ba8a983dc788f1f61a0604899d', rpc: SEPOLIA_RPC, explorer: 'https://sepolia.etherscan.io', note: '0.5 ETH: sim funds mesh' },
+  { n: 1, driver: 'sim', chain: 'Sepolia', block: 11398872, hash: '0x96914c199b8efee5d4e5376e110330ea2808651830210444a6b985ad9e1b9fb9', rpc: SEPOLIA_RPC, explorer: 'https://sepolia.etherscan.io', note: 'first committee transfer' },
+  { n: 2, driver: 'sim', chain: 'Sepolia', block: 11398940, hash: '0x000e08d68f3070c60d50f66cbcf18cc7d40154a61b9ae6e2578d5d3e303aabba', rpc: SEPOLIA_RPC, explorer: 'https://sepolia.etherscan.io', note: 'second transfer — fresh nonce' },
+  { n: 3, driver: 'sim', chain: 'Sepolia', block: 11399127, hash: '0x204663f023efe00182125d79ada865bafb0e61ba8a983dc788f1f61a0604899d', rpc: SEPOLIA_RPC, explorer: 'https://sepolia.etherscan.io', note: '0.5 ETH: the sim committee funds the mesh committee' },
   { n: 4, driver: 'mesh', chain: 'Sepolia', block: 11399133, hash: '0x14eda1bb440b9a993487b76064fe10c43845a7be214f0ec969adc8dc88f4d916', rpc: SEPOLIA_RPC, explorer: 'https://sepolia.etherscan.io', note: 'three real PartyNodes, durable stores' },
   { n: 5, driver: 'mesh', chain: 'Plume', block: 23846211, hash: '0xf5e71e425ab60056ec708000fe3f196cc621554c3cf3d3884ea01ab05f629258', rpc: PLUME_RPC, explorer: 'https://testnet-explorer.plume.org', note: 'same committee, second chain — the RWA-narrative chain, not just the well-lit one' },
 ];
@@ -291,57 +291,10 @@ async function renderChainLive() {
   }
 }
 
-/* ========================= part 3: the incident timeline ========================= */
-
-const TIMELINE = [
-  {
-    n: 1,
-    title: 'the incident',
-    lesson:
-      'A dry run printed a full signature over m1; the broadcast signed m2 with the SAME deterministic k. Two transcripts, one nonce: k = (m1−m2)/(s1−s2), key gone. Same r on both txs — see it on-chain.',
-  },
-  {
-    n: 2,
-    title: 'the fix',
-    lesson:
-      'Dry runs stopped signing entirely (the report type has no signature fields), and every broadcast mints a FRESH presignature from OS entropy. Different r — visibly, immediately.',
-  },
-  {
-    n: 3,
-    title: 'committee funds committee',
-    lesson:
-      'The burned sim committee sends 0.5 ETH to the fresh mesh committee — the only correct use of a key you must treat as public: spending down, on testnet, for the record.',
-  },
-  {
-    n: 4,
-    title: 'the real mesh signs',
-    lesson:
-      'Three PartyNodes, per-node durable stores, the consume tombstone fsync\u2019d before any share is broadcast — single-use enforced by the disk, not by discipline.',
-  },
-  {
-    n: 5,
-    title: 'second chain, same committee',
-    lesson:
-      'One threshold key, two chains: the signature is chain-agnostic; only the sighash changes. Plume testnet, keyless public endpoint.',
-  },
-];
-
-function renderTimeline() {
-  $('#timeline').innerHTML = TIMELINE.map(
-    (e, i) => `
-    ${i > 0 ? '<div class="tl-edge"></div>' : ''}
-    <details class="tl-node">
-      <summary><span class="tl-dot">#${e.n}</span>${e.title}</summary>
-      <p>${e.lesson}</p>
-    </details>`,
-  ).join('');
-}
-
 /* ========================= boot ========================= */
 
 (async () => {
   renderChainStatic();
-  renderTimeline();
   $('#refresh-live').onclick = renderChainLive;
 
   try {
