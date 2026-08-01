@@ -219,7 +219,7 @@ const TXS = [
   { n: 2, driver: 'sim', chain: 'Sepolia', block: 11398940, hash: '0x000e08d68f3070c60d50f66cbcf18cc7d40154a61b9ae6e2578d5d3e303aabba', rpc: SEPOLIA_RPC, explorer: 'https://sepolia.etherscan.io', note: 'first run after the fix: fresh r' },
   { n: 3, driver: 'sim', chain: 'Sepolia', block: 11399127, hash: '0x204663f023efe00182125d79ada865bafb0e61ba8a983dc788f1f61a0604899d', rpc: SEPOLIA_RPC, explorer: 'https://sepolia.etherscan.io', note: '0.5 ETH: sim funds mesh' },
   { n: 4, driver: 'mesh', chain: 'Sepolia', block: 11399133, hash: '0x14eda1bb440b9a993487b76064fe10c43845a7be214f0ec969adc8dc88f4d916', rpc: SEPOLIA_RPC, explorer: 'https://sepolia.etherscan.io', note: 'three real PartyNodes, durable stores' },
-  { n: 5, driver: 'mesh', chain: 'Plume', block: 23846211, hash: '0xf5e71e425ab60056ec708000fe3f196cc621554c3cf3d3884ea01ab05f629258', rpc: PLUME_RPC, explorer: 'https://testnet-explorer.plume.org', note: 'same committee, second chain' },
+  { n: 5, driver: 'mesh', chain: 'Plume', block: 23846211, hash: '0xf5e71e425ab60056ec708000fe3f196cc621554c3cf3d3884ea01ab05f629258', rpc: PLUME_RPC, explorer: 'https://testnet-explorer.plume.org', note: 'same committee, second chain — the RWA-narrative chain, not just the well-lit one' },
 ];
 
 async function rpc(url, method, params) {
@@ -234,13 +234,18 @@ async function rpc(url, method, params) {
   return body.result;
 }
 
+function chainBadge(chain) {
+  const cls = chain === 'Plume' ? 'plume' : 'sepolia';
+  return `<span class="chain-badge ${cls}">${chain}</span>`;
+}
+
 function renderChainStatic() {
   $('#balances').innerHTML = COMMITTEES.map(
     (c) => `<div class="kv"><span class="k">${c.label} (${c.chain})</span><span class="v" title="${c.address}">${trunc(c.address.slice(2))} — balance n/a (offline)</span></div>`,
   ).join('');
   $('#tx-cards').innerHTML = TXS.map(
     (t) => `<div class="tx-card">
-      <div class="tx-head">#${t.n} · ${t.driver} · ${t.chain} · block ${t.block}</div>
+      <div class="tx-head">#${t.n} · ${t.driver} · ${chainBadge(t.chain)} · block ${t.block}</div>
       <div class="tx-note">${t.note}</div>
       <div class="tx-status mono">status 1 ✓ (repo record)</div>
       <a class="tx-link" href="${t.explorer}/tx/${t.hash}">${trunc(t.hash.slice(2))} ↗</a>
@@ -269,7 +274,7 @@ async function renderChainLive() {
       .map((t) => {
         const ok = t.receipt && t.receipt.status === '0x1';
         return `<div class="tx-card">
-          <div class="tx-head">#${t.n} · ${t.driver} · ${t.chain} · block ${Number(BigInt(t.receipt.blockNumber))}</div>
+          <div class="tx-head">#${t.n} · ${t.driver} · ${chainBadge(t.chain)} · block ${Number(BigInt(t.receipt.blockNumber))}</div>
           <div class="tx-note">${t.note}</div>
           <div class="tx-status mono">${ok ? 'status 1 ✓ live' : 'status 0 ✗ LIVE — reverted?'} · gas ${Number(BigInt(t.receipt.gasUsed))}</div>
           <a class="tx-link" href="${t.explorer}/tx/${t.hash}">${trunc(t.hash.slice(2))} ↗</a>
