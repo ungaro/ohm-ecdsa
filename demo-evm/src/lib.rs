@@ -29,7 +29,7 @@ use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use k256::elliptic_curve::scalar::IsHigh;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 
-use ohm_ecdsa::presign::KeyShare;
+use ohm_ecdsa::presign::{KeyShare, Presignature};
 use ohm_ecdsa::{scalar_from_digest, sign, sim, Params};
 
 use rpc::{FeeHistory, Fees, Receipt, RpcError};
@@ -84,16 +84,55 @@ impl Committee {
         &self.address
     }
 
-    /// Sign `tx` end to end: one fresh presignature (SPEC §8), parties
-    /// 1 + 2 online (SPEC §9), low-`s` normalization (EIP-2), y_parity
-    /// from the nonce point `R`, and the ASSERTED ecrecover simulation —
-    /// recovery from the sighash must return the joint key `X`.
-    pub fn sign(&self, tx: &Eip1559Tx) -> Result<ArcOutput, DemoError> {
-        // Offline: one fresh presignature, deterministic seed distinct
-        // from keygen's.
+    /// One fresh presignature per party (SPEC §8) from DETERMINISTIC
+    /// per-party RNGs — TESTS ONLY. A deterministic presign means every
+    /// process run derives the same `k` (same `R`, same `r`): signing
+    /// two different messages with it across runs is the classic ECDSA
+    /// nonce-reuse key recovery (`k = (m1−m2)/(s1−s2)`, then
+    /// `x = (s1·k − m1)/r`) — exactly what SPEC §8.6 single-use forbids.
+    /// The binary's broadcast path uses [`Committee::presign_fresh`].
+    ///
+    /// (Deterministic KEYGEN is fine and intended — it keeps the funded
+    /// demo address stable; only the per-transaction nonce must be
+    /// fresh.)
+    #[cfg(test)]
+    pub fn presign_deterministic(&self) -> Result<Vec<Presignature>, DemoError> {
         let mut rngs = sim::make_rngs(3, DEMO_SEED.wrapping_add(1));
-        let presigs = sim::run_presign(&self.params, &self.keys, 1, &mut rngs, None)?;
+        Ok(sim::run_presign(
+            &self.params,
+            &self.keys,
+            1,
+            &mut rngs,
+            None,
+        )?)
+    }
 
+    /// One fresh presignature per party (SPEC §8) from OS entropy: a
+    /// `u64` seed sampled from `OsRng`, expanded to per-party RNGs via
+    /// `sim::make_rngs`. Every call draws a new `k` — the SPEC §8.6
+    /// single-use discipline holds across process runs.
+    pub fn presign_fresh(&self) -> Result<Vec<Presignature>, DemoError> {
+        use rand::RngCore;
+        let seed = rand::rngs::OsRng.next_u64();
+        let mut rngs = sim::make_rngs(3, seed);
+        Ok(sim::run_presign(
+            &self.params,
+            &self.keys,
+            1,
+            &mut rngs,
+            None,
+        )?)
+    }
+
+    /// Sign `tx` with `presigs` (SPEC §9): parties 1 + 2 online in one
+    /// round, low-`s` normalization (EIP-2), y_parity from the nonce
+    /// point `R`, and the ASSERTED ecrecover simulation — recovery from
+    /// the sighash must return the joint key `X`.
+    ///
+    /// The caller supplies the presignature so that the choice of
+    /// entropy (deterministic for tests, fresh for broadcast) is
+    /// explicit at the call site — signing itself never mints one.
+    pub fn sign(&self, tx: &Eip1559Tx, presigs: &[Presignature]) -> Result<ArcOutput, DemoError> {
         // The message is the EIP-1559 sighash, reduced to a scalar
         // exactly as the core does for any 32-byte digest.
         let sighash = tx.sighash();
@@ -161,9 +200,14 @@ pub struct ArcOutput {
     pub signed_tx: Vec<u8>,
 }
 
-/// M1 convenience: deterministic committee + sign in one call.
+/// M1 convenience (tests): deterministic committee + deterministic
+/// presign + sign in one call. See [`Committee::presign_deterministic`]
+/// for why this is test-only.
+#[cfg(test)]
 pub fn run_arc(tx: &Eip1559Tx) -> Result<ArcOutput, DemoError> {
-    Committee::deterministic()?.sign(tx)
+    let committee = Committee::deterministic()?;
+    let presigs = committee.presign_deterministic()?;
+    committee.sign(tx, &presigs)
 }
 
 /// Configuration for one M2 run.
@@ -181,18 +225,47 @@ pub struct DemoConfig {
     pub receipt_timeout: Duration,
 }
 
-/// What one M2 run did — structured so tests can assert, `main` prints.
+/// What one M2 run did. The DRY-RUN variant has NO signature fields by
+/// construction: a dry run must never produce (or print) `r`/`s` — a
+/// signature computed but "not sent" is still a public transcript over
+/// the presignature's `k`, and a later broadcast with a fresh-looking
+/// but equal `k` is the ECDSA nonce-reuse key-recovery scenario
+/// (SPEC §8.6). Signing is reachable only from the broadcast branch of
+/// [`run_demo`], with a freshly-drawn presignature.
 #[derive(Debug)]
-pub struct DemoReport {
+pub enum DemoReport {
+    /// Funding gate: the committee address holds 0 wei (exit 0).
+    Unfunded { address: String },
+    /// Dry run: everything EXCEPT a signature.
+    DryRun(DryRunReport),
+    /// Broadcast: the signature, the tx hash, the mined receipt.
+    Broadcast(BroadcastReport),
+}
+
+/// Dry-run output — deliberately signature-free.
+#[derive(Debug)]
+pub struct DryRunReport {
     pub address: String,
     pub balance_wei: u128,
-    /// False when the committee address is unfunded (early exit).
-    pub funded: bool,
-    pub nonce: Option<u64>,
-    pub fees: Option<Fees>,
-    pub arc: Option<ArcOutput>,
-    pub tx_hash: Option<[u8; 32]>,
-    pub receipt: Option<Receipt>,
+    pub nonce: u64,
+    pub fees: Fees,
+    /// The unsigned transaction (fields only — no `y_parity`/`r`/`s`).
+    pub tx: Eip1559Tx,
+    /// `keccak256(0x02 ‖ rlp(unsigned_tx))` — public data, useful for
+    /// eyeballing what WOULD be signed.
+    pub unsigned_sighash: [u8; 32],
+}
+
+/// Broadcast output.
+#[derive(Debug)]
+pub struct BroadcastReport {
+    pub address: String,
+    pub balance_wei: u128,
+    pub nonce: u64,
+    pub fees: Fees,
+    pub arc: ArcOutput,
+    pub tx_hash: [u8; 32],
+    pub receipt: Receipt,
 }
 
 /// Demo failures.
@@ -211,8 +284,11 @@ pub enum DemoError {
 }
 
 /// The M2 flow, shared by `main.rs` and the mock-RPC test:
-/// chain-id sanity → balance gate → live nonce/fees → local threshold
-/// sign → dry-run report, or broadcast + bounded receipt polling.
+/// chain-id sanity → balance gate → live nonce/fees → tx assembly.
+/// Then, and ONLY then:
+/// - dry run: report the unsigned tx; NO presign, NO sign;
+/// - `--broadcast`: mint a FRESH presignature ([`Committee::presign_fresh`]),
+///   sign, send, poll the receipt (bounded).
 pub fn run_demo(cfg: &DemoConfig) -> Result<DemoReport, DemoError> {
     let committee = Committee::deterministic()?;
     let mut client = rpc::Client::new(&cfg.rpc_url);
@@ -230,15 +306,8 @@ pub fn run_demo(cfg: &DemoConfig) -> Result<DemoReport, DemoError> {
     // and exit successfully (the faucet step is manual).
     let balance = client.get_balance(committee.address())?;
     if balance == 0 {
-        return Ok(DemoReport {
+        return Ok(DemoReport::Unfunded {
             address: committee.address().to_string(),
-            balance_wei: 0,
-            funded: false,
-            nonce: None,
-            fees: None,
-            arc: None,
-            tx_hash: None,
-            receipt: None,
         });
     }
 
@@ -249,7 +318,7 @@ pub fn run_demo(cfg: &DemoConfig) -> Result<DemoReport, DemoError> {
     let history: Option<FeeHistory> = client.fee_history()?;
     let fees = rpc::suggest_fees(priority, gas_price, history.as_ref());
 
-    // Sign locally — the threshold arc never touches the network.
+    // The unsigned transaction — as far as a dry run ever gets.
     let tx = Eip1559Tx {
         chain_id: cfg.chain_id,
         nonce,
@@ -260,34 +329,33 @@ pub fn run_demo(cfg: &DemoConfig) -> Result<DemoReport, DemoError> {
         value: cfg.value_wei,
         data: Vec::new(),
     };
-    let arc = committee.sign(&tx)?;
 
     if !cfg.broadcast {
-        return Ok(DemoReport {
+        return Ok(DemoReport::DryRun(DryRunReport {
             address: committee.address().to_string(),
             balance_wei: balance,
-            funded: true,
-            nonce: Some(nonce),
-            fees: Some(fees),
-            arc: Some(arc),
-            tx_hash: None,
-            receipt: None,
-        });
+            nonce,
+            fees,
+            unsigned_sighash: tx.sighash(),
+            tx,
+        }));
     }
 
-    // --broadcast: send and wait for inclusion.
+    // --broadcast: fresh presignature per attempt (SPEC §8.6 — a new `k`
+    // every run), then sign locally and send.
+    let presigs = committee.presign_fresh()?;
+    let arc = committee.sign(&tx, &presigs)?;
     let tx_hash = client.send_raw_transaction(&arc.signed_tx)?;
     let receipt = client.wait_for_receipt(&tx_hash, cfg.receipt_interval, cfg.receipt_timeout)?;
-    Ok(DemoReport {
+    Ok(DemoReport::Broadcast(BroadcastReport {
         address: committee.address().to_string(),
         balance_wei: balance,
-        funded: true,
-        nonce: Some(nonce),
-        fees: Some(fees),
-        arc: Some(arc),
-        tx_hash: Some(tx_hash),
-        receipt: Some(receipt),
-    })
+        nonce,
+        fees,
+        arc,
+        tx_hash,
+        receipt,
+    }))
 }
 
 /// The M1 fixed demo transaction (tests).
@@ -387,6 +455,57 @@ mod tests {
         let a = Committee::deterministic().unwrap();
         let b = Committee::deterministic().unwrap();
         assert_eq!(a.address(), b.address());
+    }
+
+    /// `presign_fresh` draws a new `k` every call (SPEC §8.6): two
+    /// invocations must produce different nonce points `R`. (Deterministic
+    /// keygen keeps the ADDRESS stable; only the per-tx nonce is fresh.)
+    #[test]
+    fn presign_fresh_draws_fresh_nonces() {
+        let committee = Committee::deterministic().unwrap();
+        let a = committee.presign_fresh().unwrap();
+        let b = committee.presign_fresh().unwrap();
+        assert_ne!(
+            a[0].big_r.to_encoded_point(false),
+            b[0].big_r.to_encoded_point(false),
+            "two fresh presignatures must not share k (SPEC §8.6)"
+        );
+        // And the deterministic test path is the reproducible one.
+        let d1 = committee.presign_deterministic().unwrap();
+        let d2 = committee.presign_deterministic().unwrap();
+        assert_eq!(
+            d1[0].big_r.to_encoded_point(false),
+            d2[0].big_r.to_encoded_point(false)
+        );
+    }
+
+    /// The dry-run report is signature-free BY TYPE: it has no
+    /// `ArcOutput`/`signature`/`signed_tx` fields — there is nothing to
+    /// assert against because no such data can exist. What we CAN assert
+    /// here is the API surface itself: `DryRunReport` exposes the
+    /// unsigned tx and sighash, and `ArcOutput` (which carries `r`/`s`)
+    /// is only constructible via `Committee::sign`, which `run_demo`
+    /// reaches only in the broadcast branch (read `run_demo` — the rest
+    /// is by construction).
+    #[test]
+    fn dry_run_report_is_signature_free_by_construction() {
+        let report = DryRunReport {
+            address: "0x0".into(),
+            balance_wei: 1,
+            nonce: 0,
+            fees: Fees {
+                max_priority_fee_per_gas: 1,
+                max_fee_per_gas: 2,
+            },
+            tx: demo_tx(),
+            unsigned_sighash: [0u8; 32],
+        };
+        let _ = &report.unsigned_sighash;
+        let _ = &report.tx;
+        // Compile-time guarantee: `DemoReport::DryRun` cannot carry an
+        // `ArcOutput` — the enum simply has no such field.
+        let report = DemoReport::DryRun(report);
+        assert!(matches!(report, DemoReport::DryRun(_)));
     }
 
     /// Sighash cross-check: an independent, item-based RLP encoding

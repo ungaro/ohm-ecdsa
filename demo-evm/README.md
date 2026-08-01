@@ -34,7 +34,8 @@ deterministically (fixed seed — demo reproducibility, NOT security).
 
 ```sh
 # 1. Dry run (default): chain-id sanity, balance check, live nonce +
-#    fees, local threshold signing, prints the signed tx. SENDS NOTHING.
+#    fees, prints the UNSIGNED tx and its sighash. SENDS NOTHING and —
+#    by design since the k-reuse incident below — SIGNS NOTHING.
 cd demo-evm
 cargo run
 
@@ -63,6 +64,59 @@ and the explorer link.
 
 The endpoint's `eth_chainId` must match `--chain-id` or the run refuses
 before doing anything else.
+
+## The k-reuse incident (2026-08-01)
+
+**This section is the demo's most valuable teaching artifact. Read it
+before reusing any of this code.**
+
+The M2 demo originally seeded *both* keygen and presign
+deterministically — a convenience for reproducible output. That made
+every process run derive the **same presignature**: same nonce `k`,
+same `R`, same `r`. On 2026-08-01 a dry run computed and printed a full
+signature over sighash `m1`; the `--broadcast` run minutes later signed
+a **different** sighash `m2` (the base fee had moved, changing the fee
+fields) with the **same `k`**. Two public signatures under one `k` is
+textbook ECDSA nonce reuse:
+
+```
+k = (m1 − m2) / (s1 − s2)     x = (s1·k − m1) / r
+```
+
+— the committee's secret key `x` is recoverable by anyone with both
+transcripts. This is *precisely* the failure SPEC §8.6's single-use
+discipline exists to prevent, and it was caused by an innocent
+convenience, not by a protocol flaw: the protocol never reuses a
+presignature; the *driver* did, across process runs.
+
+It was harmless here: a throwaway testnet committee key holding faucet
+ETH. The broadcast itself succeeded (status 1, block 11398872):
+<https://sepolia.etherscan.io/tx/0x96914c199b8efee5d4e5376e110330ea2808651830210444a6b985ad9e1b9fb9>
+
+**The M2-era committee key (`0x729BB22d46A1790708a3cfB2AAe7F74dE8c9e970`)
+is BURNED — educational only.** It stays on testnet for continuity
+(the faucet-funded address does not change); any production deployment
+would rotate the key and consider every wei under it gone.
+
+Two fixes, both structural:
+
+1. **Dry runs never sign.** The dry-run report type has no signature
+   fields at all, and `Committee::sign` is reachable only from the
+   broadcast branch of `run_demo`. A signature "computed but not sent"
+   is still a public transcript over `k`; not computing it is the only
+   safe option.
+2. **Fresh presignature per broadcast attempt.** Keygen stays
+   deterministic (stable funded address), but the broadcast path draws
+   a `u64` seed from `OsRng` on every run (`Committee::presign_fresh`),
+   so each attempt uses a new `k`. The deterministic presign
+   (`presign_deterministic`) survives **test-only** — reproducibility
+   is a test property, never a runtime one.
+
+The general lesson: in threshold ECDSA, determinism is safe exactly
+where the output is meant to be public and permanent (the joint key),
+and fatal exactly where the output must be secret and single-use (the
+signing nonce). If you add a "reproducible mode" to any signing driver,
+gate it behind test-only APIs.
 
 ### Plume testnet example
 

@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use ohm_ecdsa_demo_evm::rpc::explorer_tx_url;
 use ohm_ecdsa_demo_evm::tx::{hex_decode, hex_encode};
-use ohm_ecdsa_demo_evm::{run_demo, DemoConfig, DEFAULT_TO, DEFAULT_VALUE_WEI, SEPOLIA_CHAIN_ID};
+use ohm_ecdsa_demo_evm::{
+    run_demo, DemoConfig, DemoReport, DEFAULT_TO, DEFAULT_VALUE_WEI, SEPOLIA_CHAIN_ID,
+};
 
 const USAGE: &str = "usage: demo-evm [--chain-id N] [--to 0xADDR] [--value-wei N] [--broadcast]
   env: OHM_DEMO_RPC_URL (required) — JSON-RPC endpoint
@@ -95,57 +97,63 @@ fn main() -> ExitCode {
 
     println!("== OHM-ECDSA → EVM demo (M2) ==");
     println!("chain id:      {chain_id}");
-    println!("committee:     {}", report.address);
-    println!("balance:       {} wei", report.balance_wei);
 
-    if !report.funded {
-        println!();
-        println!("The committee address holds 0 wei. Fund it with testnet ETH");
-        println!("and re-run — Sepolia faucets:");
-        println!("  https://sepoliafaucet.com");
-        println!("  https://cloud.google.com/application/web3/faucet/ethereum/sepolia");
-        println!("  https://faucet.quicknode.com/ethereum/sepolia");
-        return ExitCode::SUCCESS;
-    }
-
-    let arc = report.arc.expect("funded run signs");
-    let fees = report.fees.expect("funded run has fees");
-    println!(
-        "nonce:         {}",
-        report.nonce.expect("funded run has a nonce")
-    );
-    println!(
-        "fees:          max {} wei = priority {} + 2×base",
-        fees.max_fee_per_gas, fees.max_priority_fee_per_gas
-    );
-    println!("to:            0x{}", hex_encode(&cfg.to));
-    println!("value:         {} wei", cfg.value_wei);
-    println!("sighash:       0x{}", hex_encode(&arc.sighash));
-    println!("y_parity:      {}", arc.y_parity as u8);
-    println!("signed tx:     0x{}", hex_encode(&arc.signed_tx));
-
-    match (report.tx_hash, report.receipt) {
-        (Some(hash), Some(receipt)) => {
+    match report {
+        DemoReport::Unfunded { address } => {
+            println!("committee:     {address}");
+            println!("balance:       0 wei");
             println!();
-            println!("broadcast:     0x{}", hex_encode(&hash));
+            println!("The committee address holds 0 wei. Fund it with testnet ETH");
+            println!("and re-run — Sepolia faucets:");
+            println!("  https://sepoliafaucet.com");
+            println!("  https://cloud.google.com/application/web3/faucet/ethereum/sepolia");
+            println!("  https://faucet.quicknode.com/ethereum/sepolia");
+        }
+        DemoReport::DryRun(dry) => {
+            println!("committee:     {}", dry.address);
+            println!("balance:       {} wei", dry.balance_wei);
+            println!("nonce:         {}", dry.nonce);
+            println!(
+                "fees:          max {} wei = priority {} + 2×base",
+                dry.fees.max_fee_per_gas, dry.fees.max_priority_fee_per_gas
+            );
+            println!("to:            0x{}", hex_encode(&dry.tx.to));
+            println!("value:         {} wei", dry.tx.value);
+            println!("unsigned sighash: 0x{}", hex_encode(&dry.unsigned_sighash));
+            println!();
+            println!("DRY RUN — nothing was sent, and no signature was produced by");
+            println!("design (SPEC §8.6 single-use). Re-run with --broadcast to sign");
+            println!("with a FRESH presignature and send.");
+        }
+        DemoReport::Broadcast(b) => {
+            println!("committee:     {}", b.address);
+            println!("balance:       {} wei", b.balance_wei);
+            println!("nonce:         {}", b.nonce);
+            println!(
+                "fees:          max {} wei = priority {} + 2×base",
+                b.fees.max_fee_per_gas, b.fees.max_priority_fee_per_gas
+            );
+            println!("to:            0x{}", hex_encode(&cfg.to));
+            println!("value:         {} wei", cfg.value_wei);
+            println!("sighash:       0x{}", hex_encode(&b.arc.sighash));
+            println!("y_parity:      {}", b.arc.y_parity as u8);
+            println!("signed tx:     0x{}", hex_encode(&b.arc.signed_tx));
+            println!();
+            println!("broadcast:     0x{}", hex_encode(&b.tx_hash));
             println!(
                 "receipt:       status {} ({}), block {}, gas used {}",
-                receipt.status as u8,
-                if receipt.status {
+                b.receipt.status as u8,
+                if b.receipt.status {
                     "success"
                 } else {
                     "REVERTED"
                 },
-                receipt.block_number,
-                receipt.gas_used
+                b.receipt.block_number,
+                b.receipt.gas_used
             );
-            if let Some(url) = explorer_tx_url(chain_id, &hash) {
+            if let Some(url) = explorer_tx_url(chain_id, &b.tx_hash) {
                 println!("explorer:      {url}");
             }
-        }
-        _ => {
-            println!();
-            println!("DRY RUN — nothing was sent. Re-run with --broadcast to send.");
         }
     }
     ExitCode::SUCCESS

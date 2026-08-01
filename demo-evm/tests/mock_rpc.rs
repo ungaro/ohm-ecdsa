@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use ohm_ecdsa_demo_evm::json::{self, Json};
 use ohm_ecdsa_demo_evm::tx::hex_encode;
-use ohm_ecdsa_demo_evm::{run_demo, DemoConfig, DemoError, DEFAULT_VALUE_WEI, SEPOLIA_CHAIN_ID};
+use ohm_ecdsa_demo_evm::{
+    run_demo, DemoConfig, DemoError, DemoReport, DEFAULT_VALUE_WEI, SEPOLIA_CHAIN_ID,
+};
 
 /// CONSTRUCTED Sepolia-shaped receipt (status 1, plain transfer).
 const RECEIPT: &str = r#"{
@@ -220,13 +222,17 @@ fn dry_run_end_to_end_mocked_rpc() {
     let mock = Mock::start(funded_responses());
     let report = run_demo(&cfg(&mock.url, false)).unwrap();
 
-    assert!(report.funded);
-    assert_eq!(report.nonce, Some(7));
-    let fees = report.fees.unwrap();
-    assert_eq!(fees.max_priority_fee_per_gas, 1_500_000_000);
-    assert_eq!(fees.max_fee_per_gas, 1_500_000_000 + 2 * 2_000_000_000);
-    let arc = report.arc.unwrap();
-    assert!(report.tx_hash.is_none(), "dry run must not broadcast");
+    // The dry-run variant is signature-free BY TYPE (no arc, no tx_hash
+    // — there is nothing to check for absence of).
+    let dry = match report {
+        DemoReport::DryRun(d) => d,
+        other => panic!("expected DryRun, got {other:?}"),
+    };
+    assert_eq!(dry.nonce, 7);
+    assert_eq!(dry.fees.max_priority_fee_per_gas, 1_500_000_000);
+    assert_eq!(dry.fees.max_fee_per_gas, 1_500_000_000 + 2 * 2_000_000_000);
+    assert_eq!(dry.unsigned_sighash, dry.tx.sighash());
+    assert_eq!(dry.tx.nonce, 7, "the unsigned tx carries the live nonce");
 
     // The exact RPC call sequence, then nothing else.
     assert_eq!(
@@ -246,7 +252,7 @@ fn dry_run_end_to_end_mocked_rpc() {
     let seen = mock.seen.lock().unwrap();
     let nonce_req = json::parse(&seen[2]).unwrap();
     let params = nonce_req.get("params").and_then(Json::as_array).unwrap();
-    assert_eq!(params[0].as_str(), Some(report.address.as_str()));
+    assert_eq!(params[0].as_str(), Some(dry.address.as_str()));
     assert_eq!(params[1].as_str(), Some("pending"));
     let ids: Vec<i128> = seen
         .iter()
@@ -258,10 +264,6 @@ fn dry_run_end_to_end_mocked_rpc() {
         .collect();
     assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
     drop(seen);
-
-    // The signed tx carries the LIVE nonce and fees.
-    assert!(arc.sighash != [0u8; 32]);
-    assert_eq!(arc.signed_tx[0], 0x02);
 }
 
 #[test]
@@ -275,13 +277,18 @@ fn broadcast_end_to_end_mocked_rpc() {
     let mock = Mock::start(responses);
 
     let report = run_demo(&cfg(&mock.url, true)).unwrap();
-    assert_eq!(report.tx_hash, Some([0x22u8; 32]));
-    let receipt = report.receipt.unwrap();
-    assert!(receipt.status);
-    assert_eq!(receipt.block_number, 0x123456);
-    assert_eq!(receipt.gas_used, 21_000);
+    let b = match report {
+        DemoReport::Broadcast(b) => b,
+        other => panic!("expected Broadcast, got {other:?}"),
+    };
+    assert_eq!(b.tx_hash, [0x22u8; 32]);
+    assert!(b.receipt.status);
+    assert_eq!(b.receipt.block_number, 0x123456);
+    assert_eq!(b.receipt.gas_used, 21_000);
 
-    // The raw transaction sent is exactly the signed tx from the arc.
+    // The raw transaction sent is exactly the signed tx from the arc
+    // (signed with a FRESH presignature — the assertion is independent
+    // of which k was drawn).
     let seen = mock.seen.lock().unwrap();
     let send_req = seen
         .iter()
@@ -292,8 +299,7 @@ fn broadcast_end_to_end_mocked_rpc() {
         .as_str()
         .unwrap()
         .to_string();
-    let arc = report.arc.unwrap();
-    assert_eq!(raw, format!("0x{}", hex_encode(&arc.signed_tx)));
+    assert_eq!(raw, format!("0x{}", hex_encode(&b.arc.signed_tx)));
     drop(seen); // release before methods() locks the same mutex
     let methods = mock.methods();
     assert_eq!(
@@ -309,8 +315,10 @@ fn unfunded_committee_exits_at_the_faucet_gate() {
         ("eth_getBalance", "\"0x0\"".into()),
     ]);
     let report = run_demo(&cfg(&mock.url, false)).unwrap();
-    assert!(!report.funded);
-    assert!(report.arc.is_none(), "unfunded: no signing, no sending");
+    assert!(
+        matches!(report, DemoReport::Unfunded { .. }),
+        "unfunded: no signing, no sending"
+    );
     assert_eq!(mock.methods(), vec!["eth_chainId", "eth_getBalance"]);
 }
 
@@ -342,7 +350,10 @@ fn real_sepolia_receipt_fixture_parses() {
     responses.push(("eth_getTransactionReceipt", REAL_SEPOLIA_RECEIPT.into()));
     let mock = Mock::start(responses);
     let report = run_demo(&cfg(&mock.url, true)).unwrap();
-    let receipt = report.receipt.unwrap();
+    let receipt = match report {
+        DemoReport::Broadcast(b) => b.receipt,
+        other => panic!("expected Broadcast, got {other:?}"),
+    };
     assert!(receipt.status);
     assert_eq!(receipt.block_number, 0xadedb3);
     assert_eq!(receipt.gas_used, 0x1f331);
@@ -362,7 +373,10 @@ fn unsupported_priority_method_falls_back_to_gas_price() {
         ),
     ]);
     let report = run_demo(&cfg(&mock.url, false)).unwrap();
-    let fees = report.fees.unwrap();
+    let fees = match report {
+        DemoReport::DryRun(d) => d.fees,
+        other => panic!("expected DryRun, got {other:?}"),
+    };
     // Fallback: priority = gasPrice = 30 gwei; max = 30 + 2×2 = 34 gwei.
     assert_eq!(fees.max_priority_fee_per_gas, 30_000_000_000);
     assert_eq!(fees.max_fee_per_gas, 34_000_000_000);
