@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OHM-ECDSA — live demo</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="banner">Unaudited research code — not for securing real assets (SPEC §13)</div>
+  <nav class="nav">
+    <span class="brand">OHM-ECDSA</span>
+    <span class="links">
+      <a href="index.html">Shamir + VSS</a>
+      <a href="arc.html">Protocol arc</a>
+      <a href="#" class="active">Live demo</a>
+    </span>
+  </nav>
+  <p class="pitch">
+    Three real per-node drivers, one threshold key, five testnet
+    transactions. Below: the mesh reenacting its own round structure,
+    the on-chain record with live balances and receipt statuses (fetched
+    in your browser from public keyless endpoints), and the timeline of
+    what went wrong and what it taught — including the day a dry run
+    nearly cost a committee its key.
+  </p>
+</header>
+
+<main>
+
+<section class="card" id="scene-card">
+  <h2>1 · The mesh, reenacted <span class="spec-ref">SPEC §4.7, §6, §8, §9</span></h2>
+  <p class="explainer">
+    P1–P3 are real <code>PartyNode</code> drivers on a full mesh:
+    signed envelopes, echo-broadcast accept (a value lands when it
+    carries the sender's signature plus T−1 echoes, §4.7). Blue packets
+    are broadcasts (all-to-all), green are point-to-point shares. The
+    sign round is ONE broadcast — that is the whole online cost.
+  </p>
+  <div class="controls">
+    <button id="scene-play">▶ play</button>
+    <input id="scene-scrub" type="range" min="0" max="1000" value="0" style="flex:1">
+    <span id="scene-round" class="mono muted"></span>
+  </div>
+  <div id="scene-container"></div>
+  <p class="caption" id="scene-caption"></p>
+</section>
+
+<section class="card" id="chain-card">
+  <h2>2 · The on-chain record <span class="spec-ref">testnet funds only</span>
+    <span id="live-badge" class="live-badge off">static</span>
+    <button id="refresh-live" class="cheat-btn">↻ refresh</button>
+  </h2>
+  <p class="explainer">
+    Fetched live in your browser from public keyless endpoints
+    (<code>ethereum-sepolia-rpc.publicnode.com</code>,
+    <code>testnet-rpc.plume.org</code>); if a fetch fails, values fall
+    back to the repo's recorded statics. Balances in wei.
+  </p>
+  <div id="balances" class="balances"></div>
+  <div id="tx-cards" class="tx-cards"></div>
+</section>
+
+<section class="card" id="timeline-card">
+  <h2>3 · The incident timeline <span class="spec-ref">an engineering story in five transactions</span></h2>
+  <div class="timeline" id="timeline"></div>
+  <p class="caption">
+    The full k-reuse write-up — algebra included — is
+    <code>demo-evm/README.md</code> in the repo, section
+    “The k-reuse incident (2026-08-01)”.
+  </p>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  ohm-ecdsa · scene packets reenact the real round structure; on-chain
+  data is fetched live or degraded to the repo's statics · testnet funds
+  only, always
+</footer>
+
+<script type="module" src="demo.js"></script>
+</body>
+</html>
