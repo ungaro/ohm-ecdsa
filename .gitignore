@@ -1,6 +1,7 @@
 /target
 /fuzz/target
 /fuzz/artifacts
+/demo-evm/target
 
 # Sage preparse artifacts and Python bytecode (analysis/)
 *.sage.py

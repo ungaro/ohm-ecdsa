@@ -345,6 +345,16 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
   only, like `fuzz/`; results + interpretation in `analysis/README.md`
   (full log `analysis/g1_probe_results.txt`), cited in
   `docs/proof/PROOF.md` §8.2.6.
+- `cd demo-evm && cargo test` / `cargo run` — the EVM testnet demo
+  (workspace-EXCLUDED like `fuzz/`, own `Cargo.toml`/`Cargo.lock`; deps
+  beyond the core: `tiny-keccak` only). M1 is local-only: hand-rolled
+  RLP + EIP-1559 sighash, a 2-of-3 committee arc (keygen → presign →
+  sign with the sighash as the message scalar — the protocol layer takes
+  `m: &Scalar`, no core change), y-parity from `presig.big_r` flipped by
+  low-`s` normalization, and `VerifyingKey::recover_from_prehash` as the
+  local ecrecover check. Prints a broadcast-ready signed Sepolia
+  transfer. M2 (JSON-RPC broadcast) and M3 (per-node drivers, soak,
+  Plume) are roadmap.
 - `cargo run --example NAME` — narrative examples (living documentation,
   deterministic `sim::make_rngs` seeds, every signature k256-verified):
   `wallet_2_of_3` (presig pool + single-use stores + lost-phone

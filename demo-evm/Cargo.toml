@@ -1,0 +1,20 @@
+[package]
+name = "ohm-ecdsa-demo-evm"
+version = "0.1.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+description = "M1 of an EVM testnet demo: a 2-of-3 OHM-ECDSA committee signs a Sepolia EIP-1559 transfer locally and the signature is verified by ecrecover-style address recovery. No network."
+
+# Workspace-excluded (same pattern as fuzz/): the demo crate is its own
+# workspace so the main workspace (MSRV 1.75, dependency-pure core) never
+# builds it.
+[workspace]
+members = ["."]
+
+[dependencies]
+ohm-ecdsa = { path = ".." }
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+tiny-keccak = { version = "2", features = ["keccak"] }
+rand = "0.8"
+thiserror = "2"
