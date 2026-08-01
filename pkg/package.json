@@ -1,0 +1,17 @@
+{
+  "name": "ohm-ecdsa-wasm",
+  "type": "module",
+  "description": "wasm-bindgen wrapper over ohm-ecdsa for the no-build explainer site (frontend/). Exposes REAL protocol values under deterministic seeds.",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "files": [
+    "ohm_ecdsa_wasm_bg.wasm",
+    "ohm_ecdsa_wasm.js",
+    "ohm_ecdsa_wasm.d.ts"
+  ],
+  "main": "ohm_ecdsa_wasm.js",
+  "types": "ohm_ecdsa_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
