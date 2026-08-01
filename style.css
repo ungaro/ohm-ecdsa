@@ -238,6 +238,18 @@ details.phase.unreached { opacity: 0.55; }
 .live-badge.off { background: rgba(139, 148, 158, 0.12); color: var(--muted); border: 1px solid var(--border); }
 #refresh-live { margin-left: 0.5rem; font-size: 0.8rem; padding: 0.15rem 0.6rem; }
 
+.chain-split { font-size: 0.9rem; margin: 0.25rem 0 0.75rem; }
+.chain-badge {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  border-radius: 8px;
+  padding: 0.05rem 0.45rem;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.chain-badge.sepolia { background: rgba(88, 166, 255, 0.14); color: #58a6ff; border: 1px solid rgba(88, 166, 255, 0.4); }
+.chain-badge.plume { background: rgba(210, 153, 34, 0.14); color: #d29922; border: 1px solid rgba(210, 153, 34, 0.45); }
+
 .balances { margin: 0.75rem 0 1rem; }
 .balances .kv .k { min-width: 24rem; }
 
