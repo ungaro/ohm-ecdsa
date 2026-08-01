@@ -330,7 +330,7 @@ export OHM_DEMO_RPC_URL="https://<your-testnet-endpoint>"
 ```
 
 Chains: Sepolia by default (`--chain-id 11155111`); Plume testnet via
-`--chain-id 98899` (with a Plume endpoint in the env var). The
+`--chain-id 98867` (with a Plume endpoint in the env var). The
 endpoint's `eth_chainId` must match or the run refuses before anything
 else.
 

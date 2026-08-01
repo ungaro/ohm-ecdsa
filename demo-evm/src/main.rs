@@ -20,7 +20,7 @@ use ohm_ecdsa_demo_evm::{
 
 const USAGE: &str = "usage: demo-evm [--chain-id N] [--to 0xADDR] [--value-wei N] [--driver sim|mesh] [--data-dir PATH] [--broadcast]
   env: OHM_DEMO_RPC_URL (required) — JSON-RPC endpoint
-  default chain: 11155111 (Sepolia); Plume testnet: --chain-id 98899
+  default chain: 11155111 (Sepolia); Plume testnet: --chain-id 98867
   default driver: sim (in-process committee); mesh = 3 real PartyNodes
   default: DRY RUN (nothing is sent); --broadcast sends";
 

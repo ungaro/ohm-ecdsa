@@ -40,7 +40,7 @@ use tx::Eip1559Tx;
 /// an OS CSPRNG per party in any real deployment).
 pub const DEMO_SEED: u64 = 0xE1559;
 
-/// Sepolia chain id (the default; Plume testnet is 98899, selected via
+/// Sepolia chain id (the default; Plume testnet is 98867, selected via
 /// the `--chain-id` flag only).
 pub const SEPOLIA_CHAIN_ID: u64 = 11155111;
 

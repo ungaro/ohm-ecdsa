@@ -181,16 +181,29 @@ and fatal exactly where the output must be secret and single-use (the
 signing nonce). If you add a "reproducible mode" to any signing driver,
 gate it behind test-only APIs.
 
+## On-chain record (all status 1)
+
+| # | Driver | Chain | Tx |
+|---|---|---|---|
+| 1 | sim | Sepolia (block 11398872) | [0x96914c19…](https://sepolia.etherscan.io/tx/0x96914c199b8efee5d4e5376e110330ea2808651830210444a6b985ad9e1b9fb9) — the incident broadcast |
+| 2 | sim | Sepolia (block 11398940) | [0x000e08d6…](https://sepolia.etherscan.io/tx/0x000e08d68f3070c60d50f66cbcf18cc7d40154a61b9ae6e2578d5d3e303aabba) — first run after the fix: fresh `r`, visibly different from #1 |
+| 3 | sim | Sepolia (block 11399127) | [0x204663f0…](https://sepolia.etherscan.io/tx/0x204663f023efe00182125d79ada865bafb0e61ba8a983dc788f1f61a0604899d) — 0.5 ETH: the sim committee funds the mesh committee |
+| 4 | mesh | Sepolia (block 11399133) | [0x14eda1bb…](https://sepolia.etherscan.io/tx/0x14eda1bb440b9a993487b76064fe10c43845a7be214f0ec969adc8dc88f4d916) — three real PartyNodes, durable stores |
+| 5 | mesh | Plume (block 23846211) | [0xf5e71e42…](https://testnet-explorer.plume.org/tx/0xf5e71e425ab60056ec708000fe3f196cc621554c3cf3d3884ea01ab05f629258) — same committee, second chain |
+
+Every broadcast since the incident carries a distinct `r` — no nonce
+reuse anywhere.
+
 ### Plume testnet example
 
 ```sh
 export OHM_DEMO_RPC_URL="https://<your-plume-testnet-endpoint>"
-cargo run -- --chain-id 98899            # dry run
-cargo run -- --chain-id 98899 --broadcast
+cargo run -- --chain-id 98867            # dry run
+cargo run -- --chain-id 98867 --broadcast
 ```
 
 Explorer links are picked by chain id: `sepolia.etherscan.io` for
-11155111, `testnet-explorer.plume.org` for 98899.
+11155111, `testnet-explorer.plume.org` for 98867.
 
 ## Fee policy
 

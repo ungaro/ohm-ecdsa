@@ -365,7 +365,7 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
   pre-hashed-message variants added for this demo; idempotence via
   deterministic keygen + on-disk monotonic id counters). Endpoint via
   `OHM_DEMO_RPC_URL` only (never committed); two live Sepolia transfers
-  confirmed on-chain. Plume testnet (`--chain-id 98899`) is wired.
+  confirmed on-chain. Plume testnet (`--chain-id 98867`) is wired.
   See `demo-evm/README.md` and runbook §9.
 - `cargo run --example NAME` — narrative examples (living documentation,
   deterministic `sim::make_rngs` seeds, every signature k256-verified):

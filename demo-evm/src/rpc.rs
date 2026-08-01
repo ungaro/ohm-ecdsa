@@ -316,7 +316,7 @@ pub fn quantity_u64(q: &str) -> Result<u64, RpcError> {
 pub fn explorer_tx_url(chain_id: u64, tx_hash: &[u8; 32]) -> Option<String> {
     let base = match chain_id {
         11155111 => "https://sepolia.etherscan.io",
-        98899 => "https://testnet-explorer.plume.org",
+        98867 => "https://testnet-explorer.plume.org",
         _ => return None,
     };
     Some(format!("{base}/tx/0x{}", crate::tx::hex_encode(tx_hash)))
@@ -385,7 +385,7 @@ mod tests {
             format!("https://sepolia.etherscan.io/tx/0x{}", "ab".repeat(32))
         );
         assert_eq!(
-            explorer_tx_url(98899, &hash).unwrap(),
+            explorer_tx_url(98867, &hash).unwrap(),
             format!(
                 "https://testnet-explorer.plume.org/tx/0x{}",
                 "ab".repeat(32)
