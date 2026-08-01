@@ -454,6 +454,8 @@ out-of-band bundle exchange itself (ops, not code), key rotation
 * Deployment, transport, and hardening checklists → SPEC §13
 * Deployment topologies (who holds which share, blame-token evidence flow, storage duties) → SPEC Appendix A
 * Operator runbook (ceremony, running a node, pools, monitoring, incident response, backup/upgrade, security checklist) → `docs/runbook.md`
+* EVM testnet demo (threshold committee signing on-chain, Sepolia + Plume; k-reuse incident write-up) → `demo-evm/README.md`
+* Interactive explainer site (real protocol code in the browser via wasm) → `frontend/` (`cd frontend && python3 -m http.server`)
 * References (GJKR96, Beaver, Groth–Shoup, DJNPO20, KU24, …) → SPEC §14
 * Contributor conventions (and guidance for AI agents) → `AGENTS.md`
 

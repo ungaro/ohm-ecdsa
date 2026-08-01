@@ -351,6 +351,18 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
   only, like `fuzz/`; results + interpretation in `analysis/README.md`
   (full log `analysis/g1_probe_results.txt`), cited in
   `docs/proof/PROOF.md` §8.2.6.
+- `cd frontend && python3 -m http.server 8000` — the static explainer
+  site (workspace-excluded, NO build step: plain HTML/ES-module JS,
+  self-contained, no CDNs). `frontend/wasm/` is a wasm-bindgen wrapper
+  over the core (own lockfile, workspace-excluded; build with
+  `wasm-pack build --target web --out-dir ../pkg`, pkg gitignored) —
+  pages run REAL protocol code in the browser (deterministic seeded
+  runs). F1 (done): the interactive Shamir+VSS page — live polynomial
+  plot, per-share Feldman badges verified in Rust, t-of-n
+  reconstruction, cheat toggle firing the commitment check (the
+  identifiable-abort intuition), and the real `run_keygen` card;
+  `node smoke.mjs` is its 15-assertion smoke test. F2 (protocol-arc
+  page) and F3 (three.js live-demo page) are roadmap.
 - `cd demo-evm && cargo test` / `cargo run` — the EVM testnet demo
   (workspace-EXCLUDED like `fuzz/`, own `Cargo.toml`/`Cargo.lock`; deps
   beyond the core + node: `tiny-keccak`, `ureq` 2.12.1). Two drivers
