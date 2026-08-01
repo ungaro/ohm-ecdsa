@@ -2,6 +2,7 @@
 /fuzz/target
 /fuzz/artifacts
 /demo-evm/target
+/frontend/wasm/target
 /demo-evm/data
 /frontend/pkg
 /frontend/node_modules
