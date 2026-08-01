@@ -1,0 +1,70 @@
+p = 577   N = 613   (prime order, p < N: fold-free)
+  2-to-1 check: max preimage mult = 2 (MUST be 2), image size = 306 (expect ~N/2 = 306)
+  F-uniformity: support/N = 0.499  SD = 0.501  chi2/N = 1.002  N_eff/N = 0.499
+  exact table (N^2 = 375769 evals): colliding pairs = 115165607 (random-fn control 115161670, ratio 1.0000)
+                 max bucket = 709 (control 689)
+  A  baseline birthday             mean work =      30.8  (predicted 0.50*log2N =   4.6, got 4.95)
+  B1 preimage (sign-then-find)     mean work =     907.1  (predicted 1.00*log2N =   9.3, got 9.83)
+  B2 fixed M (M=M')                mean work =      33.4  (predicted 0.50*log2N =   4.6, got 5.06)
+  B3 fixed tau (tau=tau')          mean work =      33.6  (predicted 0.50*log2N =   4.6, got 5.07)
+  B4 two-block MITM                mean work =      43.5  (predicted 0.50*log2N =   4.6, got 5.44)
+  B5a tau'=0 grind                 mean work =     763.0  (predicted 1.00*log2N =   9.3, got 9.58)
+  B5b small-tau grid               mean work =      30.6  (predicted 0.50*log2N =   4.6, got 4.94)
+  B5c adaptive chain               mean work =      90.2  (predicted 0.50*log2N =   4.6, got 6.49)
+  AFFINE Wagner 4-sum (control)    mean work =      65.3  (predicted 0.33*log2N =   3.1, got 6.03)  [100/100 solved]
+
+p = 8779   N = 8863   (prime order, p < N: fold-free)
+  2-to-1 check: max preimage mult = 2 (MUST be 2), image size = 4431 (expect ~N/2 = 4431)
+  F-uniformity: support/N = 0.500  SD = 0.500  chi2/N = 1.000  N_eff/N = 0.500
+  A  baseline birthday             mean work =     112.9  (predicted 0.50*log2N =   6.6, got 6.82)
+  B1 preimage (sign-then-find)     mean work =    9643.1  (predicted 1.00*log2N =  13.1, got 13.24)
+  B2 fixed M (M=M')                mean work =     121.9  (predicted 0.50*log2N =   6.6, got 6.93)
+  B3 fixed tau (tau=tau')          mean work =     120.2  (predicted 0.50*log2N =   6.6, got 6.91)
+  B4 two-block MITM                mean work =     162.8  (predicted 0.50*log2N =   6.6, got 7.35)
+  B5a tau'=0 grind                 mean work =    7344.2  (predicted 1.00*log2N =  13.1, got 12.84)
+  B5b small-tau grid               mean work =     114.6  (predicted 0.50*log2N =   6.6, got 6.84)
+  B5c adaptive chain               mean work =     199.1  (predicted 0.50*log2N =   6.6, got 7.64)
+  AFFINE Wagner 4-sum (control)    mean work =     148.5  (predicted 0.33*log2N =   4.3, got 7.21)  [100/100 solved]
+
+p = 99079   N = 99709   (prime order, p < N: fold-free)
+  2-to-1 check: max preimage mult = 2 (MUST be 2), image size = 49854 (expect ~N/2 = 49854)
+  F-uniformity: support/N = 0.500  SD = 0.500  chi2/N = 1.000  N_eff/N = 0.500
+  A  baseline birthday             mean work =     412.4  (predicted 0.50*log2N =   8.3, got 8.69)
+  B1 preimage (sign-then-find)     mean work =   95586.8  (predicted 1.00*log2N =  16.6, got 16.54)
+  B2 fixed M (M=M')                mean work =     382.5  (predicted 0.50*log2N =   8.3, got 8.58)
+  B3 fixed tau (tau=tau')          mean work =     402.1  (predicted 0.50*log2N =   8.3, got 8.65)
+  B4 two-block MITM                mean work =     522.0  (predicted 0.50*log2N =   8.3, got 9.03)
+  B5a tau'=0 grind                 mean work =  151294.8  (predicted 1.00*log2N =  16.6, got 17.21)
+  B5b small-tau grid               mean work =     407.9  (predicted 0.50*log2N =   8.3, got 8.67)
+  B5c adaptive chain               mean work =    1127.5  (predicted 0.50*log2N =   8.3, got 10.14)
+  AFFINE Wagner 4-sum (control)    mean work =     298.7  (predicted 0.33*log2N =   5.5, got 8.22)  [30/30 solved]
+
+p = 998653   N = 999907   (prime order, p < N: fold-free)
+  2-to-1 check: max preimage mult = 2 (MUST be 2), image size = 499953 (expect ~N/2 = 499953)
+  F-uniformity: support/N = 0.500  SD = 0.500  chi2/N = 1.000  N_eff/N = 0.500
+  A  baseline birthday             mean work =    1337.7  (predicted 0.50*log2N =  10.0, got 10.39)
+  B1 preimage (sign-then-find)     mean work = 1207950.1  (predicted 1.00*log2N =  19.9, got 20.20)
+  B2 fixed M (M=M')                mean work =    1125.0  (predicted 0.50*log2N =  10.0, got 10.14)
+  B3 fixed tau (tau=tau')          mean work =    1277.7  (predicted 0.50*log2N =  10.0, got 10.32)
+  B4 two-block MITM                mean work =    1757.2  (predicted 0.50*log2N =  10.0, got 10.78)
+  B5a tau'=0 grind                 mean work =  987391.4  (predicted 1.00*log2N =  19.9, got 19.91)
+  B5b small-tau grid               mean work =    1284.9  (predicted 0.50*log2N =  10.0, got 10.33)
+  B5c adaptive chain               mean work =    4002.0  (predicted 0.50*log2N =  10.0, got 11.97)
+  AFFINE Wagner 4-sum (control)    mean work =     631.5  (predicted 0.33*log2N =   6.6, got 9.30)  [30/30 solved]
+
+=== exponent fit: log2(work) vs log2(N) ===
+    (Phi strategies: expect ~0.5 birthday / ~1.0 preimage;
+     affine control: expect ~0.33 — the GS21 cube root)
+  A  baseline birthday             slope = 0.512   OK
+  B1 preimage (sign-then-find)     slope = 0.969   OK
+  B2 fixed M (M=M')                slope = 0.475   OK
+  B3 fixed tau (tau=tau')          slope = 0.492   OK
+  B4 two-block MITM                slope = 0.498   OK
+  B5a tau'=0 grind                 slope = 0.996   OK
+  B5b small-tau grid               slope = 0.507   OK
+  B5c adaptive chain               slope = 0.530   OK
+  AFFINE Wagner 4-sum (control)    slope = 0.305   OK (control)
+
+VERDICT: no sub-birthday strategy found at this scale; Phi behaves as a
+random function (control confirms the harness detects cube-root structure
+when present). Consistent with the F-uniformity heuristic of PROOF.md §8.2.6.

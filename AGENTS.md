@@ -325,7 +325,9 @@ with `-p ohm-ecdsa` and to the node crate with `-p ohm-ecdsa-node`.
   named heuristic (G1, F-uniformity of the x-coordinate map): small-scale
   collision-search exponents for `Φ(M,τ)` under adversarial tweaks, with a
   Wagner 4-sum positive control on the affine (GS21) condition. Dev tool
-  only, like `fuzz/`; results are cited in `docs/proof/PROOF.md` §8.2.6.
+  only, like `fuzz/`; results + interpretation in `analysis/README.md`
+  (full log `analysis/g1_probe_results.txt`), cited in
+  `docs/proof/PROOF.md` §8.2.6.
 - `cargo run --example NAME` — narrative examples (living documentation,
   deterministic `sim::make_rngs` seeds, every signature k256-verified):
   `wallet_2_of_3` (presig pool + single-use stores + lost-phone
