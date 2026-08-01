@@ -90,6 +90,16 @@ fixed at the source; recorded here so the audit trail survives:
    literature check that §12.3 already recorded as DONE (negative).
    Fixed: §12.4's recommendation now records the §13 resolution and
    Path A's fallback status.
+7. **Commit-title labels outrunning the page (git history, immutable).**
+   Two commit titles dropped the qualifier the document carried at the
+   same commit: `eb3d612` ("Theorem U3 proved: commit-reveal DKG is
+   UC-secure against rushing" — the page then, as now, read "proved in
+   §11 **at the level of the hybrid argument**" with `ℱ_BC`-realization
+   and union-bound indexing remaining), and `bbc6890` ("Re-randomization
+   lemma PROVED (modulo F-uniformity)" — walked back in `b8415ca`'s
+   honest relabeling). Public history is deliberately **not** rewritten:
+   the qualifier on the page is the status, and this entry is the
+   reconciliation. Current status labels are the ones in the table above.
 
 ## How to verify
 
