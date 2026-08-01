@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OHM-ECDSA — the protocol arc</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="banner">Unaudited research code — not for securing real assets (SPEC §13)</div>
+  <nav class="nav">
+    <span class="brand">OHM-ECDSA</span>
+    <span class="links">
+      <a href="index.html">Shamir + VSS</a>
+      <a href="#" class="active">Protocol arc</a>
+      <a href="#" class="soon" title="frontend milestone F3">Live demo <em>(F3)</em></a>
+    </span>
+  </nav>
+  <p class="pitch">
+    The full OHM-ECDSA arc — keygen, Beaver triple, presignature, one-round
+    sign — computed live in your browser by the protocol's own Rust code
+    (compiled to WebAssembly, deterministic under your seed). Arm the
+    sabotage panel to watch a cheater get <em>named</em>: every broadcast
+    value is checked against public commitments, so misbehavior is
+    identifiable abort, not a shrug (SPEC §10).
+  </p>
+</header>
+
+<main>
+
+<section class="card" id="control-card">
+  <div class="controls">
+    <label>seed <input id="seed" type="number" value="42" min="0"></label>
+    <label>sabotage
+      <select id="fault">
+        <option value="off" selected>off — honest run</option>
+        <option value="bad-deal">keygen: bad dealt share (F2)</option>
+        <option value="bad-product-proof">triples: bad DLEQ proof (F3)</option>
+        <option value="bad-open-share">presign: bad opening share (F4)</option>
+        <option value="bad-nonce-point">presign: bad nonce point (F5)</option>
+        <option value="bad-sign-share">sign: bad signature share (F6)</option>
+      </select>
+    </label>
+    <label>cheater
+      <select id="cheater">
+        <option value="1">P1</option>
+        <option value="2" selected>P2</option>
+        <option value="3">P3</option>
+      </select>
+    </label>
+    <button id="run">RUN</button>
+    <button id="play">▶ play</button>
+    <span id="wasm-status" class="muted">loading wasm…</span>
+  </div>
+  <div id="abort-panel" class="recon ok">no abort — no one blamed</div>
+</section>
+
+<div class="stepper">
+
+  <details class="card phase" id="card-keygen" open>
+    <summary><span class="phase-name">1 · KeyGen</span> <span class="spec-ref">SPEC §6 · commit-reveal Pedersen DKG</span> <span class="phase-badge" data-badge></span></summary>
+    <div class="phase-body">
+      <p class="explainer">
+        Every party deals a random polynomial (hash-committed first — R1
+        hashes are internal to the driver), shares go out point-to-point,
+        and each dealt share is defended publicly against the commitment:
+        a wrong deal is a complaint the dealer cannot defend. The joint
+        key X = Σ xᵢ·G emerges; no one ever holds x.
+      </p>
+      <div data-body></div>
+    </div>
+  </details>
+
+  <details class="card phase" id="card-triples">
+    <summary><span class="phase-name">2 · Beaver triple</span> <span class="spec-ref">SPEC §7 · verifiable degree reduction</span> <span class="phase-badge" data-badge></span></summary>
+    <div class="phase-body">
+      <p class="explainer">
+        The committee produces <code>(a, b, c)</code> with
+        <code>c = a·b</code>, nobody learning any of the three. Each
+        party re-shares its local product and proves in one line —
+        Chaum–Pedersen DLEQ (§7.3) — that its re-shared value really is
+        the product of its dealt shares. A fake proof names the prover.
+      </p>
+      <div data-body></div>
+    </div>
+  </details>
+
+  <details class="card phase" id="card-presign">
+    <summary><span class="phase-name">3 · Presignature</span> <span class="spec-ref">SPEC §8 · the offline factory</span> <span class="phase-badge" data-badge></span></summary>
+    <div class="phase-body">
+      <p class="explainer">
+        The design-around: the inverse is <em>dealt directly</em> —
+        <code>[u] = [k⁻¹]</code> is sampled as a random value and k is
+        derived publicly, so no inversion protocol exists anywhere.
+        Openings go through verified opening (commitment checks), and
+        the nonce point R is pinned to the dealt sharing of k. Strictly
+        single-use (§8.6).
+      </p>
+      <div data-body></div>
+    </div>
+  </details>
+
+  <details class="card phase" id="card-sign">
+    <summary><span class="phase-name">4 · Sign</span> <span class="spec-ref">SPEC §9 · one online round</span> <span class="phase-badge" data-badge></span></summary>
+    <div class="phase-body">
+      <p class="explainer">
+        One broadcast: party j sends <code>s_j = m·u_j + r·z_j</code>.
+        Every share is checked against the public commitment
+        <code>m·A[u] + r·A[z]</code> by point equality — a wrong share
+        names its sender — and the valid shares interpolate to
+        <code>(r, s)</code>, an ordinary ECDSA signature under X.
+      </p>
+      <div data-body></div>
+    </div>
+  </details>
+
+</div>
+
+</main>
+
+<footer class="site-footer">
+  ohm-ecdsa · every value on this page is computed live by the real Rust
+  code compiled to wasm (no canned data) · the sabotage verdicts are the
+  same ground truth pinned by tests/blame_matrix.rs in the repo
+</footer>
+
+<script type="module" src="arc.js"></script>
+</body>
+</html>

@@ -45,7 +45,9 @@ node smoke.mjs     # imports pkg/ and asserts the F1 protocol surface
 ```
 frontend/
 ├── index.html      F1 page: Shamir + Feldman VSS interactive + 2-of-3 keygen card
-├── shamir.js       page logic (ES module, imports pkg/)
+├── arc.html        F2 page: the full protocol arc + sabotage mode (identifiable abort)
+├── shamir.js       F1 page logic (ES module, imports pkg/)
+├── arc.js          F2 page logic (ES module, imports pkg/)
 ├── style.css       dark theme, self-contained (no external fonts/CDNs)
 ├── smoke.mjs       node smoke test of the wasm exports
 ├── pkg/            wasm-pack output (gitignored)
@@ -65,6 +67,15 @@ frontend/
   equality, in Rust/k256. The page never re-implements secp256k1.
 - `reconstruct(t, ids, shares_hex) -> secret_hex` — Lagrange at 0 (§4.1);
   errors below `t`.
+- `full_arc(seed) -> { keygen, triples, presign, sign }` — the honest
+  2-of-3 arc (§6→§9) via the sim drivers: X + shares + commitments, the
+  triple (per-party a/b/c, multiplicativity + DLEQ-verified booleans),
+  the presignature (id, R, r, u/z shares + commitments), and the
+  signature (m, per-party s_j, (r, s), k256-verified + low-s booleans).
+- `arc_with_tamper(seed, fault, party) -> { fault, faultClass, check,
+  phase, blamed, detail }` — one injected fault (`bad-deal` F2,
+  `bad-product-proof` F3, `bad-open-share` F4, `bad-nonce-point` F5,
+  `bad-sign-share` F6); the blamed ids mirror `tests/blame_matrix.rs`.
 
 Note for porters: the wrapper enables `getrandom`'s `js` backend because
 the core's k256/ff tree pulls `rand_core` with default features (see

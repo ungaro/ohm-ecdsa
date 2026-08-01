@@ -58,3 +58,38 @@ if (failures) {
   process.exit(1);
 }
 console.log('\nall smoke checks passed');
+
+// --- F2: the full protocol arc -----------------------------------------------
+const arc = wasm.full_arc(42n);
+check('arc keygen: X + 3 parties', /^(02|03)/.test(arc.keygen.x) && arc.keygen.parties.length === 3);
+check('arc triples: multiplicative a·b == c', arc.triples.multiplicative === true);
+check('arc triples: DLEQ proofs verified', arc.triples.proofsVerified === true);
+check('arc presign: id + R + r', arc.presign.id === 1 && /^[0-9a-f]{64}$/.test(arc.presign.r) && /^(02|03)/.test(arc.presign.bigR));
+check('arc sign: 3 shares + (r, s)', arc.sign.shares.length === 3 && /^[0-9a-f]{64}$/.test(arc.sign.r) && /^[0-9a-f]{64}$/.test(arc.sign.s));
+check('arc sign: k256-verified + low-s', arc.sign.verified === true && arc.sign.lowS === true);
+check('arc is deterministic', wasm.full_arc(42n).sign.s === arc.sign.s);
+
+// --- F2: sabotage — the blame matrix ground truth -----------------------------
+const tampers = [
+  ['bad-deal', 2, 'F2', 'keygen', [2]],
+  ['bad-deal', 3, 'F2', 'keygen', [3]],
+  ['bad-product-proof', 1, 'F3', 'triples', [1]],
+  ['bad-open-share', 2, 'F4', 'presign', [2]],
+  ['bad-nonce-point', 3, 'F5', 'presign', [3]],
+  ['bad-sign-share', 1, 'F6', 'sign', [1]],
+  ['bad-sign-share', 3, 'F6', 'sign', [3]],
+];
+for (const [fault, party, fclass, phase, blamed] of tampers) {
+  const a = wasm.arc_with_tamper(42n, fault, party);
+  check(
+    `${fault} by P${party}: ${fclass} ${phase} blames [${blamed}]`,
+    a.faultClass === fclass &&
+      a.phase === phase &&
+      a.blamed.length === blamed.length &&
+      a.blamed.every((b, i) => b === blamed[i]) &&
+      typeof a.detail === 'string' && a.detail.length > 0,
+  );
+}
+let badFaultErrored = false;
+try { wasm.arc_with_tamper(42n, "nonsense", 1); } catch { badFaultErrored = true; }
+check('unknown fault errors', badFaultErrored);
