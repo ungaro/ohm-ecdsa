@@ -3,6 +3,7 @@
 // arc_with_tamper); the page only renders and flips badges.
 
 import init, * as wasm from './pkg/ohm_ecdsa_wasm.js';
+import * as fig from './figures.js';
 
 const $ = (sel) => document.querySelector(sel);
 const status = $('#wasm-status');
@@ -39,6 +40,14 @@ function checkLine(id, label) {
   return `<div class="check-line" data-check="${id}"><span class="check-badge">✓</span> ${label}</div>`;
 }
 
+function figureBlock(id, caption, controls = '') {
+  return `<div class="figure" id="${id}">
+    ${controls}
+    <div class="figure-canvas"></div>
+    <p class="caption figure-note">${caption}</p>
+  </div>`;
+}
+
 // --- card bodies ---------------------------------------------------------------
 
 function renderKeygen() {
@@ -50,7 +59,9 @@ function renderKeygen() {
     ${hexRow('A₀ (= X, joint key)', k.commitment[0], 'hl')}
     ${hexRow('A₁', k.commitment[1])}
     ${k.parties.map((p) => hexRow(`party ${p.index} share x_${p.index}`, p.share, tamper && tamper.blamed.includes(p.index) && sabotaged ? 'cheater' : '')).join('')}
-    ${hexRow('X (SEC1 compressed)', k.x, 'hl')}`;
+    ${hexRow('X (SEC1 compressed)', k.x, 'hl')}
+    ${figureBlock('fig-lagrange', 'The real shares as points; the fitted curve is a normalized projection of 𝔽_q (display only — the protocol interpolates exactly). Click a share to hide it. SPEC §4.1')}
+    ${figureBlock('fig-commit', 'Commit-reveal: hashes bind every dealer before any reveal — anti-rushing (SPEC §6, §4.3)')}`;
 }
 
 function renderTriples() {
@@ -68,7 +79,9 @@ function renderTriples() {
         <span class="v">a: ${trunc(p.a)}</span>
         <span class="v">b: ${trunc(p.b)}</span>
         <span class="v">c: ${trunc(p.c)}</span>
-      </div>`).join('')}`;
+      </div>`).join('')}
+    ${figureBlock('fig-shutters', 'The masked opening as shutters — illustrative schematic (δ/ε values stay inside the driver). SPEC §7.2/§8')}
+    ${figureBlock('fig-ladders', 'DLEQ as parallel ladders — illustrative small exponent. SPEC §7.3/§4.4')}`;
 }
 
 function renderPresign() {
@@ -87,7 +100,9 @@ function renderPresign() {
         <span class="k">P${q.index}</span>
         <span class="v">u_share: ${trunc(q.uShare)}</span>
         <span class="v">z_share: ${trunc(q.zShare)}</span>
-      </div>`).join('')}`;
+      </div>`).join('')}
+    ${figureBlock('fig-inverse', 'The inverse-dealing chain — no inversion protocol (SPEC §8, §12)')}
+    ${figureBlock('fig-scatter', '', `<div class="figure-controls mono"><label>field <select><option>53</option><option>251</option><option>997</option></select></label><button class="cheat-btn">▶</button> <span class="muted">hop R = k·G</span></div>`)}`;
 }
 
 function renderSign() {
@@ -100,10 +115,46 @@ function renderSign() {
     ${s.shares.map((q) => hexRow(`s_${q.index} = m·u_${q.index} + r·z_${q.index}`, q.s, tamper && tamper.blamed.includes(q.index) && sabotaged ? 'cheater' : '')).join('')}
     ${hexRow('r', s.r, 'hl')}
     ${hexRow('s', s.s, 'hl')}
-    <div class="check-line" data-check="final"><span class="check-badge">✓</span> k256 verifies under X · low-s (BIP-62/EIP-2)</div>`;
+    <div class="check-line" data-check="final"><span class="check-badge">✓</span> k256 verifies under X · low-s (BIP-62/EIP-2)</div>
+    ${figureBlock('fig-equation', '', '<div class="figure-check mono" id="eq-check"></div>')}`;
 }
 
 const RENDER = { keygen: renderKeygen, triples: renderTriples, presign: renderPresign, sign: renderSign };
+
+// --- figures (F2.5) ------------------------------------------------------------
+
+function drawFigures(phase, body) {
+  const canvasIn = (id) => {
+    const wrap = body.querySelector(`#${id} .figure-canvas`);
+    if (!wrap) return null;
+    const c = document.createElement('canvas');
+    wrap.append(c);
+    return c;
+  };
+  const noteIn = (id) => body.querySelector(`#${id} .figure-note`);
+  const wrapIn = (id) => body.querySelector(`#${id} .figure-canvas`);
+
+  if (phase === 'keygen') {
+    fig.keygenLagrange(
+      canvasIn('fig-lagrange'),
+      noteIn('fig-lagrange'),
+      arc.keygen.parties.map((p) => ({ index: p.index, shareHex: p.share })),
+    );
+    fig.commitReveal(wrapIn('fig-commit'));
+  } else if (phase === 'triples') {
+    fig.shutters(wrapIn('fig-shutters'));
+    fig.ladders(wrapIn('fig-ladders'));
+  } else if (phase === 'presign') {
+    fig.inverseChain(wrapIn('fig-inverse'));
+    fig.ffScatter(
+      canvasIn('fig-scatter'),
+      noteIn('fig-scatter'),
+      body.querySelector('#fig-scatter .figure-controls'),
+    );
+  } else if (phase === 'sign') {
+    fig.equationBoard(canvasIn('fig-equation'), body.querySelector('#eq-check'), arc.sign);
+  }
+}
 
 // --- rendering the run -----------------------------------------------------------
 
@@ -137,11 +188,18 @@ function render() {
         fired.classList.add('fired');
         fired.querySelector('.check-badge').textContent = '✗';
       }
+      const note = document.createElement('p');
+      note.className = 'caption sabotage-note';
+      note.textContent =
+        'values shown are the HONEST run\u2019s — the sabotaged run aborted at the red check above; figures greyed.';
+      body.prepend(note);
       card.open = true;
     } else {
       badge.textContent = '✓ complete';
       badge.className = 'phase-badge badge-ok';
     }
+    // Figures (F2.5) — real arc values where available.
+    drawFigures(phase, body);
   }
 
   // The abort panel — the REAL abort from the core.
