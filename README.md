@@ -139,15 +139,19 @@ Rust 1.75+ (MSRV), no system dependencies:
 cargo test
 ```
 
-169 tests workspace-wide (core: unit + integration + example smoke
-tests; node: thread- and process-level suites covering the mesh,
-persistence, ceremony, resilience, robustness, TLS, and the pool
-manager): end-to-end signing verified by `k256`'s ECDSA verifier,
+233 tests workspace-wide (core 123: unit + integration + the F1–F8
+blame-matrix + proptest properties + deterministic test vectors; node
+110: thread- and process-level suites covering the mesh, persistence,
+ceremony, resilience, robustness, TLS, and the pool manager):
+end-to-end signing verified by `k256`'s ECDSA verifier,
 cheater identification in every phase, robust continuation,
 expel-and-restart, refresh/re-sharing, batch and packed generation,
-single-use enforcement — plus smoke tests that run the four narrative
+single-use enforcement — plus smoke tests that run the five narrative
 examples below and check their guarantee lines. Everything is
-deterministic — no OS randomness in tests.
+deterministic (proptest's case generation is the one OS-seeded spot;
+failures print their seed for reproduction). The EVM demo
+(`demo-evm/`, 32 tests incl. mock-RPC end-to-end) and the frontend
+(`frontend/smoke.mjs`, 30 assertions) have their own suites.
 
 ```bash
 cargo run --release --example perf
@@ -428,6 +432,19 @@ sets, issuers, auditors.
   that keeps the presignature pool at a target level with fsync-first
   expiry tombstones (`--factory N --pool-ttl SECS`; ids are monotonic
   across restarts, never re-issued)
+* EVM on-chain demo (`demo-evm/`, workspace-excluded): threshold
+  committees signing real EIP-1559 transactions — five broadcasts across
+  Sepolia and Plume testnets, all status 1, including the three-process
+  mesh arc over per-node durable stores (the node crate's
+  `sign_stored_scalar` — pre-hashed-message signing for chains whose
+  payload is an external hash, e.g. the keccak sighash); dry-runs never
+  sign, every broadcast mints a fresh presignature (SPEC §8.6 enforced
+  by construction, and by the store's tombstones on the mesh path)
+* Interactive explainer site (`frontend/`, workspace-excluded): the
+  protocol running live in the browser via a wasm build of the core —
+  interactive Shamir/VSS, the full arc with per-phase figures and a
+  sabotage mode showing real blame, and a three.js live-demo page
+  (deployed via the `gh-pages` branch)
 
 **Not yet** (roadmap): production-hardened transport beyond the node
 crate's H2 (crash recovery of finished rounds, committee rejoin after a
@@ -455,7 +472,7 @@ out-of-band bundle exchange itself (ops, not code), key rotation
 * Deployment topologies (who holds which share, blame-token evidence flow, storage duties) → SPEC Appendix A
 * Operator runbook (ceremony, running a node, pools, monitoring, incident response, backup/upgrade, security checklist) → `docs/runbook.md`
 * EVM testnet demo (threshold committee signing on-chain, Sepolia + Plume; k-reuse incident write-up) → `demo-evm/README.md`
-* Interactive explainer site (real protocol code in the browser via wasm) → `frontend/` (`cd frontend && python3 -m http.server`)
+* Interactive explainer site (real protocol code in the browser via wasm) → `frontend/` (`cd frontend && python3 -m http.server`), live at [ungaro.github.io/ohm-ecdsa](https://ungaro.github.io/ohm-ecdsa/)
 * References (GJKR96, Beaver, Groth–Shoup, DJNPO20, KU24, …) → SPEC §14
 * Contributor conventions (and guidance for AI agents) → `AGENTS.md`
 
